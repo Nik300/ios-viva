@@ -80,8 +80,10 @@ initrd properties.
 4. ✅ **iOS 16.7.16 lock screen** (2026-11-02, ufs-rw stage, ~20 min first boot): backboardd and
    SpringBoard up, black wallpaper, red date/time, static "charging" battery, gesture bar.
    No input yet (sweet's Qualcomm key/touch drivers are off).
-5. ⏳ USB link (MUSB device mode: log stream + command channel), patch 0092 = step 1 probe,
-   patch 0093 = the link (`vivausb=3`), written and compile/link-checked, untested on the phone.
+5. ✅ **USB link** (2026-11-03, patch 0093, `vivausb=3`, `out/xnu-ufs-rw-link.img`): enumerates at
+   high speed, live console from the first kernel line, `ping`/`stat` answer. Host:
+   `tools/viva-link.py -o FILE`. Measured after the PHY wake: DTM0 0x02000000, DTM1 0x00003f2f,
+   POWER 0x70 (HS), DEVCTL 0x99.
 6. Keys (MT6366 PMIC via pwrap), touch (Goodix on MTK I²C), then SMP/perf, battery, GPU.
 
 ## Handoff (2026-11-02, end of session)
@@ -96,7 +98,7 @@ dtm0 02040000 dtm1 00000000 | musb hw e503 ep 88 fa 00 pw 20 dc 80 ie 06 tx 01ff
 Reading: MUSB clocked, peripheral mode, soft-disconnected (POWER.SOFTCONN=0), 8 TX + 8 RX
 endpoints; T-PHY u2 forced into suspend (DTM0 FORCE_SUSPENDM). No clock needs enabling.
 
-Patch 0093 "viva link" (`vivausb=3`, written 2026-11-02, CI run 41541439190 OK, image `out/xnu-ufs-rw-link.img`, untested): wakes the T-PHY (MediaTek
+Patch 0093 "viva link" (`vivausb=3`, written 2026-11-02, CI run 41541439190 OK, image `out/xnu-ufs-rw-link.img`, works on the phone 2026-11-03): wakes the T-PHY (MediaTek
 usb_phy_recover sequence, DTM1 forced to device: VBUSVALID/AVALID/BVALID/IDDIG, SESSEND=0),
 MUSB peripheral in PIO (no DMA), interrupt line masked (L1INTM=0), a kernel thread polls
 every 1 ms. Device 1209:0002 "viva iOS link", vendor interface, bulk 0x81 IN / 0x01 OUT.
