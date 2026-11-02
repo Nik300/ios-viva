@@ -1,0 +1,688 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index d0aef66..db0af8e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -677,7 +677,6 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
+-	viva_usb_probe();
+ 	return 0;
+ }
+ 
+@@ -829,6 +828,12 @@ int sweet_ufs_rootdev(dev_t *dev);
+ int
+ sweet_ufs_rootdev(dev_t *dev)
+ {
++	static bool viva_usb_done;
++	if (!viva_usb_done) {
++		/* before storage, so a UFS failure can still be read over USB */
++		viva_usb_done = true;
++		viva_usb_probe();
++	}
+ 	if (!su.ready) {
+ 		int error = sweet_ufs_init();
+ 		if (error) {
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index c779745..c6ca9ef 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -9,16 +9,22 @@
+  * hang on a gated block, so a hang still shows how far it got.
+  *
+  * Boot-arg vivausb: 0 (default) off, 1 probe, 2 probe then panic with the
+- * summary (the panic screen keeps it visible).
++ * summary (the panic screen keeps it visible), 3 probe then start the
++ * "viva link" (step 2, below).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/debug.h>
+ #include <pexpert/pexpert.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
+ 
+-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);  /* not exported to the BSD layer */
+ void viva_usb_probe(void);
++static void viva_link_start(vm_offset_t tphy, vm_offset_t musb);
+ 
+ #define INFRA_AO_PA     0x10001000u
+ #define INFRA_CG_STA0   0x90
+@@ -90,5 +96,633 @@ viva_usb_probe(void)
+ 		    cg0, cg1, cg2, cg3, acr0, acr6, acr4, dtm0, dtm1,
+ 		    hwvers, epinfo, faddr, power, devctl, intrusbe, txe, rxe, l1intm);
+ 	}
++	if (mode == 3) {
++		viva_link_start(tphy, musb);
++	}
++}
++/*
++ * Step 2: "viva link" (vivausb=3), a vendor-class USB device for logs and
++ * commands. One interface, bulk IN 0x81 and bulk OUT 0x01. Every IN packet
++ * is one frame: 'V', type, u16 payload length (little endian), payload.
++ * Types: 'L' console log bytes (the ring in bsd/dev/sweet_ufs.c, from the
++ * start of the boot), 'R' command reply text, 'E' end of a reply. Every OUT
++ * packet is one text command (see vl_command). Host side: tools/viva-link.py.
++ *
++ * PHY: LK leaves the T-PHY u2 port forced into suspend; it is woken with the
++ * MediaTek usb20 phy "recover" sequence (as Linux phy-mtk-tphy u2 init) and
++ * VBUS/session/ID are forced to "device" in U2PHYDTM1, so no PMIC/charger
++ * code is needed. MUSB: peripheral mode, PIO only (no DMA, no cache
++ * maintenance), the interrupt line stays masked (MediaTek L1INTM = 0) and a
++ * kernel thread polls the status registers, which on MediaTek are
++ * write-1-to-clear (Linux musb/mediatek.c). Register layout and the EP0
++ * state machine follow Linux drivers/usb/musb (musb_regs.h,
++ * musb_gadget_ep0.c). The thread never prints in steady state: its output
++ * would feed the log it streams.
++ */
++#define U3P_USBPHYACR5  0x014
++#define U3P_USBPHYACR7  0x01c
++
++#define MUSB_INTRTX     0x02            /* 16, W1C */
++#define MUSB_INTRRX     0x04            /* 16, W1C */
++#define MUSB_INTRUSB    0x0a            /* 8, W1C */
++#define MUSB_INDEX      0x0e            /* 8 */
++#define MUSB_TXMAXP     0x10            /* 16, indexed */
++#define MUSB_CSR0       0x12            /* 16, indexed (ep0) */
++#define MUSB_TXCSR      0x12            /* 16, indexed */
++#define MUSB_RXMAXP     0x14            /* 16, indexed */
++#define MUSB_RXCSR      0x16            /* 16, indexed */
++#define MUSB_COUNT0     0x18            /* 16, indexed (ep0) */
++#define MUSB_RXCOUNT    0x18            /* 16, indexed */
++#define MUSB_FIFO(n)    (0x20 + 4 * (n))
++#define MUSB_TXFIFOSZ   0x62            /* 8: log2(size / 8) */
++#define MUSB_RXFIFOSZ   0x63
++#define MUSB_TXFIFOADD  0x64            /* 16: address / 8 */
++#define MUSB_RXFIFOADD  0x66
++
++#define POWER_SOFTCONN  0x40
++#define POWER_HSENAB    0x20
++#define POWER_HSMODE    0x10
++#define DEVCTL_SESSION  0x01
++#define INTR_SUSPEND    0x01
++#define INTR_RESUME     0x02
++#define INTR_RESET      0x04
++#define INTR_DISCON     0x20
++
++#define CSR0_RXPKTRDY   0x0001
++#define CSR0_TXPKTRDY   0x0002
++#define CSR0_SENTSTALL  0x0004
++#define CSR0_DATAEND    0x0008
++#define CSR0_SETUPEND   0x0010
++#define CSR0_SENDSTALL  0x0020
++#define CSR0_SVDRXPKTRDY 0x0040
++#define CSR0_SVDSETUPEND 0x0080
++
++#define TXCSR_TXPKTRDY  0x0001
++#define TXCSR_FIFONOTEMPTY 0x0002
++#define TXCSR_UNDERRUN  0x0004
++#define TXCSR_FLUSHFIFO 0x0008
++#define TXCSR_SENTSTALL 0x0020
++#define TXCSR_CLRDATATOG 0x0040
++#define TXCSR_MODE      0x2000
++#define RXCSR_RXPKTRDY  0x0001
++#define RXCSR_FLUSHFIFO 0x0010
++#define RXCSR_CLRDATATOG 0x0080
++
++#define EP1_TXFIFO      64              /* after the fixed 64-byte ep0 FIFO */
++#define EP1_RXFIFO      (64 + 512)
++
++#define TOPRGU_PA       0x10007000u
++#define WDT_MODE        0x00
++#define WDT_SWRST       0x14
++#define WDT_SWRST_KEY   0x1209
++
++static struct {
++	vm_offset_t musb;
++	vm_offset_t toprgu;
++	int         sleep_chan;
++	enum { EP0_IDLE, EP0_IN, EP0_STATUS } ep0;
++	const uint8_t *in_data;         /* ep0 IN data stage */
++	uint32_t    in_left;
++	bool        in_zlp;
++	uint8_t     new_addr;           /* SET_ADDRESS, applied after the status stage */
++	bool        configured;
++	bool        hs;
++	uint8_t     ep0_buf[256];
++	char        cmd[512];
++	char        reply[4096];
++	uint32_t    reply_len, reply_pos;
++	bool        reply_end;          /* an 'E' frame is still owed */
++	uint64_t    log_pos;
++	uint64_t    resets, setups, cmds, tx_pkts, rx_pkts, log_bytes;
++} vl;
++
++static inline void wr32(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; }
++static inline void wr16(vm_offset_t b, uint32_t o, uint16_t v) { *(volatile uint16_t *)(b + o) = v; }
++static inline void wr8(vm_offset_t b, uint32_t o, uint8_t v) { *(volatile uint8_t *)(b + o) = v; }
++static inline void set32(vm_offset_t b, uint32_t o, uint32_t m) { wr32(b, o, rd32(b, o) | m); }
++static inline void clr32(vm_offset_t b, uint32_t o, uint32_t m) { wr32(b, o, rd32(b, o) & ~m); }
++
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);   /* bsd/dev/sweet_ufs.c */
++extern uint64_t sweet_log_position(void);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++
++static void
++vl_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&vl.sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++vl_fifo_write(unsigned ep, const uint8_t *p, uint32_t n)
++{
++	uint32_t i = 0;
++	for (; i + 4 <= n; i += 4) {
++		uint32_t w = (uint32_t)p[i] | (uint32_t)p[i + 1] << 8 | (uint32_t)p[i + 2] << 16 | (uint32_t)p[i + 3] << 24;
++		wr32(vl.musb, MUSB_FIFO(ep), w);
++	}
++	for (; i < n; i++) {
++		wr8(vl.musb, MUSB_FIFO(ep), p[i]);
++	}
++}
++
++static void
++vl_fifo_read(unsigned ep, uint8_t *p, uint32_t n)
++{
++	uint32_t i = 0;
++	for (; i + 4 <= n; i += 4) {
++		uint32_t w = rd32(vl.musb, MUSB_FIFO(ep));
++		p[i] = (uint8_t)w; p[i + 1] = (uint8_t)(w >> 8);
++		p[i + 2] = (uint8_t)(w >> 16); p[i + 3] = (uint8_t)(w >> 24);
++	}
++	for (; i < n; i++) {
++		p[i] = rd8(vl.musb, MUSB_FIFO(ep));
++	}
++}
++
++/* Descriptors. VID 0x1209 / PID 0x0002 = pid.codes test ID, not a product. */
++static const uint8_t vl_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
++	0x09, 0x12, 0x02, 0x00, 0x00, 0x01, 1, 2, 3, 1,
++};
++static const uint8_t vl_qual_desc[10] = { 10, 6, 0x00, 0x02, 0x00, 0x00, 0x00, 64, 1, 0 };
++static uint8_t vl_cfg_desc[32] = {
++	9, 2, 32, 0, 1, 1, 0, 0x80, 250,                /* config: 1 interface, 500 mA */
++	9, 4, 0, 0, 2, 0xff, 0x56, 0x01, 0,             /* vendor interface, 2 endpoints */
++	7, 5, 0x81, 2, 0x00, 0x02, 0,                   /* bulk IN 1, 512 */
++	7, 5, 0x01, 2, 0x00, 0x02, 0,                   /* bulk OUT 1, 512 */
++};
++static const char *const vl_strings[] = { NULL, "ios-viva", "viva iOS link", "0001" };
++
++static uint32_t
++vl_mps(void)
++{
++	return vl.hs ? 512 : 64;
++}
++
++static uint32_t
++vl_string(unsigned idx, uint8_t *out)
++{
++	if (idx == 0) {
++		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;   /* en-US */
++		return 4;
++	}
++	if (idx >= sizeof(vl_strings) / sizeof(vl_strings[0])) {
++		return 0;
++	}
++	const char *str = vl_strings[idx];
++	uint32_t n = 2;
++	for (; *str && n < 126; str++) {
++		out[n++] = (uint8_t)*str;
++		out[n++] = 0;
++	}
++	out[0] = (uint8_t)n;
++	out[1] = 3;
++	return n;
++}
++
++/* Bulk endpoint 1, both directions, for the current speed. */
++static void
++vl_ep1_config(void)
++{
++	uint16_t mps = (uint16_t)vl_mps();
++	wr8(vl.musb, MUSB_INDEX, 1);
++	wr16(vl.musb, MUSB_TXMAXP, mps);
++	wr8(vl.musb, MUSB_TXFIFOSZ, 6);                 /* 512 bytes, single buffered */
++	wr16(vl.musb, MUSB_TXFIFOADD, EP1_TXFIFO >> 3);
++	wr16(vl.musb, MUSB_TXCSR, TXCSR_MODE | TXCSR_CLRDATATOG);
++	if (rd16(vl.musb, MUSB_TXCSR) & TXCSR_FIFONOTEMPTY) {
++		wr16(vl.musb, MUSB_TXCSR, TXCSR_MODE | TXCSR_FLUSHFIFO);
++	}
++	wr16(vl.musb, MUSB_RXMAXP, mps);
++	wr8(vl.musb, MUSB_RXFIFOSZ, 6);
++	wr16(vl.musb, MUSB_RXFIFOADD, EP1_RXFIFO >> 3);
++	wr16(vl.musb, MUSB_RXCSR, RXCSR_FLUSHFIFO | RXCSR_CLRDATATOG);
++	wr16(vl.musb, MUSB_RXCSR, RXCSR_FLUSHFIFO | RXCSR_CLRDATATOG);
++	wr8(vl.musb, MUSB_INDEX, 0);
++}
++
++/* Next ep0 IN packet; the last one carries DATAEND. Index must be 0. */
++static void
++vl_ep0_in_next(void)
++{
++	uint32_t n = MIN(vl.in_left, 64u);
++	vl_fifo_write(0, vl.in_data, n);
++	vl.in_data += n;
++	vl.in_left -= n;
++	bool last = vl.in_left == 0 && !(n == 64 && vl.in_zlp);
++	if (n < 64) {
++		vl.in_zlp = false;
++	}
++	wr16(vl.musb, MUSB_CSR0, CSR0_TXPKTRDY | (last ? CSR0_DATAEND : 0));
++	vl.ep0 = last ? EP0_STATUS : EP0_IN;
++}
++
++static void
++vl_setup(void)
++{
++	uint8_t st[8];
++	uint16_t count = rd16(vl.musb, MUSB_COUNT0);
++	if (count != 8) {
++		wr16(vl.musb, MUSB_CSR0, CSR0_SVDRXPKTRDY | CSR0_SENDSTALL);
++		return;
++	}
++	vl_fifo_read(0, st, 8);
++	vl.setups++;
++	uint8_t type = st[0], req = st[1];
++	uint16_t value = (uint16_t)(st[2] | st[3] << 8);
++	uint16_t index = (uint16_t)(st[4] | st[5] << 8);
++	uint16_t length = (uint16_t)(st[6] | st[7] << 8);
++	const uint8_t *data = NULL;
++	uint32_t n = 0;
++	bool ok = true;
++
++	if ((type & 0x60) != 0) {       /* only standard requests */
++		ok = false;
++	} else if (req == 6 && (type & 0x80)) {         /* GET_DESCRIPTOR */
++		switch (value >> 8) {
++		case 1: data = vl_dev_desc; n = sizeof(vl_dev_desc); break;
++		case 2:
++			vl.hs = (rd8(vl.musb, MUSB_POWER) & POWER_HSMODE) != 0;
++			vl_cfg_desc[22] = vl_cfg_desc[29] = (uint8_t)vl_mps();
++			vl_cfg_desc[23] = vl_cfg_desc[30] = (uint8_t)(vl_mps() >> 8);
++			data = vl_cfg_desc; n = sizeof(vl_cfg_desc);
++			break;
++		case 3: n = vl_string(value & 0xff, vl.ep0_buf); data = vl.ep0_buf; ok = n != 0; break;
++		case 6: data = vl_qual_desc; n = sizeof(vl_qual_desc); break;
++		default: ok = false; break;
++		}
++	} else if (req == 5 && type == 0x00) {          /* SET_ADDRESS */
++		vl.new_addr = (uint8_t)(value & 0x7f);
++	} else if (req == 9 && type == 0x00) {          /* SET_CONFIGURATION */
++		vl.configured = value != 0;
++		if (vl.configured) {
++			vl.hs = (rd8(vl.musb, MUSB_POWER) & POWER_HSMODE) != 0;
++			vl_ep1_config();
++			printf("VIVA LINK: configured, %s speed\n", vl.hs ? "high" : "full");
++		}
++	} else if (req == 8 && (type & 0x80)) {         /* GET_CONFIGURATION */
++		vl.ep0_buf[0] = vl.configured ? 1 : 0; data = vl.ep0_buf; n = 1;
++	} else if (req == 0 && (type & 0x80)) {         /* GET_STATUS */
++		vl.ep0_buf[0] = 0; vl.ep0_buf[1] = 0; data = vl.ep0_buf; n = 2;
++	} else if (req == 10 && (type & 0x80)) {        /* GET_INTERFACE */
++		vl.ep0_buf[0] = 0; data = vl.ep0_buf; n = 1;
++	} else if (req == 11 && type == 0x01) {         /* SET_INTERFACE */
++	} else if (req == 1 && type == 0x02) {          /* CLEAR_FEATURE(ENDPOINT_HALT): reset the toggle */
++		if ((index & 0x7f) == 1) {
++			wr8(vl.musb, MUSB_INDEX, 1);
++			if (index & 0x80) {
++				wr16(vl.musb, MUSB_TXCSR, TXCSR_MODE | TXCSR_CLRDATATOG);
++			} else {
++				wr16(vl.musb, MUSB_RXCSR, RXCSR_CLRDATATOG);
++			}
++			wr8(vl.musb, MUSB_INDEX, 0);
++		}
++	} else {
++		ok = false;
++	}
++	if (!ok || (!(type & 0x80) && length != 0)) {   /* no OUT data stages */
++		wr16(vl.musb, MUSB_CSR0, CSR0_SVDRXPKTRDY | CSR0_SENDSTALL);
++		vl.ep0 = EP0_IDLE;
++		return;
++	}
++	if (!(type & 0x80)) {
++		wr16(vl.musb, MUSB_CSR0, CSR0_SVDRXPKTRDY | CSR0_DATAEND);
++		vl.ep0 = EP0_STATUS;
++		return;
++	}
++	if (n > length) {
++		n = length;
++	}
++	vl.in_data = data;
++	vl.in_left = n;
++	vl.in_zlp = n < length;                         /* a short transfer ending on 64 needs a ZLP */
++	wr16(vl.musb, MUSB_CSR0, CSR0_SVDRXPKTRDY);
++	vl_ep0_in_next();
++}
++
++/* Endpoint 0 interrupt (INTRTX bit 0). */
++static void
++vl_ep0(void)
++{
++	wr8(vl.musb, MUSB_INDEX, 0);
++	uint16_t csr = rd16(vl.musb, MUSB_CSR0);
++	if (csr & CSR0_SENTSTALL) {
++		wr16(vl.musb, MUSB_CSR0, 0);
++		vl.ep0 = EP0_IDLE;
++		csr = rd16(vl.musb, MUSB_CSR0);
++	}
++	if (csr & CSR0_SETUPEND) {
++		wr16(vl.musb, MUSB_CSR0, CSR0_SVDSETUPEND);
++		vl.ep0 = EP0_IDLE;
++		csr = rd16(vl.musb, MUSB_CSR0);
++	}
++	switch (vl.ep0) {
++	case EP0_IN:
++		if (!(csr & CSR0_TXPKTRDY)) {
++			vl_ep0_in_next();
++		}
++		return;
++	case EP0_STATUS:                /* status stage done */
++		if (vl.new_addr) {
++			wr8(vl.musb, MUSB_FADDR, vl.new_addr);
++			vl.new_addr = 0;
++		}
++		vl.ep0 = EP0_IDLE;
++		break;
++	case EP0_IDLE:
++		break;
++	}
++	if (csr & CSR0_RXPKTRDY) {
++		vl_setup();
++	}
++}
++
++/* Queue reply text (truncated to the buffer). */
++static void
++vl_reply(const char *fmt, ...) __printflike(1, 2);
++
++static void
++vl_reply(const char *fmt, ...)
++{
++	va_list ap;
++	if (vl.reply_len >= sizeof(vl.reply) - 1) {
++		return;
++	}
++	va_start(ap, fmt);
++	int n = vsnprintf(vl.reply + vl.reply_len, sizeof(vl.reply) - vl.reply_len, fmt, ap);
++	va_end(ap);
++	if (n > 0) {
++		vl.reply_len = MIN(vl.reply_len + (uint32_t)n, (uint32_t)sizeof(vl.reply) - 1);
++	}
++}
++
++static bool
++vl_arg(char **p, uint64_t *v)
++{
++	char *s = *p;
++	while (*s == ' ') {
++		s++;
++	}
++	if (*s == 0) {
++		return false;
++	}
++	char *end;
++	*v = strtouq(s, &end, 0);
++	if (end == s) {
++		return false;
++	}
++	*p = end;
++	return true;
++}
++
++/*
++ * Commands (one per OUT packet, text):
++ *   ping | stat | help
++ *   peek PA [WORDS]   read 32-bit words of physical memory/MMIO (max 64)
++ *   poke PA VALUE     write one 32-bit word, then read it back
++ *   rewind [BYTES]    resend the log from BYTES back (default: whole ring)
++ *   panic [TEXT]      panic (to test the panic path)
++ *   reboot            watchdog software reset (back through preloader/LK)
++ * peek/poke have no guard: an address in a gated block can hang the bus.
++ */
++static void
++vl_command(void)
++{
++	char *c = vl.cmd, *rest;
++	uint64_t a, v;
++
++	vl.cmds++;
++	vl.reply_len = vl.reply_pos = 0;
++	vl.reply_end = true;
++	while (*c == ' ') {
++		c++;
++	}
++	for (rest = c; *rest && *rest != ' '; rest++) {
++	}
++	size_t len = (size_t)(rest - c);
++#define IS(word) (len == sizeof(word) - 1 && strncmp(c, word, len) == 0)
++	if (IS("ping")) {
++		vl_reply("pong\n");
++	} else if (IS("stat")) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		vl_reply("uptime %llu ms, %s speed, address %u\n", ns / NSEC_PER_MSEC,
++		    vl.hs ? "high" : "full", rd8(vl.musb, MUSB_FADDR));
++		vl_reply("log: total %llu bytes, sent up to %llu (%llu bytes this link)\n",
++		    sweet_log_position(), vl.log_pos, vl.log_bytes);
++		vl_reply("usb: %llu resets, %llu setups, %llu commands, %llu IN packets, %llu OUT packets\n",
++		    vl.resets, vl.setups, vl.cmds, vl.tx_pkts, vl.rx_pkts);
++	} else if (IS("peek") && vl_arg(&rest, &a)) {
++		uint64_t words = 1;
++		(void)vl_arg(&rest, &words);
++		words = MIN(MAX(words, 1ull), 64ull);
++		a &= ~3ull;
++		for (uint64_t i = 0; i < words; i++) {
++			if (i % 4 == 0) {
++				vl_reply("%s%010llx:", i ? "\n" : "", a + 4 * i);
++			}
++			vl_reply(" %08x", ml_phys_read_word_64(a + 4 * i));
++		}
++		vl_reply("\n");
++	} else if (IS("poke") && vl_arg(&rest, &a) && vl_arg(&rest, &v)) {
++		a &= ~3ull;
++		ml_phys_write_word_64(a, (unsigned int)v);
++		vl_reply("%010llx <- %08x, reads %08x\n", a, (unsigned int)v, ml_phys_read_word_64(a));
++	} else if (IS("rewind")) {
++		uint64_t total = sweet_log_position(), back = UINT64_MAX;
++		(void)vl_arg(&rest, &back);
++		vl.log_pos = back >= total ? 0 : total - back;
++		vl_reply("log rewound to %llu\n", vl.log_pos);
++	} else if (IS("panic")) {
++		while (*rest == ' ') {
++			rest++;
++		}
++		panic("VIVA LINK: panic command: %s", rest);
++	} else if (IS("reboot")) {
++		printf("VIVA LINK: reboot (WDT_MODE 0x%08x)\n", rd32(vl.toprgu, WDT_MODE));
++		for (;;) {
++			wr32(vl.toprgu, WDT_SWRST, WDT_SWRST_KEY);
++			delay(5000);
++		}
++	} else if (IS("help")) {
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | rewind [BYTES] | panic [TEXT] | reboot\n");
++	} else {
++		vl_reply("unknown command: %s (try help)\n", c);
++	}
++#undef IS
++}
++
++/* One bulk IN frame if the endpoint is free: reply first, then log. Index 1. */
++static bool
++vl_tx(void)
++{
++	static uint8_t pkt[512];
++	uint16_t csr = rd16(vl.musb, MUSB_TXCSR);
++	if (csr & (TXCSR_UNDERRUN | TXCSR_SENTSTALL)) {
++		wr16(vl.musb, MUSB_TXCSR, TXCSR_MODE);
++		csr = rd16(vl.musb, MUSB_TXCSR);
++	}
++	if (csr & (TXCSR_TXPKTRDY | TXCSR_FIFONOTEMPTY)) {
++		return false;
++	}
++	uint32_t room = vl_mps() - 4, n;
++	uint8_t type;
++	if (vl.reply_pos < vl.reply_len) {
++		n = MIN(room, vl.reply_len - vl.reply_pos);
++		memcpy(pkt + 4, vl.reply + vl.reply_pos, n);
++		vl.reply_pos += n;
++		type = 'R';
++	} else if (vl.reply_end) {
++		vl.reply_end = false;
++		n = 0;
++		type = 'E';
++	} else {
++		n = sweet_log_copy(&vl.log_pos, (char *)pkt + 4, room);
++		if (n == 0) {
++			return false;
++		}
++		vl.log_bytes += n;
++		type = 'L';
++	}
++	pkt[0] = 'V';
++	pkt[1] = type;
++	pkt[2] = (uint8_t)n;
++	pkt[3] = (uint8_t)(n >> 8);
++	vl_fifo_write(1, pkt, n + 4);
++	wr16(vl.musb, MUSB_TXCSR, TXCSR_MODE | TXCSR_TXPKTRDY);
++	vl.tx_pkts++;
++	return true;
++}
++
++/* One bulk OUT command packet, if any. Index 1. */
++static void
++vl_rx(void)
++{
++	uint16_t csr = rd16(vl.musb, MUSB_RXCSR);
++	if (!(csr & RXCSR_RXPKTRDY)) {
++		return;
++	}
++	uint32_t n = MIN((uint32_t)rd16(vl.musb, MUSB_RXCOUNT), (uint32_t)sizeof(vl.cmd) - 1);
++	vl_fifo_read(1, (uint8_t *)vl.cmd, n);
++	wr16(vl.musb, MUSB_RXCSR, 0);
++	vl.rx_pkts++;
++	while (n > 0 && (vl.cmd[n - 1] == '\n' || vl.cmd[n - 1] == '\r' || vl.cmd[n - 1] == 0)) {
++		n--;
++	}
++	vl.cmd[n] = 0;
++	if (vl.reply_pos < vl.reply_len || vl.reply_end) {
++		return;                 /* previous reply still going out: one command at a time */
++	}
++	printf("VIVA LINK: command \"%s\"\n", vl.cmd);
++	vl_command();
++}
++
++static void
++vl_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (;;) {
++		uint8_t usb = rd8(vl.musb, MUSB_INTRUSB);
++		uint16_t tx = rd16(vl.musb, MUSB_INTRTX);
++		uint16_t rx = rd16(vl.musb, MUSB_INTRRX);
++		if (usb) {
++			wr8(vl.musb, MUSB_INTRUSB, usb);
++		}
++		if (tx) {
++			wr16(vl.musb, MUSB_INTRTX, tx);
++		}
++		if (rx) {
++			wr16(vl.musb, MUSB_INTRRX, rx);
++		}
++		if (usb & INTR_RESET) {
++			vl.resets++;
++			vl.ep0 = EP0_IDLE;
++			vl.new_addr = 0;
++			vl.configured = false;
++			vl.hs = (rd8(vl.musb, MUSB_POWER) & POWER_HSMODE) != 0;
++			wr8(vl.musb, MUSB_FADDR, 0);
++			printf("VIVA LINK: bus reset (%s speed)\n", vl.hs ? "high" : "full");
++		}
++		if (usb & INTR_DISCON) {
++			vl.configured = false;
++		}
++		/* ep0: on its interrupt, and on a waiting SETUP in case the bit was missed */
++		wr8(vl.musb, MUSB_INDEX, 0);
++		if ((tx & 1) || (vl.ep0 == EP0_IDLE && (rd16(vl.musb, MUSB_CSR0) & CSR0_RXPKTRDY))) {
++			vl_ep0();
++		}
++		if (vl.configured) {
++			wr8(vl.musb, MUSB_INDEX, 1);
++			vl_rx();
++			/* up to 64 packets per wakeup, while the host keeps reading */
++			for (int i = 0; i < 64; i++) {
++				if (!vl_tx()) {
++					delay(20);
++					if (!vl_tx()) {
++						break;
++					}
++				}
++			}
++			wr8(vl.musb, MUSB_INDEX, 0);
++		}
++		vl_sleep_ms(1);
++	}
++}
++
++static void
++viva_link_start(vm_offset_t tphy, vm_offset_t musb)
++{
++	thread_t thread;
++
++	vl.musb = musb;
++	vl.toprgu = ml_io_map(TOPRGU_PA, 0x1000);
++	vl.log_pos = 0;                 /* whole ring: the boot so far */
++
++	/* T-PHY u2: MediaTek usb_phy_recover (leave suspend, USB function, no BC1.1) */
++	clr32(tphy, U3P_USBPHYACR7, 1u << 12);          /* PUPD_BIST_EN */
++	clr32(tphy, U3P_U2PHYDTM0, 1u << 26);           /* FORCE_UART_EN */
++	clr32(tphy, U3P_U2PHYDTM1, 1u << 16);           /* RG_UART_EN */
++	clr32(tphy, U3P_U2PHYACR4, 3u << 8);            /* GPIO_CTL, USB20_GPIO_MODE */
++	clr32(tphy, U3P_USBPHYACR6, 1u << 23);          /* BC11_SW_EN */
++	set32(tphy, U3P_U2PHYACR4, 1u << 18);           /* DP_100K_MODE */
++	clr32(tphy, U3P_U2PHYACR4, 3u << 16);           /* DP/DM_100K_EN */
++	clr32(tphy, U3P_USBPHYACR5, 1u << 11);          /* HS_100U_U3_EN */
++	set32(tphy, U3P_USBPHYACR6, 1u << 20);          /* OTG_VBUSCMP_EN */
++	clr32(tphy, U3P_U2PHYDTM0, 1u << 18);           /* FORCE_SUSPENDM */
++	clr32(tphy, U3P_U2PHYDTM0, (3u << 6) | (3u << 4) | (1u << 2) | (0xfu << 10));
++	clr32(tphy, U3P_U2PHYDTM0, (1u << 17) | (1u << 19) | (1u << 20) | (1u << 21) | (1u << 23));
++	delay(800);
++	/* device mode: VBUSVALID, AVALID, BVALID, IDDIG, IDPULLUP = 1, SESSEND = 0, all forced */
++	clr32(tphy, U3P_U2PHYDTM1, 1u << 4);
++	set32(tphy, U3P_U2PHYDTM1, 0x2fu);
++	set32(tphy, U3P_U2PHYDTM1, 0x3fu << 8);
++	delay(1000);
++	printf("VIVA LINK: phy dtm0 0x%08x dtm1 0x%08x acr6 0x%08x\n",
++	    rd32(tphy, U3P_U2PHYDTM0), rd32(tphy, U3P_U2PHYDTM1), rd32(tphy, U3P_USBPHYACR6));
++
++	/* MUSB: disconnected, interrupts masked at the MediaTek level, then connect */
++	wr8(musb, MUSB_POWER, rd8(musb, MUSB_POWER) & ~POWER_SOFTCONN);
++	wr32(musb, MTK_L1INTM, 0);
++	wr8(musb, MUSB_INTRUSBE, 0);
++	wr16(musb, MUSB_INTRTXE, 0);
++	wr16(musb, MUSB_INTRRXE, 0);
++	wr8(musb, MUSB_INTRUSB, rd8(musb, MUSB_INTRUSB));
++	wr16(musb, MUSB_INTRTX, rd16(musb, MUSB_INTRTX));
++	wr16(musb, MUSB_INTRRX, rd16(musb, MUSB_INTRRX));
++	wr8(musb, MUSB_FADDR, 0);
++	wr8(musb, MUSB_INDEX, 0);
++	wr16(musb, MUSB_INTRTXE, 0x0003);               /* ep0, ep1 IN */
++	wr16(musb, MUSB_INTRRXE, 0x0002);               /* ep1 OUT */
++	wr8(musb, MUSB_INTRUSBE, INTR_RESET | INTR_RESUME | INTR_SUSPEND | INTR_DISCON);
++	wr8(musb, MUSB_DEVCTL, rd8(musb, MUSB_DEVCTL) | DEVCTL_SESSION);
++	wr8(musb, MUSB_POWER, POWER_HSENAB | POWER_SOFTCONN);
++	printf("VIVA LINK: connected (power 0x%02x devctl 0x%02x), waiting for the host\n",
++	    rd8(musb, MUSB_POWER), rd8(musb, MUSB_DEVCTL));
++
++	if (kernel_thread_start(vl_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

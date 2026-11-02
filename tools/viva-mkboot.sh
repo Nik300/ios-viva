@@ -6,6 +6,8 @@
 #   nostorage  no UFS node: the kernel never touches storage, panics at root mount
 #   ufs-ro     UFS node, writes refused (no ufsrw): finds "userdata" and tries to mount it
 #   ufs-rw     iOS root in userdata, read-write; writes stay inside that partition
+# Env: VIVA_CMDLINE replaces the whole command line; VIVA_EXTRA sets single
+# boot-args on top of it (e.g. VIVA_EXTRA="cpus=6 vivausb=3").
 # Every stage turns off sweet's Qualcomm drivers (keys, touch, USB, persistent
 # log): their fixed MMIO addresses are other blocks on MT6781.
 set -euo pipefail
@@ -23,6 +25,11 @@ ufs-rw) ADT_FLAGS=(--viva --ufs)
 *) echo "unknown stage $STAGE" >&2; exit 2 ;;
 esac
 CMDLINE=${VIVA_CMDLINE:-$CMDLINE}
+# VIVA_EXTRA="cpus=6 vivausb=3": set/replace single boot-args (XNU uses the first match)
+for arg in ${VIVA_EXTRA:-}; do
+	key=${arg%%=*}
+	CMDLINE="$(printf ' %s ' "$CMDLINE" | sed -E "s/ -?$key(=[^ ]*)? / /g; s/^ +//; s/ +$//") $arg"
+done
 echo "stage $STAGE: $CMDLINE"
 
 mkdir -p shim/out

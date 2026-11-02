@@ -80,7 +80,8 @@ initrd properties.
 4. ✅ **iOS 16.7.16 lock screen** (2026-11-02, ufs-rw stage, ~20 min first boot): backboardd and
    SpringBoard up, black wallpaper, red date/time, static "charging" battery, gesture bar.
    No input yet (sweet's Qualcomm key/touch drivers are off).
-5. ⏳ USB link (MUSB device mode: log stream + command channel), patch 0092 = step 1 probe.
+5. ⏳ USB link (MUSB device mode: log stream + command channel), patch 0092 = step 1 probe,
+   patch 0093 = the link (`vivausb=3`), written and compile/link-checked, untested on the phone.
 6. Keys (MT6366 PMIC via pwrap), touch (Goodix on MTK I²C), then SMP/perf, battery, GPU.
 
 ## Handoff (2026-11-02, end of session)
@@ -95,20 +96,31 @@ dtm0 02040000 dtm1 00000000 | musb hw e503 ep 88 fa 00 pw 20 dc 80 ie 06 tx 01ff
 Reading: MUSB clocked, peripheral mode, soft-disconnected (POWER.SOFTCONN=0), 8 TX + 8 RX
 endpoints; T-PHY u2 forced into suspend (DTM0 FORCE_SUSPENDM). No clock needs enabling.
 
-Next: patch 0093 "viva link" (`vivausb=3`): wake the T-PHY (Linux phy-mtk-tphy
-u2 power-on sequence, force VBUS/B-session valid in DTM1), MUSB peripheral EP0
-enumeration, one bulk IN (log stream from `sweet_log_copy()` + command responses) and
-one bulk OUT (commands), polling kernel thread; host tool `tools/viva-link.py`
-(pyusb + Homebrew libusb). Then keys (MT6366 PMIC via pwrap), touch (Goodix on MTK I²C).
+Patch 0093 "viva link" (`vivausb=3`, written 2026-11-02, untested): wakes the T-PHY (MediaTek
+usb_phy_recover sequence, DTM1 forced to device: VBUSVALID/AVALID/BVALID/IDDIG, SESSEND=0),
+MUSB peripheral in PIO (no DMA), interrupt line masked (L1INTM=0), a kernel thread polls
+every 1 ms. Device 1209:0002 "viva iOS link", vendor interface, bulk 0x81 IN / 0x01 OUT.
+IN frames `'V' type len16 payload`: `L` console ring from the start of the boot, `R` reply,
+`E` end of reply. Commands: ping, stat, help, peek PA [WORDS], poke PA VALUE, rewind [BYTES],
+panic [TEXT], reboot (toprgu WDT_SWRST). It starts in `sweet_ufs_rootdev()` *before* UFS, so it
+also works in the `nostorage` stage and when UFS fails; it does not run during a panic yet.
+Host: `tools/viva-link.py [-o FILE] [log|cmd CMD...]` (pyusb + Homebrew libusb).
+
+Build: `VIVA_EXTRA="cpus=6 vivausb=3" tools/viva-mkboot.sh KERNEL STOCK ufs-rw`.
+
+If it does not enumerate, things to check in order: the `VIVA LINK: phy ...` / `connected (power
+.. devctl ..)` lines on screen (POWER should read 0x60 or 0x70, DEVCTL bit 0 set); then bus
+reset lines; DTM0 bit 25 (unknown, left as LK set it); MediaTek-specific registers not touched
+(0x80/0x84 data toggle, PHY tuning). Then keys (MT6366 PMIC via pwrap), touch (Goodix on MTK I²C).
 
 Workflow notes:
 - Kernel patches are made against a local xnu-8796.141.3 tree with all
   `xnu/patches/*.patch` applied in order (`git apply`; 0031/0041 need the CI's HFS
   staging script and can be skipped locally). CI silently skips a patch that does not
   apply, so check each new patch with `git apply --check` on that tree.
-- Single files compile-check locally with `tools/xnu-cc.py` against the `xnu-buildtree`
-  artifact and the CI log (`gh run view RUN --log`), after replacing its CI_DXB path
-  (`/Users/runner/work/ios-viva/ios-viva/dxb`) and CLANG (`/usr/bin/clang`).
+- Single files compile-check locally with `tools/xnu-cc.py LOG BUILDTREE FILES` against the
+  `xnu-buildtree` artifact (it holds the patched source: edit there, `git diff` = next patch)
+  and the CI log (`gh run view RUN --log`); CI_DXB/CLANG in it are set for this fork.
 - Build: `gh workflow run xnu.yml -R Nik300/ios-viva --ref viva` (~1 h), then
   `tools/viva-mkboot.sh KERNEL ~/Developer/ios-viva/stock/boot.img STAGE`; extra boot-args via
   `VIVA_CMDLINE`. Debug features stay compiled in and are switched by boot-args.
