@@ -92,6 +92,8 @@ def node(name, props=(), children=()):
 
 # Linux IRQ_TYPE_* in the second interrupt cell (SweetGIC.cpp)
 IRQ_EDGE_RISING, IRQ_LEVEL_HIGH = 1, 4
+# HID consumer-page usages (IOHIDUsageTables.h)
+HID_CSMR_POWER, HID_CSMR_VOLUME_UP, HID_CSMR_VOLUME_DOWN = 0x30, 0xe9, 0xea
 
 
 def spi(n, flags):
@@ -104,13 +106,21 @@ def viva_devices(ph, gic_ph):
     io = lambda pa, size: u64(pa - SOC_BASE, size)
     return [
         # MediaTek keypad (kp@10010000, SPI 73 edge): iokit/Kernel/arm/hid/VivaKeypad.cpp.
-        # keymap = <bit usage> pairs, filled in once the board's bits are known.
+        # keymap = <bit usage> pairs (HID consumer page). Volume down is kpd-hw-init-map
+        # index 0 = bit 0 (measured 2026-11-03); power and volume up are PMIC keys.
         node('keypad', [
             ph(),
             ('compatible', cstr('mediatek,mt6781-keypad')),
             ('reg', io(0x10010000, 0x1000)),
             ('interrupt-parent', u32(gic_ph)),
             ('interrupts', spi(0x49, IRQ_EDGE_RISING)),
+            ('keymap', u32(0, HID_CSMR_VOLUME_DOWN)),
+        ]),
+        # PMIC wrapper (pwrap@1000d000) to the MT6366: iokit/Kernel/arm/VivaPwrap.cpp, read only.
+        node('pwrap', [
+            ph(),
+            ('compatible', cstr('mediatek,mt6781-pwrap')),
+            ('reg', io(0x1000d000, 0x1000)),
         ]),
     ]
 

@@ -1,0 +1,292 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index c6ca9ef..7c8eef9 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -205,6 +205,7 @@ static inline void clr32(vm_offset_t b, uint32_t o, uint32_t m) { wr32(b, o, rd3
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);   /* bsd/dev/sweet_ufs.c */
+ extern uint64_t sweet_log_position(void);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern int viva_pwrap_read(uint32_t addr, uint32_t *value);               /* iokit/Kernel/arm/VivaPwrap.cpp */
+ 
+ static void
+ vl_sleep_ms(unsigned ms)
+@@ -484,6 +485,7 @@ vl_arg(char **p, uint64_t *v)
+  *   peek PA [WORDS]   read 32-bit words of physical memory/MMIO (max 64)
+  *   poke PA VALUE     write one 32-bit word, then read it back
+  *   rewind [BYTES]    resend the log from BYTES back (default: whole ring)
++ *   pmic ADDR [N]     read N (max 32) 16-bit PMIC registers through pwrap (read only)
+  *   panic [TEXT]      panic (to test the panic path)
+  *   reboot            watchdog software reset (back through preloader/LK)
+  * peek/poke have no guard: an address in a gated block can hang the bus.
+@@ -531,6 +533,22 @@ vl_command(void)
+ 		a &= ~3ull;
+ 		ml_phys_write_word_64(a, (unsigned int)v);
+ 		vl_reply("%010llx <- %08x, reads %08x\n", a, (unsigned int)v, ml_phys_read_word_64(a));
++	} else if (IS("pmic") && vl_arg(&rest, &a)) {
++		uint64_t n = 1;
++		(void)vl_arg(&rest, &n);
++		n = MIN(MAX(n, 1ull), 32ull);
++		a &= ~1ull;
++		for (uint64_t i = 0; i < n; i++) {
++			uint32_t val = 0;
++			int err = viva_pwrap_read((uint32_t)(a + 2 * i), &val);
++			if (err) {
++				vl_reply("pmic 0x%04llx: error %d\n", a + 2 * i, err);
++				break;
++			}
++			vl_reply("%spmic 0x%04llx:", i % 8 ? "" : (i ? "\n" : ""), a + 2 * i);
++			vl_reply(" %04x", val);
++		}
++		vl_reply("\n");
+ 	} else if (IS("rewind")) {
+ 		uint64_t total = sweet_log_position(), back = UINT64_MAX;
+ 		(void)vl_arg(&rest, &back);
+@@ -548,7 +566,7 @@ vl_command(void)
+ 			delay(5000);
+ 		}
+ 	} else if (IS("help")) {
+-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | rewind [BYTES] | panic [TEXT] | reboot\n");
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | rewind [BYTES] | panic [TEXT] | reboot\n");
+ 	} else {
+ 		vl_reply("unknown command: %s (try help)\n", c);
+ 	}
+diff --git a/iokit/Kernel/arm/VivaPwrap.cpp b/iokit/Kernel/arm/VivaPwrap.cpp
+new file mode 100644
+index 0000000..6c48d02
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaPwrap.cpp
+@@ -0,0 +1,161 @@
++/*
++ * viva (MT6781): MediaTek PMIC wrapper ("pwrap", 0x1000d000), the AP's
++ * channel to the MT6366 PMIC (MT6358 register layout). Matches the
++ * /arm-io/pwrap nub ("mediatek,mt6781-pwrap").
++ *
++ * LK initializes the wrapper; this driver only uses the AP's software
++ * channel WACS2 as Xiaomi's kernel does for this SoC
++ * (drivers/soc/mediatek/mtk-pmic-wrap.c, pwrap_mt6781, viva-r-oss):
++ *   wait WACS2_RDATA.FSM == IDLE, WACS2_CMD = (addr >> 1) << 16,
++ *   wait FSM == WFVLDCLR, data = WACS2_RDATA[15:0], WACS2_VLDCLR = 1.
++ * WACS2_CMD bit 31 would make it a PMIC *write*. This step is read-only:
++ * there is no write path, and readPMIC() refuses anything that could set
++ * bit 31. The regulators live in the same PMIC; writes come later, behind
++ * an explicit register whitelist.
++ *
++ * C entry point viva_pwrap_read() for the USB link's "pmic" command.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOLocks.h>
++
++#define PWRAP_INIT_DONE0        0x090
++#define PWRAP_WACS2_EN          0x09c
++#define PWRAP_WACS2_CMD         0xc20
++#define PWRAP_WACS2_RDATA       0xc24
++#define PWRAP_WACS2_VLDCLR      0xc28
++
++#define WACS_FSM(x)             (((x) >> 16) & 7)
++#define WACS_FSM_IDLE           0
++#define WACS_FSM_WFVLDCLR       6
++#define WACS_INIT_DONE0_V2      (1u << 22)
++
++/* MT6358/MT6366 registers (include/linux/mfd/mt6358/registers.h) */
++#define MT6358_HWCID            0x008
++#define MT6358_SWCID            0x00a
++#define MT6358_TOPSTATUS        0x028   /* bit 1 PWRKEY_DEB, bit 3 HOMEKEY_DEB (0 = pressed) */
++#define MT6358_TOP_INT_STATUS0  0x19e
++#define MT6358_PSC_TOP_INT_CON0 0x910   /* bit 0 pwrkey, 1 homekey, 2 pwrkey_r, 3 homekey_r */
++#define MT6358_PSC_TOP_INT_MASK_CON0 0x916
++#define MT6358_PSC_TOP_INT_STATUS0 0x91c
++#define MT6358_PSC_TOP_INT_RAW_STATUS0 0x91e
++
++class VivaPwrap : public IOService {
++	OSDeclareDefaultStructors(VivaPwrap);
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn readPMIC(uint32_t addr, uint32_t *value);
++
++private:
++	bool waitFSM(uint32_t fsm);
++	inline uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(fRegs + off); }
++	inline void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(fRegs + off) = v; }
++
++	IOMemoryMap *fMap;
++	vm_offset_t  fRegs;
++	IOLock      *fLock;
++	uint32_t     fTimeouts;
++};
++
++OSDefineMetaClassAndStructors(VivaPwrap, IOService);
++
++static VivaPwrap *gVivaPwrap;
++
++bool
++VivaPwrap::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	fLock = IOLockAlloc();
++	fMap = provider->mapDeviceMemoryWithIndex(0);
++	if (fLock == NULL || fMap == NULL) {
++		IOLog("VIVA PWRAP: cannot map registers\n");
++		return false;
++	}
++	fRegs = (vm_offset_t)fMap->getVirtualAddress();
++
++	uint32_t rdata = rd32(PWRAP_WACS2_RDATA);
++	IOLog("VIVA PWRAP: init_done0 0x%x wacs2_en 0x%x wacs2_rdata 0x%08x (fsm %u, init %u)\n",
++	    rd32(PWRAP_INIT_DONE0), rd32(PWRAP_WACS2_EN), rdata, WACS_FSM(rdata),
++	    (rdata & WACS_INIT_DONE0_V2) != 0);
++	if (!(rdata & WACS_INIT_DONE0_V2)) {
++		IOLog("VIVA PWRAP: WACS2 not initialized by LK, not using it\n");
++		return false;
++	}
++
++	uint32_t hw = 0, sw = 0, top = 0, topint = 0, con = 0, mask = 0, sta = 0, raw = 0;
++	IOReturn ret = readPMIC(MT6358_HWCID, &hw);
++	if (ret == kIOReturnSuccess) {
++		readPMIC(MT6358_SWCID, &sw);
++		readPMIC(MT6358_TOPSTATUS, &top);
++		readPMIC(MT6358_TOP_INT_STATUS0, &topint);
++		readPMIC(MT6358_PSC_TOP_INT_CON0, &con);
++		readPMIC(MT6358_PSC_TOP_INT_MASK_CON0, &mask);
++		readPMIC(MT6358_PSC_TOP_INT_STATUS0, &sta);
++		readPMIC(MT6358_PSC_TOP_INT_RAW_STATUS0, &raw);
++	}
++	IOLog("VIVA PWRAP: PMIC hwcid 0x%04x swcid 0x%04x (%s) topstatus 0x%04x top_int 0x%04x "
++	    "psc con 0x%04x mask 0x%04x sta 0x%04x raw 0x%04x (%d)\n", hw, sw,
++	    (hw & 0xff00) == 0x6600 ? "MT6366" : (hw & 0xff00) == 0x5800 ? "MT6358" : "unknown",
++	    top, topint, con, mask, sta, raw, ret);
++
++	gVivaPwrap = this;
++	registerService();
++	return true;
++}
++
++bool
++VivaPwrap::waitFSM(uint32_t fsm)
++{
++	for (int i = 0; i < 10000; i++) {       /* ~10 ms, like Linux */
++		if (WACS_FSM(rd32(PWRAP_WACS2_RDATA)) == fsm) {
++			return true;
++		}
++		IODelay(1);
++	}
++	fTimeouts++;
++	return false;
++}
++
++IOReturn
++VivaPwrap::readPMIC(uint32_t addr, uint32_t *value)
++{
++	if (value == NULL || (addr & 1) || addr > 0xfffe) {
++		return kIOReturnBadArgument;
++	}
++	uint32_t cmd = (addr >> 1) << 16;       /* bit 31 clear: a read */
++	if (cmd & 0x80000000u) {
++		return kIOReturnNotPermitted;
++	}
++	IOReturn ret = kIOReturnTimeout;
++	IOLockLock(fLock);
++	if (WACS_FSM(rd32(PWRAP_WACS2_RDATA)) == WACS_FSM_WFVLDCLR) {
++		wr32(PWRAP_WACS2_VLDCLR, 1);    /* a previous read left it waiting */
++	}
++	if (waitFSM(WACS_FSM_IDLE)) {
++		wr32(PWRAP_WACS2_CMD, cmd);
++		if (waitFSM(WACS_FSM_WFVLDCLR)) {
++			*value = rd32(PWRAP_WACS2_RDATA) & 0xffff;
++			wr32(PWRAP_WACS2_VLDCLR, 1);
++			ret = kIOReturnSuccess;
++		}
++	}
++	IOLockUnlock(fLock);
++	return ret;
++}
++
++extern "C" int
++viva_pwrap_read(uint32_t addr, uint32_t *value)
++{
++	if (gVivaPwrap == NULL) {
++		return -1;
++	}
++	return gVivaPwrap->readPMIC(addr, value) == kIOReturnSuccess ? 0 : -2;
++}
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/hid/VivaKeypad.cpp b/iokit/Kernel/arm/hid/VivaKeypad.cpp
+index 1f9b70a..ca83db5 100644
+--- a/iokit/Kernel/arm/hid/VivaKeypad.cpp
++++ b/iokit/Kernel/arm/hid/VivaKeypad.cpp
+@@ -9,8 +9,10 @@
+  * matrix position, 0 = pressed (Linux drivers/input/keyboard/mt6779-keypad.c).
+  * The ADT property "keymap" lists <bit usage> pairs: bit number in MEM1..5
+  * (MEM1 bit 0 = 0) and a HID consumer-page usage (0xe9 volume up, 0xea
+- * volume down, 0x30 power). Changes of unmapped bits are only logged, which
+- * is how the map of a new board is found.
++ * volume down, 0x30 power). Changes of unmapped bits are only logged (the
++ * first change of each), which is how the map of a new board is found. On
++ * viva one key shows up in 8 bits (0, 9, 34, 43, 68, 77, 102, 111 for
++ * volume down = kpd-hw-init-map index 0); only the first is mapped.
+  *
+  * Events are consumer-control keyboard events, the same usage pair and
+  * event kind as SweetHIDButtons and Apple's own button services.
+@@ -61,6 +63,7 @@ private:
+ 	uint32_t                fKeyUsage[KP_MAX_KEYS];
+ 	uint32_t                fNumKeys;
+ 	uint32_t                fInterrupts;
++	uint32_t                fLogged[KP_NUM_MEMS];   /* unmapped bits already logged */
+ };
+ 
+ OSDefineMetaClassAndStructors(VivaKeypad, IOHIDEventService);
+@@ -157,9 +160,16 @@ VivaKeypad::scan(void)
+ 					usage = fKeyUsage[k];
+ 				}
+ 			}
+-			IOLog("VIVA KP: bit %u %s (usage 0x%x, interrupt %u)\n", bit, down ? "down" : "up",
+-			    (unsigned)usage, fInterrupts);
+-			if (usage != 0) {
++			if (usage == 0) {
++				if (!(fLogged[m] & (1u << b))) {
++					fLogged[m] |= 1u << b;
++					IOLog("VIVA KP: unmapped bit %u %s (interrupt %u)\n", bit, down ? "down" : "up",
++					    fInterrupts);
++				}
++				continue;
++			}
++			IOLog("VIVA KP: key 0x%x %s\n", (unsigned)usage, down ? "down" : "up");
++			{
+ 				IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, usage, down);
+ 				if (event != NULL) {
+ 					dispatchEvent(event);
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index b2cd334..273ce6c 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -78,6 +78,11 @@ const char * gIOKernelConfigTables =
+     "     'IONameMatch'     = 'mediatek,mt6781-keypad';"
+     "   },"
+     "   {"
++    "     'IOClass'         = VivaPwrap;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'mediatek,mt6781-pwrap';"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetHIDButtons;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDButtons;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 5902f68..856d35d 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetGIC.cpp                                    optional iokitcpp
++iokit/Kernel/arm/VivaPwrap.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/VivaKeypad.cpp                              optional iokitcpp
