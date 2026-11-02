@@ -50,6 +50,7 @@ initrd properties.
 ## Milestones
 
 1. ✅ Own code runs (gzip Image), framebuffer drawable, text console, live RAM map.
-2. ⏳ XNU prints to the screen and reaches "waiting for root device".
+2. ✅ XNU boots to root mounting (2026-11-02, CI run 41525615211, 1 CPU): panics as designed with
+   `IOFindBSDRoot: SWEET UFS root ufsroot0 unavailable: 6` because the `--viva` ADT has no UFS node.
 3. Storage: MediaTek UFS (bring-up from LK's state), root in `userdata`.
 4. Lock screen; then touch (Goodix on MTK I²C) and keys (MT6366 PMIC).
