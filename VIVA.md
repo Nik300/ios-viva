@@ -18,9 +18,9 @@ is added next to it (`--viva` in `tools/mkadt.py`, `shim/viva.c`,
 | Framebuffer | `/chosen/atag,videolfb`: 0x7bc10000, ARGB8888, **pitch 1088 px**, 3 buffers |
 | RAM | 0x40000000–0x1c0000000 (6 GiB). All LK reservations below 0xc0000000, plus dramc-rk1 at 0x1bffff000 |
 | XNU RAM | 0xc0000000–0x1be000000 (last 32 MiB block below dramc-rk1) |
-| GICv3 | GICD 0x0c000000, GICR 0x0c040000 (DT size 0x200000: redistributor stride still to verify) |
+| GICv3 | GICD 0x0c000000, GICR 0x0c040000; redistributor stride 0x20000 works (6-core boot) |
 | Timer | 13 MHz, virtual timer PPI 11 = INTID 27 |
-| CPUs | 6× Cortex-A55 (MPIDR 0x000–0x500), 2× big (0x600, 0x700) |
+| CPUs | 6× Cortex-A55 (MPIDR 0x000–0x500), 2× big (0x600, 0x700). `cpus=6` boots to the lock screen; the big cores are untested |
 | UFS | MediaTek ufshci at 0x11270000, left running by LK. CAP 0x1587071f (64-bit DMA, 32 slots). LUN 0/1: no GPT (preloader); **LUN 2**: GPT, `userdata` at block 0x2ff800, 109735 MiB (= fastboot's 0x1aca7f8000) |
 
 ## Safety
