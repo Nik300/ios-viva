@@ -1,0 +1,132 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..6b91cb9 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/viva_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index f32aabb..d0aef66 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void viva_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -676,6 +677,7 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	viva_usb_probe();
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+new file mode 100644
+index 0000000..c779745
+--- /dev/null
++++ b/bsd/dev/viva_usb.c
+@@ -0,0 +1,94 @@
++/*
++ * viva (MT6781) USB, step 1: read-only state probe.
++ *
++ * The phone's USB is a MediaTek-flavoured Mentor MUSB (DT "mediatek,mt6781-usb20",
++ * 0x11200000, 16 endpoints) with a generic T-PHY v1 u2 port at 0x11ca0300; its
++ * "usb0" clock gate is in infracfg_ao (0x10001000, always on). LK drives this
++ * controller for fastboot. The probe reports the state it leaves behind and
++ * never writes a register. It prints what it has before every read that could
++ * hang on a gated block, so a hang still shows how far it got.
++ *
++ * Boot-arg vivausb: 0 (default) off, 1 probe, 2 probe then panic with the
++ * summary (the panic screen keeps it visible).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/debug.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void viva_usb_probe(void);
++
++#define INFRA_AO_PA     0x10001000u
++#define INFRA_CG_STA0   0x90
++#define INFRA_CG_STA1   0x94
++#define INFRA_CG_STA2   0xac
++#define INFRA_CG_STA3   0xc8
++
++#define TPHY_PA         0x11ca0000u
++#define U2PORT          0x300           /* u2port0 inside the T-PHY block */
++#define U3P_USBPHYACR0  0x000
++#define U3P_USBPHYACR6  0x018
++#define U3P_U2PHYACR4   0x020
++#define U3P_U2PHYDTM0   0x068
++#define U3P_U2PHYDTM1   0x06c
++
++#define MUSB_PA         0x11200000u
++#define MUSB_FADDR      0x00            /* 8 */
++#define MUSB_POWER      0x01            /* 8: bit6 SOFTCONN, bit5 HSENAB, bit4 HSMODE */
++#define MUSB_INTRTXE    0x06            /* 16 */
++#define MUSB_INTRRXE    0x08            /* 16 */
++#define MUSB_INTRUSBE   0x0b            /* 8 */
++#define MUSB_DEVCTL     0x60            /* 8: bit0 SESSION, bit2 HOSTMODE, bit7 BDEVICE */
++#define MUSB_HWVERS     0x6c            /* 16 */
++#define MUSB_EPINFO     0x78            /* 8: [7:4] rx eps, [3:0] tx eps */
++#define MTK_L1INTM      0xa4            /* 32, MediaTek level-1 interrupt mask */
++
++static inline uint32_t rd32(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline uint16_t rd16(vm_offset_t b, uint32_t o) { return *(volatile uint16_t *)(b + o); }
++static inline uint8_t rd8(vm_offset_t b, uint32_t o) { return *(volatile uint8_t *)(b + o); }
++
++void
++viva_usb_probe(void)
++{
++	uint32_t mode = 0;
++	PE_parse_boot_argn("vivausb", &mode, sizeof(mode));
++	if (mode == 0) {
++		return;
++	}
++
++	vm_offset_t infra = ml_io_map(INFRA_AO_PA, 0x1000);
++	uint32_t cg0 = rd32(infra, INFRA_CG_STA0), cg1 = rd32(infra, INFRA_CG_STA1);
++	uint32_t cg2 = rd32(infra, INFRA_CG_STA2), cg3 = rd32(infra, INFRA_CG_STA3);
++	printf("VIVA USB: infra cg sta 0x%08x 0x%08x 0x%08x 0x%08x (bit set = gated)\n", cg0, cg1, cg2, cg3);
++
++	printf("VIVA USB: reading T-PHY u2 port...\n");
++	vm_offset_t tphy = ml_io_map(TPHY_PA, 0x1000) + U2PORT;
++	uint32_t acr0 = rd32(tphy, U3P_USBPHYACR0), acr6 = rd32(tphy, U3P_USBPHYACR6);
++	uint32_t acr4 = rd32(tphy, U3P_U2PHYACR4), dtm0 = rd32(tphy, U3P_U2PHYDTM0);
++	uint32_t dtm1 = rd32(tphy, U3P_U2PHYDTM1);
++	printf("VIVA USB: phy acr0 0x%08x acr6 0x%08x acr4 0x%08x dtm0 0x%08x dtm1 0x%08x\n",
++	    acr0, acr6, acr4, dtm0, dtm1);
++
++	printf("VIVA USB: reading MUSB...\n");
++	vm_offset_t musb = ml_io_map(MUSB_PA, 0x1000);
++	uint8_t faddr = rd8(musb, MUSB_FADDR), power = rd8(musb, MUSB_POWER);
++	uint8_t devctl = rd8(musb, MUSB_DEVCTL), intrusbe = rd8(musb, MUSB_INTRUSBE);
++	uint16_t txe = rd16(musb, MUSB_INTRTXE), rxe = rd16(musb, MUSB_INTRRXE);
++	uint16_t hwvers = rd16(musb, MUSB_HWVERS);
++	uint8_t epinfo = rd8(musb, MUSB_EPINFO);
++	uint32_t l1intm = rd32(musb, MTK_L1INTM);
++	printf("VIVA USB: musb hwvers 0x%04x epinfo 0x%02x faddr 0x%02x power 0x%02x devctl 0x%02x\n",
++	    hwvers, epinfo, faddr, power, devctl);
++	printf("VIVA USB: musb intrusbe 0x%02x txe 0x%04x rxe 0x%04x l1intm 0x%08x\n",
++	    intrusbe, txe, rxe, l1intm);
++
++	if (mode == 2) {
++		panic("VIVA USB probe: cg %08x %08x %08x %08x | phy %08x %08x %08x %08x %08x | "
++		    "musb hw %04x ep %02x fa %02x pw %02x dc %02x ie %02x tx %04x rx %04x l1 %08x",
++		    cg0, cg1, cg2, cg3, acr0, acr6, acr4, dtm0, dtm1,
++		    hwvers, epinfo, faddr, power, devctl, intrusbe, txe, rxe, l1intm);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
