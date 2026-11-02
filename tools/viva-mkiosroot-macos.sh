@@ -24,10 +24,13 @@ RSYNC=/opt/homebrew/bin/rsync
 [[ ! -e $out ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
 
 work=$(mktemp -d /tmp/viva-iosroot.XXXXXX)
+# macOS /bin/bash is 3.2: with set -u an empty array counts as unset, so
+# arrays are only expanded through their length.
 attached=()
 cleanup() {
-	for d in "${attached[@]}"; do
-		hdiutil detach -force "$d" >/dev/null 2>&1 || true
+	local i
+	for ((i = ${#attached[@]} - 1; i >= 0; i--)); do
+		hdiutil detach -force "${attached[$i]}" >/dev/null 2>&1 || true
 	done
 	rm -f "$work"/*.dmg
 	rmdir "$work"/* "$work" 2>/dev/null || true
@@ -53,12 +56,15 @@ done
 # Attach read-only at a fixed mount point; cryptexes are raw APFS (no UDIF).
 attach() {	# image mountpoint [raw]
 	mkdir -p "$2"
-	local extra=()
-	[[ ${3:-} == raw ]] && extra=(-imagekey diskimage-class=CRawDiskImage)
 	local dev
-	dev=$(hdiutil attach -nobrowse -readonly -noverify -owners on "${extra[@]}" -mountpoint "$2" "$1" |
-		awk 'NR==1{print $1}')
-	attached=("$dev" "${attached[@]}")
+	if [[ ${3:-} == raw ]]; then
+		dev=$(hdiutil attach -nobrowse -readonly -noverify -owners on \
+			-imagekey diskimage-class=CRawDiskImage -mountpoint "$2" "$1" | awk 'NR==1{print $1}')
+	else
+		dev=$(hdiutil attach -nobrowse -readonly -noverify -owners on -mountpoint "$2" "$1" |
+			awk 'NR==1{print $1}')
+	fi
+	attached+=("$dev")
 }
 attach "$work/$os_dmg" "$work/os"
 attach "$work/$sys_dmg" "$work/sysos" raw
@@ -67,7 +73,7 @@ attach "$work/$app_dmg" "$work/appos" raw
 # Blank sparse raw image -> HFS+ (case-sensitive, journaled), mounted with owners.
 mkfile -n "$size" "$out"
 dev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$out" | awk 'NR==1{print $1}')
-attached=("$dev" "${attached[@]}")
+attached+=("$dev")
 newfs_hfs -s -J -v iOSRoot "/dev/r${dev#/dev/}"
 mkdir -p "$work/root"
 mount_hfs -o nobrowse "$dev" "$work/root"
