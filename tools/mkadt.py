@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--viva]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--viva [--ufs]]
 """
 import hashlib, os, struct, sys
 
@@ -52,6 +52,8 @@ VIVA_FB_SIZE = (VIVA_FB_STRIDE * 2400 + 0x3fff) & ~0x3fff
 VIVA_TIMEBASE = 13000000
 VIVA_VTIMER_INTID = 27  # DT timer <GIC_PPI 11>, the standard virtual timer
 VIVA_ECID = 0x5649564100000001  # 'VIVA' + 1, synthetic
+# MediaTek ufshci@11270000 (DT size 0x2300, one 16K page)
+VIVA_UFS, VIVA_UFS_SIZE = 0x11270000, 0x4000
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -88,9 +90,10 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, viva=False):
+def build(seed=None, qemu=False, highmem=False, viva=False, viva_ufs=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
-    viva=True: Redmi Note 11 Pro 4G addresses; no UFS node, so the kernel never touches storage."""
+    viva=True: Redmi Note 11 Pro 4G addresses. Without viva_ufs there is no UFS node, so the
+    kernel never touches storage; with it the kernel drives the MediaTek host LK left running."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     if viva:
         phys_base, mem_size = VIVA_PHYS_BASE, VIVA_MEM_SIZE
@@ -223,8 +226,8 @@ def build(seed=None, qemu=False, highmem=False, viva=False):
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
     ufs = node('sweet-ufs', [
         ph(),
-        ('compatible', cstr('qcom,ufshc')),
-        ('reg', u64(UFS, UFS_SIZE)),
+        ('compatible', cstr('mediatek,mt8183-ufshci') if viva else cstr('qcom,ufshc')),
+        ('reg', u64(VIVA_UFS, VIVA_UFS_SIZE) if viva else u64(UFS, UFS_SIZE)),
     ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
@@ -261,11 +264,12 @@ def build(seed=None, qemu=False, highmem=False, viva=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu or viva else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([ufs] if (viva_ufs if viva else not qemu) else []))
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, viva='--viva' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, viva='--viva' in sys.argv,
+                 viva_ufs='--ufs' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

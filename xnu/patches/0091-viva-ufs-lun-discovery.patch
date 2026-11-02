@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..f32aabb 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -5,8 +5,10 @@
+  * bootloader, which loaded our boot image from it. This driver reuses that
+  * state: it points the transfer request list at its own memory (verifying the
+  * host took it before ringing any doorbell) and issues polled SCSI commands,
+- * one at a time, to LUN 0. It finds one GPT partition by name (boot-arg
+- * ufsroot=, default "userdata") and exposes it as the BSD disk ufsroot0
++ * one at a time. It finds one GPT partition by name (boot-arg ufsroot=,
++ * default "userdata") on LUN ufslun= or, by default, on the first of LUNs 0-7
++ * whose GPT has it (MediaTek keeps the preloader on LUNs 0/1 and the GPT on
++ * another; discovery only reads), and exposes it as the BSD disk ufsroot0
+  * (rufsroot0), with 512-byte logical sectors over the device's 4 KiB blocks.
+  * Root on it with rd=ufsroot0.
+  *
+@@ -608,7 +610,9 @@ sweet_ufs_init(void)
+ 	su.wait = (wait == 1);
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+-	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	/* A host without 64-bit addressing gets DMA memory below 4 GiB. */
++	ppnum_t max_pnum = (ufs_rd(REG_CAP) & CAP_64AS) ? 0 : (ppnum_t)(atop_64(1ULL << 32) - 1);
++	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, max_pnum, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET UFS: no contiguous DMA memory\n");
+ 		return ENOMEM;
+@@ -618,19 +622,31 @@ sweet_ufs_init(void)
+ 		return ENOMEM;
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
+-	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
++	uint32_t lun_arg = UINT32_MAX;
++	PE_parse_boot_argn("ufslun", &lun_arg, sizeof(lun_arg));
++	uint32_t lun_first = lun_arg < 8 ? lun_arg : 0, lun_last = lun_arg < 8 ? lun_arg : 7;
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
++	printf("SWEET UFS: host cap 0x%x, DMA at 0x%llx\n", ufs_rd(REG_CAP), su.dma_pa);
+ 	error = ufs_take_over_host();
+-	if (!error) {
++	for (uint32_t lun = lun_first; !error && lun <= lun_last; lun++) {
+ 		static const uint8_t tur[6] = { 0x00 };
++		su.lun = (uint8_t)lun;
+ 		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		int lun_error = 0;
++		for (int i = 0; i < 3 && (lun_error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		}
++		if (!lun_error) {
++			lun_error = ufs_find_partition(want);
++		}
++		printf("SWEET UFS: LUN %u: %s (%d)\n", lun, lun_error ? "no" : "found", lun_error);
++		if (!lun_error) {
++			break;
++		}
++		if (lun == lun_last) {
++			error = ENXIO;
+ 		}
+-	}
+-	if (!error) {
+-		error = ufs_find_partition(want);
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {

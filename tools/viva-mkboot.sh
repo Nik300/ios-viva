@@ -1,18 +1,32 @@
 #!/bin/bash
 # XNU kernel -> viva boot image (shim + SWEETXNU payload in the ramdisk).
-#   tools/viva-mkboot.sh KERNEL STOCK_BOOT_IMG   -> shim/out/viva-boot.img
+#   tools/viva-mkboot.sh KERNEL STOCK_BOOT_IMG [STAGE]   -> shim/out/viva-boot.img
+#
+# STAGE (default ufs-ro):
+#   nostorage  no UFS node: the kernel never touches storage, panics at root mount
+#   ufs-ro     UFS node, writes refused (no ufsrw): finds "userdata" and tries to mount it
+#   ufs-rw     iOS root in userdata, read-write; writes stay inside that partition
+# Every stage turns off sweet's Qualcomm drivers (keys, touch, USB, persistent
+# log): their fixed MMIO addresses are other blocks on MT6781.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-KERNEL=${1:?usage: viva-mkboot.sh KERNEL STOCK_BOOT_IMG}
-STOCK=${2:?usage: viva-mkboot.sh KERNEL STOCK_BOOT_IMG}
+KERNEL=${1:?usage: viva-mkboot.sh KERNEL STOCK_BOOT_IMG [nostorage|ufs-ro|ufs-rw]}
+STOCK=${2:?usage: viva-mkboot.sh KERNEL STOCK_BOOT_IMG [nostorage|ufs-ro|ufs-rw]}
+STAGE=${3:-ufs-ro}
 
-# First boot: one core, framebuffer console, no storage (no /sweet-ufs node in
-# the --viva ADT) and every sweet Qualcomm driver off: their fixed MMIO
-# addresses are other blocks on MT6781.
-CMDLINE=${VIVA_CMDLINE:-'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 wdt=-1 wdt_test=no_user_checkin sweetkeys=0 sweettouch=0 sweetusb=0 sweetusblog=0 sweetlog=0'}
+BASE='debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 wdt=-1 wdt_test=no_user_checkin sweetkeys=0 sweettouch=0 sweetusb=0 sweetusblog=0 sweetlog=0'
+case $STAGE in
+nostorage) ADT_FLAGS=(--viva); CMDLINE=$BASE ;;
+ufs-ro) ADT_FLAGS=(--viva --ufs); CMDLINE=$BASE ;;
+ufs-rw) ADT_FLAGS=(--viva --ufs)
+	CMDLINE="$BASE ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1" ;;
+*) echo "unknown stage $STAGE" >&2; exit 2 ;;
+esac
+CMDLINE=${VIVA_CMDLINE:-$CMDLINE}
+echo "stage $STAGE: $CMDLINE"
 
 mkdir -p shim/out
-python3 tools/mkadt.py shim/out/viva.adt --viva
+python3 tools/mkadt.py shim/out/viva.adt "${ADT_FLAGS[@]}"
 python3 tools/mkpayload.py "$KERNEL" shim/out/viva.adt shim/out/viva-payload.bin --cmdline "$CMDLINE"
 # LK loads the ramdisk at 0x47c80000 and the DTB at 0x4bc80000: 64 MiB of room.
 size=$(stat -f %z shim/out/viva-payload.bin 2>/dev/null || stat -c %s shim/out/viva-payload.bin)

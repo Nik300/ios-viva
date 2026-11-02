@@ -34,14 +34,38 @@ addresses are other blocks on MT6781. Only `boot_b` is ever flashed.
 ## Build and boot
 
 ```sh
-# 1. kernel (GitHub Actions, macos-14)
+# kernel (GitHub Actions, macos-14)
 gh workflow run xnu.yml -R YOU/ios-viva --ref viva
 gh run download RUN_ID -R YOU/ios-viva -n xnu-kernel -D xnu/out
-# 2. boot image (stock boot.img from the viva fastboot ROM, EEA OS1.0.3.0.TGDEUXM)
-tools/viva-mkboot.sh xnu/out/kernel.development.sweet STOCK/boot.img
+# boot image (stock boot.img from the viva fastboot ROM, EEA OS1.0.3.0.TGDEUXM)
+tools/viva-mkboot.sh xnu/out/kernel.development.sweet STOCK/boot.img STAGE
 fastboot flash boot_b shim/out/viva-boot.img
 fastboot reboot
 ```
+
+`STAGE` goes one step at a time:
+
+| Stage | ADT | Kernel writes | Expected result |
+| --- | --- | --- | --- |
+| `nostorage` | no UFS node | none | panic `ufsroot0 unavailable: 6` (reached 2026-11-02) |
+| `ufs-ro` | UFS node | refused (no `ufsrw`) | `SWEET UFS: "userdata" on LUN n ... read-only`, then a mount failure (Android's f2fs) |
+| `ufs-rw` | UFS node | only inside `userdata` | iOS boots from the HFS+ root flashed into `userdata` |
+
+`ufs-ro` discovers the LUN by reading the GPT of LUNs 0-7 (patch 0091); pass
+`ufslun=N` via `VIVA_CMDLINE` once it is known.
+
+### iOS root image (macOS, no Linux needed)
+
+```sh
+python3 tools/viva-extract-dt.py IPSW          # D22AP /product for mkadt.py (research/, not in git)
+sudo tools/viva-mkiosroot-macos.sh IPSW ios16-root.img 16g
+python3 tools/viva-img2simg.py ios16-root.img ios16-root.simg
+fastboot flash userdata ios16-root.simg        # touches only userdata (Android data is lost)
+```
+
+IPSW: iPhone10,3 16.7.16 (20H392) from Apple. The image is built with
+macOS's APFS/HFS+ and GNU rsync (`brew install rsync`), which writes the
+files decompressed: the viva kernel has no AppleFSCompression kexts.
 
 `shim/build-viva.sh STOCK/boot.img` without a payload builds a shim-only image
 that stops at "no SWEETXNU payload": a quick check of the shim and of LK's
