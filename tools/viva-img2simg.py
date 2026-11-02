@@ -44,6 +44,10 @@ def convert(src, dst):
     with open(src, 'rb') as f:
         cur = 0
         for start, end in data_ranges(f, size):
+            # Block rounding can make neighbouring data ranges overlap.
+            start = max(start, cur)
+            if start >= end:
+                continue
             dont_care((start - cur) // BLK)
             f.seek(start)
             off = start
