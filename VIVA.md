@@ -21,7 +21,7 @@ is added next to it (`--viva` in `tools/mkadt.py`, `shim/viva.c`,
 | GICv3 | GICD 0x0c000000, GICR 0x0c040000 (DT size 0x200000: redistributor stride still to verify) |
 | Timer | 13 MHz, virtual timer PPI 11 = INTID 27 |
 | CPUs | 6× Cortex-A55 (MPIDR 0x000–0x500), 2× big (0x600, 0x700) |
-| UFS | MediaTek ufshci at 0x11270000 (not used yet) |
+| UFS | MediaTek ufshci at 0x11270000, left running by LK. CAP 0x1587071f (64-bit DMA, 32 slots). LUN 0/1: no GPT (preloader); **LUN 2**: GPT, `userdata` at block 0x2ff800, 109735 MiB (= fastboot's 0x1aca7f8000) |
 
 ## Safety
 
@@ -48,11 +48,11 @@ fastboot reboot
 | Stage | ADT | Kernel writes | Expected result |
 | --- | --- | --- | --- |
 | `nostorage` | no UFS node | none | panic `ufsroot0 unavailable: 6` (reached 2026-11-02) |
-| `ufs-ro` | UFS node | refused (no `ufsrw`) | `SWEET UFS: "userdata" on LUN n ... read-only`, then a mount failure (Android's f2fs) |
+| `ufs-ro` | UFS node | refused (no `ufsrw`) | `SWEET UFS: "userdata" on LUN 2 ... read-only` (reached 2026-11-02, CI run 41529510653) |
 | `ufs-rw` | UFS node | only inside `userdata` | iOS boots from the HFS+ root flashed into `userdata` |
 
-`ufs-ro` discovers the LUN by reading the GPT of LUNs 0-7 (patch 0091); pass
-`ufslun=N` via `VIVA_CMDLINE` once it is known.
+Patch 0091 can discover the LUN by reading the GPT of LUNs 0-7; on viva it is
+LUN 2, so `viva-mkboot.sh` passes `ufslun=2`.
 
 ### iOS root image (macOS, no Linux needed)
 
