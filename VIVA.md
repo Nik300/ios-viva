@@ -82,3 +82,33 @@ initrd properties.
    No input yet (sweet's Qualcomm key/touch drivers are off).
 5. ⏳ USB link (MUSB device mode: log stream + command channel), patch 0092 = step 1 probe.
 6. Keys (MT6366 PMIC via pwrap), touch (Goodix on MTK I²C), then SMP/perf, battery, GPU.
+
+## Handoff (2026-11-02, end of session)
+
+State: iOS 16.7.16 reaches the lock screen on viva (6 cores, `out/xnu-ufs-rw-smp.img`
+in `~/Developer/ios-viva/out/`). No input devices yet. Kernel artifacts: CI run
+41537557007 (patches up to 0092).
+
+USB probe result (patch 0092, `vivausb=2`, cable attached):
+`cg 00bf8000 00000800 00000001 00000180 | phy acr0 00463c6e acr6 00100442 acr4 0000001a
+dtm0 02040000 dtm1 00000000 | musb hw e503 ep 88 fa 00 pw 20 dc 80 ie 06 tx 01ff rx 01fe l1 0`.
+Reading: MUSB clocked, peripheral mode, soft-disconnected (POWER.SOFTCONN=0), 8 TX + 8 RX
+endpoints; T-PHY u2 forced into suspend (DTM0 FORCE_SUSPENDM). No clock needs enabling.
+
+Next: patch 0093 "viva link" (`vivausb=3`): wake the T-PHY (Linux phy-mtk-tphy
+u2 power-on sequence, force VBUS/B-session valid in DTM1), MUSB peripheral EP0
+enumeration, one bulk IN (log stream from `sweet_log_copy()` + command responses) and
+one bulk OUT (commands), polling kernel thread; host tool `tools/viva-link.py`
+(pyusb + Homebrew libusb). Then keys (MT6366 PMIC via pwrap), touch (Goodix on MTK I²C).
+
+Workflow notes:
+- Kernel patches are made against a local xnu-8796.141.3 tree with all
+  `xnu/patches/*.patch` applied in order (`git apply`; 0031/0041 need the CI's HFS
+  staging script and can be skipped locally). CI silently skips a patch that does not
+  apply, so check each new patch with `git apply --check` on that tree.
+- Single files compile-check locally with `tools/xnu-cc.py` against the `xnu-buildtree`
+  artifact and the CI log (`gh run view RUN --log`), after replacing its CI_DXB path
+  (`/Users/runner/work/ios-viva/ios-viva/dxb`) and CLANG (`/usr/bin/clang`).
+- Build: `gh workflow run xnu.yml -R Nik300/ios-viva --ref viva` (~1 h), then
+  `tools/viva-mkboot.sh KERNEL ~/Developer/ios-viva/stock/boot.img STAGE`; extra boot-args via
+  `VIVA_CMDLINE`. Debug features stay compiled in and are switched by boot-args.
