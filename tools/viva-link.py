@@ -4,6 +4,8 @@
   viva-link.py [-o LOGFILE]            live kernel console + interactive commands
   viva-link.py [-o LOGFILE] log        live console only
   viva-link.py cmd COMMAND...          send one command, print the reply, exit
+  viva-link.py dump PA SIZE FILE       save physical memory (via peek) to FILE
+  viva-link.py dumpdtb [FILE]          save LK's merged DTB (default viva-live.dtb)
 
 The phone shows up as 1209:0002 "viva iOS link" (vendor class, bulk 0x81 IN,
 0x01 OUT). Every IN packet is a frame: 'V', type, u16 length, payload with
@@ -107,15 +109,47 @@ class Link:
             return self.reply.decode(errors='replace')
 
 
+def dump(link, pa, size):
+    """Read physical memory with peek (64 words per command)."""
+    out = bytearray()
+    start = pa & ~3
+    end = pa + size
+    for at in range(start, end, 256):
+        words = min(64, (end - at + 3) // 4)
+        reply = link.command('peek 0x%x %d' % (at, words))
+        vals = [w for line in reply.splitlines() if ':' in line for w in line.split(':', 1)[1].split()]
+        if len(vals) != words:
+            sys.exit('bad peek reply at 0x%x: %r' % (at, reply[:200]))
+        for v in vals:
+            out += int(v, 16).to_bytes(4, 'little')
+        if (at - start) % 0x4000 == 0:
+            print('\r%d / %d KiB' % ((at - start) >> 10, size >> 10), end='', file=sys.stderr)
+    print(file=sys.stderr)
+    return bytes(out[pa - start:pa - start + size])
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('-o', '--output', help='append the console log to this file')
-    ap.add_argument('mode', nargs='?', default='interactive', choices=('interactive', 'log', 'cmd'))
+    ap.add_argument('mode', nargs='?', default='interactive', choices=('interactive', 'log', 'cmd', 'dump', 'dumpdtb'))
     ap.add_argument('command', nargs='*')
     a = ap.parse_args()
 
-    link = Link(a.output, show_log=(a.mode != 'cmd'))
+    link = Link(a.output, show_log=(a.mode not in ('cmd', 'dump', 'dumpdtb')))
     threading.Thread(target=link.pump, daemon=True).start()
+    if a.mode in ('dump', 'dumpdtb'):
+        if a.mode == 'dumpdtb':     # LK's merged DTB (base + DTBO), still in RAM
+            pa, out = 0x4bc80000, (a.command or ['viva-live.dtb'])[0]
+            hdr = dump(link, pa, 8)
+            if hdr[:4] != b'\xd0\x0d\xfe\xed':
+                sys.exit('no FDT at 0x%x (%s)' % (pa, hdr.hex()))
+            size = int.from_bytes(hdr[4:8], 'big')
+        else:
+            pa, size, out = int(a.command[0], 0), int(a.command[1], 0), a.command[2]
+        data = dump(link, pa, size)
+        open(out, 'wb').write(data)
+        print('%s: %d bytes from 0x%x' % (out, len(data), pa), file=sys.stderr)
+        return
     if a.mode == 'cmd':
         sys.stdout.write(link.command(' '.join(a.command)))
         return
