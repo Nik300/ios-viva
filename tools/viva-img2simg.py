@@ -74,7 +74,7 @@ def convert(src, dst):
             if zeros:
                 chunks.append((CHUNK_FILL, zeros, struct.pack('<I', 0)))
             cur = end
-        dont_care(total - cur)
+        dont_care(total - cur // BLK)
 
     with open(dst, 'wb') as o:
         o.write(struct.pack('<IHHHHIIII', 0xED26FF3A, 1, 0, 28, 12, BLK, total, len(chunks), 0))
