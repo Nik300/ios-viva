@@ -90,6 +90,31 @@ def node(name, props=(), children=()):
     return n
 
 
+# Linux IRQ_TYPE_* in the second interrupt cell (SweetGIC.cpp)
+IRQ_EDGE_RISING, IRQ_LEVEL_HIGH = 1, 4
+
+
+def spi(n, flags):
+    """DT <GIC_SPI n flags> -> the ADT's <INTID flags>."""
+    return u32(32 + n, flags)
+
+
+def viva_devices(ph, gic_ph):
+    """viva /arm-io devices with their own IOKit drivers (addresses and SPIs from the viva DTB)."""
+    io = lambda pa, size: u64(pa - SOC_BASE, size)
+    return [
+        # MediaTek keypad (kp@10010000, SPI 73 edge): iokit/Kernel/arm/hid/VivaKeypad.cpp.
+        # keymap = <bit usage> pairs, filled in once the board's bits are known.
+        node('keypad', [
+            ph(),
+            ('compatible', cstr('mediatek,mt6781-keypad')),
+            ('reg', io(0x10010000, 0x1000)),
+            ('interrupt-parent', u32(gic_ph)),
+            ('interrupts', spi(0x49, IRQ_EDGE_RISING)),
+        ]),
+    ]
+
+
 def build(seed=None, qemu=False, highmem=False, viva=False, viva_ufs=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     viva=True: Redmi Note 11 Pro 4G addresses. Without viva_ufs there is no UFS node, so the
@@ -184,10 +209,14 @@ def build(seed=None, qemu=False, highmem=False, viva=False, viva_ufs=False):
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
                          ('#size-cells', u32(0))], cpu_nodes)
 
+    # SPI interrupt controller of the /arm-io nubs (iokit/Kernel/arm/SweetGIC.cpp):
+    # a device node has interrupt-parent = gic_ph and interrupts = <INTID flags>.
+    gic_ph = next(phandle)
     gic = node('gic', [
-        ph(),
+        ('AAPL,phandle', u32(gic_ph)),
         ('compatible', cstr('arm,gic-v3')),
         ('interrupt-controller', b''),
+        ('#interrupt-cells', u32(2)),
         ('virtual-timer-intid', u32(vtimer)),
         ('reg', u64(gicd - SOC_BASE, gicd_size, gicr - SOC_BASE, gicr_size)),
     ])
@@ -213,7 +242,7 @@ def build(seed=None, qemu=False, highmem=False, viva=False, viva_ufs=False):
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
-        ])])
+        ])] + (viva_devices(ph, gic_ph) if viva else []))
 
     fbcon = node('sweet-fbcon', [
         ph(),
