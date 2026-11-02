@@ -96,7 +96,7 @@ dtm0 02040000 dtm1 00000000 | musb hw e503 ep 88 fa 00 pw 20 dc 80 ie 06 tx 01ff
 Reading: MUSB clocked, peripheral mode, soft-disconnected (POWER.SOFTCONN=0), 8 TX + 8 RX
 endpoints; T-PHY u2 forced into suspend (DTM0 FORCE_SUSPENDM). No clock needs enabling.
 
-Patch 0093 "viva link" (`vivausb=3`, written 2026-11-02, untested): wakes the T-PHY (MediaTek
+Patch 0093 "viva link" (`vivausb=3`, written 2026-11-02, CI run 41541439190 OK, image `out/xnu-ufs-rw-link.img`, untested): wakes the T-PHY (MediaTek
 usb_phy_recover sequence, DTM1 forced to device: VBUSVALID/AVALID/BVALID/IDDIG, SESSEND=0),
 MUSB peripheral in PIO (no DMA), interrupt line masked (L1INTM=0), a kernel thread polls
 every 1 ms. Device 1209:0002 "viva iOS link", vendor interface, bulk 0x81 IN / 0x01 OUT.
