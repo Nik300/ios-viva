@@ -76,5 +76,9 @@ initrd properties.
 1. ✅ Own code runs (gzip Image), framebuffer drawable, text console, live RAM map.
 2. ✅ XNU boots to root mounting (2026-11-02, CI run 41525615211, 1 CPU): panics as designed with
    `IOFindBSDRoot: SWEET UFS root ufsroot0 unavailable: 6` because the `--viva` ADT has no UFS node.
-3. Storage: MediaTek UFS (bring-up from LK's state), root in `userdata`.
-4. Lock screen; then touch (Goodix on MTK I²C) and keys (MT6366 PMIC).
+3. ✅ Storage: MediaTek UFS from LK's state, LUN 2 (2026-11-02, CI run 41529510653).
+4. ✅ **iOS 16.7.16 lock screen** (2026-11-02, ufs-rw stage, ~20 min first boot): backboardd and
+   SpringBoard up, black wallpaper, red date/time, static "charging" battery, gesture bar.
+   No input yet (sweet's Qualcomm key/touch drivers are off).
+5. ⏳ USB link (MUSB device mode: log stream + command channel), patch 0092 = step 1 probe.
+6. Keys (MT6366 PMIC via pwrap), touch (Goodix on MTK I²C), then SMP/perf, battery, GPU.
