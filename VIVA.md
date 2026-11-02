@@ -115,6 +115,11 @@ If it does not enumerate, things to check in order: the `VIVA LINK: phy ...` / `
 reset lines; DTM0 bit 25 (unknown, left as LK set it); MediaTek-specific registers not touched
 (0x80/0x84 data toggle, PHY tuning). Then keys (MT6366 PMIC via pwrap), touch (Goodix on MTK I²C).
 
+Patch 0094 (CI run 41546086814, image `out/xnu-ufs-rw-gic.img`, untested): SweetGIC = GICv3 SPIs as an
+IOInterruptController (nub /arm-io/gic, ADT `#interrupt-cells` 2 = `<INTID flags>`), handler on CPU 0, all
+SPIs routed to CPU 0. First consumer VivaKeypad (kp@10010000, SPI 73 edge, IOInterruptEventSource), logs
+`VIVA KP: bit N down/up`; the ADT `keymap` (`<bit usage>` pairs) is still empty.
+
 Workflow notes:
 - Kernel patches are made against a local xnu-8796.141.3 tree with all
   `xnu/patches/*.patch` applied in order (`git apply`; 0031/0041 need the CI's HFS
