@@ -120,6 +120,18 @@ IOInterruptController (nub /arm-io/gic, ADT `#interrupt-cells` 2 = `<INTID flags
 SPIs routed to CPU 0. First consumer VivaKeypad (kp@10010000, SPI 73 edge, IOInterruptEventSource), logs
 `VIVA KP: bit N down/up`; the ADT `keymap` (`<bit usage>` pairs) is still empty.
 
+0094 result (2026-11-03): SweetGIC works (512 INTIDs, keypad INTID 105 edge, interrupts delivered to the
+work loop). Volume down = keypad bit 0 (mirrored in bits 9, 34, 43, 68, 77, 102, 111). Power and volume up
+are PMIC keys (live DTB `kpd-hw-pwrkey`/`kpd-hw-rstkey`, CONFIG_KPD_PWRKEY_USE_PMIC): MT6358/MT6366
+TOPSTATUS 0x28 bit 1 PWRKEY_DEB, bit 3 HOMEKEY_DEB (0 = pressed); PSC_TOP_INT_CON0 0x910 / STATUS0 0x91c
+bits 0-3 = pwrkey, homekey, pwrkey_r, homekey_r; PMIC interrupt = pio EINT 144 -> GIC SPI 186.
+Reference source: github.com/MiCode/Xiaomi_Kernel_OpenSource branch viva-r-oss (MTK_PLATFORM mt6785,
+drivers/soc/mediatek/mtk-pmic-wrap.c pwrap_mt6781). Merged DTB from RAM: ~/Developer/ios-viva/dtb/viva-live.dtb.
+Touch: Goodix GT9896 on i2c0@11007000 addr 0x5d, irq GPIO 13 (falling), reset GPIO 17, max 8640x19200.
+
+Patch 0095 (CI run 41548885484, image `out/xnu-ufs-rw-pwrap.img`, untested): VivaPwrap, read-only WACS2
+(no write path); USB link `pmic ADDR [N]`; keypad keymap <0 0xea>.
+
 Workflow notes:
 - Kernel patches are made against a local xnu-8796.141.3 tree with all
   `xnu/patches/*.patch` applied in order (`git apply`; 0031/0041 need the CI's HFS
