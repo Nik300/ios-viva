@@ -348,6 +348,23 @@ Patch 0118 (2026-11-03, K0g, NOT tested on the phone yet; analysis in `~/Develop
   only at the vsync tick: the copy goes off screen right away and is switched at the next frame end (one frame of
   latency less). `disp` shows tries / frames shown early.
 
+0118 built: CI run 41731434461, image `~/Developer/ios-viva/out/xnu-ufs-rw-0118.img` (cpus=8 vivausb=3 vivagpu=2).
+
+Patch 0119 (2026-11-04, userspace requests K0h/K0i in gpu/docs/RICHIESTE-KERNEL.md, NOT tested on the phone yet; UAPI minor 2):
+- **K0h.1 SUBMIT_BATCH** (selector 21): up to 64 `vgpu_submit` in one call, queued in order under one gate acquisition,
+  exactly as N SUBMITs; `done` = how many were queued (stops at the first error); each element's `seq` written back.
+- **K0h.2 completion page**: `vgpu_submit.seq` (was `pad`) = the job's number in its connection; IOConnectMapMemory64
+  type `VGPU_MAP_COMPLETION` (0x10000) maps a read-only page `struct vgpu_completion`: every job with seq <= completed
+  has finished (a watermark: the connection's unfinished jobs are kept in submit order, slots finish out of order).
+  Not valid for other processes' jobs on a shared IOSurface.
+- **K0i SURFACE_PROMISE** (selector 22): an unsignalled "promise" fence put into a syncobj and made the last fence of up
+  to 16 IOSurfaces (IOSurfaceLock, K0c, WAIT_BO and other processes' jobs wait for it). The owner connection's jobs and
+  WAIT_BOs on those surfaces use what came before it (no self-deadlock). Resolved when the syncobj's fence is replaced:
+  TRANSFER into it / SUBMIT out_sync = it follows that fence (fence `followers`); RESET/SIGNAL/DESTROY/close = signals
+  now; timeout (default 1 s, max 5 s, job timer) = signals with an error and logs. Not resolved by the first SUBMIT
+  automatically: Panfrost uses one out_sync for all submits, so the driver must TRANSFER the final fence in.
+  `gpu calls` shows promises made/pending/timed out.
+
 Workflow notes:
 - Kernel patches are made against a local xnu-8796.141.3 tree with all
   `xnu/patches/*.patch` applied in order (`git apply`; 0031/0041 need the CI's HFS
