@@ -1,0 +1,845 @@
+diff --git a/iokit/Kernel/arm/VivaEINT.cpp b/iokit/Kernel/arm/VivaEINT.cpp
+new file mode 100644
+index 0000000..d62e472
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaEINT.cpp
+@@ -0,0 +1,238 @@
++/*
++ * viva (MT6781): MediaTek external interrupt controller (EINT, 0x1000b000)
++ * as an IOKit interrupt controller cascaded under the GIC (SweetGIC.cpp).
++ * Matches /arm-io/eint ("mediatek,mt6781-eint"); its own interrupt is GIC
++ * SPI 186 (level high), taken in primary interrupt context.
++ *
++ * Children use interrupt-parent = the eint phandle and interrupts =
++ * <EINT flags> (Linux IRQ_TYPE_*: 1 rising, 2 falling, 4 high, 8 low; both
++ * edges are not supported). EINT n is bit n % 32 of the register at
++ * offset + 4 * (n / 32). Register layout and handling as Linux
++ * drivers/pinctrl/mediatek/mtk-eint.c (Xiaomi viva-r-oss): MT6781 has 151
++ * AP EINTs; sens 1 = level, pol 1 = high/rising, mask 1 = masked, ack
++ * clears the latched status, dom_en routes the line to the AP.
++ *
++ * Only lines a driver registers are touched (Linux additionally sets every
++ * dom_en bit at probe). EINT lines that are GPIO pins must already be in
++ * their EINT mode: on viva the PMIC's EINT 144 is pin 202 (EINT only) and
++ * the touch's EINT 13 is GPIO13 mode 0.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOInterruptController.h>
++#include <IOKit/IOInterrupts.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <IOKit/IOMemoryDescriptor.h>
++
++#define EINT_STA                0x000
++#define EINT_ACK                0x040
++#define EINT_MASK               0x080
++#define EINT_MASK_SET           0x0c0
++#define EINT_MASK_CLR           0x100
++#define EINT_SENS_SET           0x180
++#define EINT_SENS_CLR           0x1c0
++#define EINT_POL_SET            0x340
++#define EINT_POL_CLR            0x380
++#define EINT_DOM_EN             0x400
++
++#define EINT_AP_NUM             151
++
++#define IRQ_TYPE_EDGE_RISING    1
++#define IRQ_TYPE_EDGE_FALLING   2
++#define IRQ_TYPE_LEVEL_HIGH     4
++#define IRQ_TYPE_LEVEL_LOW      8
++
++class VivaEINT : public IOInterruptController {
++	OSDeclareDefaultStructors(VivaEINT);
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++
++	virtual IOReturn registerInterrupt(IOService *nub, int source, void *target,
++	    IOInterruptHandler handler, void *refCon) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn getInterruptType(IOService *nub, int source, int *interruptType) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn handleInterrupt(void *refCon, IOService *nub, int source) APPLE_KEXT_OVERRIDE;
++
++	virtual int  getVectorType(IOInterruptVectorNumber vectorNumber, IOInterruptVector *vector) APPLE_KEXT_OVERRIDE;
++	virtual void disableVectorHard(IOInterruptVectorNumber vectorNumber, IOInterruptVector *vector) APPLE_KEXT_OVERRIDE;
++	virtual void enableVector(IOInterruptVectorNumber vectorNumber, IOInterruptVector *vector) APPLE_KEXT_OVERRIDE;
++
++private:
++	bool spec(IOService *nub, int source, uint32_t *eint, uint32_t *flags);
++	inline uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(fRegs + off); }
++	inline void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(fRegs + off) = v; }
++	inline uint32_t reg(uint32_t base, uint32_t eint) { return base + 4 * (eint / 32); }
++
++	IOMemoryMap *fMap;
++	vm_offset_t  fRegs;
++	uint8_t      fType[EINT_AP_NUM];
++	uint32_t     fStray;
++};
++
++OSDefineMetaClassAndStructors(VivaEINT, IOInterruptController);
++
++bool
++VivaEINT::start(IOService *provider)
++{
++	if (!IOInterruptController::start(provider)) {
++		return false;
++	}
++	fMap = provider->mapDeviceMemoryWithIndex(0);
++	if (fMap == NULL) {
++		IOLog("VIVA EINT: cannot map registers\n");
++		return false;
++	}
++	fRegs = (vm_offset_t)fMap->getVirtualAddress();
++
++	vectors = IONewZero(IOInterruptVector, EINT_AP_NUM);
++	if (vectors == NULL) {
++		return false;
++	}
++	for (unsigned int i = 0; i < EINT_AP_NUM; i++) {
++		vectors[i].interruptLock = IOLockAlloc();
++		if (vectors[i].interruptLock == NULL) {
++			return false;
++		}
++	}
++
++	const OSSymbol *name = IODTInterruptControllerName(provider);
++	if (name == NULL) {
++		return false;
++	}
++	getPlatform()->registerInterruptController((OSSymbol *)name, this);
++
++	/* Our line into the GIC: primary interrupt context, dispatched below. */
++	IOReturn ret = provider->registerInterrupt(0, this,
++	    OSMemberFunctionCast(IOInterruptAction, this, &VivaEINT::handleInterrupt), NULL);
++	if (ret == kIOReturnSuccess) {
++		ret = provider->enableInterrupt(0);
++	}
++	IOLog("VIVA EINT: %s, %u lines, parent interrupt %s (0x%x); mask %08x %08x %08x %08x %08x\n",
++	    name->getCStringNoCopy(), EINT_AP_NUM, ret == kIOReturnSuccess ? "on" : "FAILED", ret,
++	    rd32(EINT_MASK), rd32(EINT_MASK + 4), rd32(EINT_MASK + 8), rd32(EINT_MASK + 12), rd32(EINT_MASK + 16));
++	name->release();
++	registerService();
++	return ret == kIOReturnSuccess;
++}
++
++bool
++VivaEINT::spec(IOService *nub, int source, uint32_t *eint, uint32_t *flags)
++{
++	OSArray *specs = OSDynamicCast(OSArray, nub->getProperty(gIOInterruptSpecifiersKey));
++	OSData *data = specs ? OSDynamicCast(OSData, specs->getObject((unsigned int)source)) : NULL;
++
++	if (data == NULL || data->getLength() < 2 * sizeof(uint32_t)) {
++		return false;
++	}
++	const uint32_t *cells = (const uint32_t *)data->getBytesNoCopy();
++	*eint = cells[0];
++	*flags = cells[1];
++	if (*eint >= EINT_AP_NUM) {
++		return false;
++	}
++	uint32_t type = *flags & 0xf;
++	if (type != IRQ_TYPE_EDGE_RISING && type != IRQ_TYPE_EDGE_FALLING &&
++	    type != IRQ_TYPE_LEVEL_HIGH && type != IRQ_TYPE_LEVEL_LOW) {
++		IOLog("VIVA EINT: %s EINT %u: unsupported type 0x%x\n", nub->getName(), *eint, *flags);
++		return false;
++	}
++	return true;
++}
++
++IOReturn
++VivaEINT::getInterruptType(IOService *nub, int source, int *interruptType)
++{
++	uint32_t eint, flags;
++
++	if (interruptType == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!spec(nub, source, &eint, &flags)) {
++		return kIOReturnNoInterrupt;
++	}
++	*interruptType = (flags & (IRQ_TYPE_EDGE_RISING | IRQ_TYPE_EDGE_FALLING)) ? kIOInterruptTypeEdge : kIOInterruptTypeLevel;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++VivaEINT::registerInterrupt(IOService *nub, int source, void *target,
++    IOInterruptHandler handler, void *refCon)
++{
++	uint32_t eint, flags;
++
++	if (!spec(nub, source, &eint, &flags)) {
++		return kIOReturnNoInterrupt;
++	}
++	uint32_t bit = 1u << (eint % 32);
++	bool edge = (flags & (IRQ_TYPE_EDGE_RISING | IRQ_TYPE_EDGE_FALLING)) != 0;
++	bool high = (flags & (IRQ_TYPE_EDGE_RISING | IRQ_TYPE_LEVEL_HIGH)) != 0;
++	fType[eint] = edge ? kIOInterruptTypeEdge : kIOInterruptTypeLevel;
++
++	wr32(reg(EINT_MASK_SET, eint), bit);
++	wr32(reg(high ? EINT_POL_SET : EINT_POL_CLR, eint), bit);
++	wr32(reg(edge ? EINT_SENS_CLR : EINT_SENS_SET, eint), bit);
++	wr32(reg(EINT_DOM_EN, eint), rd32(reg(EINT_DOM_EN, eint)) | bit);
++	wr32(reg(EINT_ACK, eint), bit);
++
++	IOReturn ret = IOInterruptController::registerInterrupt(nub, source, target, handler, refCon);
++	IOLog("VIVA EINT: %s interrupt %d -> EINT %u (%s %s) %s\n", nub->getName(), source, eint,
++	    edge ? "edge" : "level", high ? "high" : "low", ret == kIOReturnSuccess ? "registered" : "refused");
++	return ret;
++}
++
++/* Primary interrupt context (GIC SPI 186 on CPU 0). */
++IOReturn
++VivaEINT::handleInterrupt(void *refCon __unused, IOService *nub __unused, int source __unused)
++{
++	for (uint32_t base = 0; base < EINT_AP_NUM; base += 32) {
++		uint32_t pending = rd32(reg(EINT_STA, base)) & ~rd32(reg(EINT_MASK, base));
++		while (pending) {
++			uint32_t b = (uint32_t)__builtin_ctz(pending);
++			pending &= pending - 1;
++			uint32_t eint = base + b;
++			if (eint >= EINT_AP_NUM) {
++				break;
++			}
++			IOInterruptVector *vector = &vectors[eint];
++
++			wr32(reg(EINT_ACK, eint), 1u << b);
++			vector->interruptActive = 1;
++			OSMemoryBarrier();
++			if (!vector->interruptRegistered) {
++				fStray++;
++				wr32(reg(EINT_MASK_SET, eint), 1u << b);
++			} else if (!vector->interruptDisabledSoft) {
++				vector->handler(vector->target, vector->refCon, vector->nub, vector->source);
++			} else {
++				/* soft-disabled (an IOInterruptEventSource is servicing it): mask until re-enabled */
++				vector->interruptDisabledHard = 1;
++				disableVectorHard(eint, vector);
++			}
++			vector->interruptActive = 0;
++		}
++	}
++	return kIOReturnSuccess;
++}
++
++int
++VivaEINT::getVectorType(IOInterruptVectorNumber vectorNumber, IOInterruptVector *vector __unused)
++{
++	return fType[vectorNumber];
++}
++
++void
++VivaEINT::disableVectorHard(IOInterruptVectorNumber vectorNumber, IOInterruptVector *vector __unused)
++{
++	wr32(reg(EINT_MASK_SET, (uint32_t)vectorNumber), 1u << (vectorNumber % 32));
++}
++
++void
++VivaEINT::enableVector(IOInterruptVectorNumber vectorNumber, IOInterruptVector *vector __unused)
++{
++	wr32(reg(EINT_MASK_CLR, (uint32_t)vectorNumber), 1u << (vectorNumber % 32));
++}
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/VivaPMIC.cpp b/iokit/Kernel/arm/VivaPMIC.cpp
+new file mode 100644
+index 0000000..7bbb3f9
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaPMIC.cpp
+@@ -0,0 +1,149 @@
++/*
++ * viva (MT6781): MT6366 PMIC (MT6358 register layout) on the pwrap bus.
++ * Matches /arm-io/pwrap/pmic ("mediatek,mt6366-pmic").
++ *
++ * The PMIC has one interrupt line (EINT 144, level high, via VivaEINT.cpp)
++ * for all its interrupt groups. As Linux drivers/mfd/mt6358-core.c does:
++ * at start every group's interrupts are disabled and pending ones cleared
++ * (LK leaves some on, e.g. charger detection, which would hold the line
++ * high), then children enable only what they handle with
++ * registerGroupInterrupt(). The line is taken through an
++ * IOInterruptEventSource: pwrap access sleeps on a lock, so the groups are
++ * serviced on this driver's work loop, while EINT keeps the line masked.
++ *
++ * PMIC writes go through VivaPwrap::writePMIC, which only accepts the
++ * interrupt enable SET/CLR and status registers.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include "VivaPMIC.h"
++
++OSDefineMetaClassAndStructors(VivaPMIC, IOService);
++
++IOWorkLoop *
++VivaPMIC::getWorkLoop(void) const
++{
++	return fWorkLoop;
++}
++
++bool
++VivaPMIC::start(IOService *provider)
++{
++	fPwrap = OSDynamicCast(VivaPwrap, provider->getProvider());
++	fWorkLoop = IOWorkLoop::workLoop();
++	if (fPwrap == NULL || fWorkLoop == NULL || !IOService::start(provider)) {
++		IOLog("VIVA PMIC: no pwrap\n");
++		return false;
++	}
++	uint32_t id = 0;
++	if (read(VIVA_PMIC_HWCID, &id) != kIOReturnSuccess || (id & 0xff00) != 0x6600) {
++		IOLog("VIVA PMIC: hwcid 0x%04x is not an MT6366, not touching it\n", id);
++		return false;
++	}
++
++	/* Everything off and acknowledged; log what LK had left on. */
++	for (unsigned int g = 0; g < kVivaPMICGroupCount; g++) {
++		const VivaPMICGroupRegs *r = &gVivaPMICGroups[g];
++		for (unsigned int n = 0; r->con0 != 0 && n < r->nregs; n++) {
++			uint32_t con = 0, sta = 0;
++			read(r->con0 + 6 * n, &con);
++			read(r->sta0 + 2 * n, &sta);
++			if (con | sta) {
++				IOLog("VIVA PMIC: %s[%u] was enabled 0x%04x pending 0x%04x\n", r->name, n, con, sta);
++			}
++			fPwrap->writePMIC(r->con0 + 6 * n + 4, 0xffff);
++			fPwrap->writePMIC(r->sta0 + 2 * n, 0xffff);
++		}
++	}
++
++	fInterrupt = IOInterruptEventSource::interruptEventSource(this, &VivaPMIC::interruptOccurred, provider, 0);
++	if (fInterrupt == NULL || fWorkLoop->addEventSource(fInterrupt) != kIOReturnSuccess) {
++		IOLog("VIVA PMIC: no interrupt\n");
++		return false;
++	}
++	fInterrupt->enable();
++	IOLog("VIVA PMIC: MT6366 hwcid 0x%04x, all PMIC interrupts off, line on\n", id);
++	registerService();
++	VivaDTNub::publishChildren(this, provider);
++	return true;
++}
++
++void
++VivaPMIC::free(void)
++{
++	if (fInterrupt != NULL) {
++		fInterrupt->disable();
++		if (fWorkLoop != NULL) {
++			fWorkLoop->removeEventSource(fInterrupt);
++		}
++	}
++	OSSafeReleaseNULL(fInterrupt);
++	OSSafeReleaseNULL(fWorkLoop);
++	IOService::free();
++}
++
++IOReturn
++VivaPMIC::registerGroupInterrupt(uint32_t group, uint32_t index, uint32_t bits, OSObject *target, Handler handler)
++{
++	if (group >= kVivaPMICGroupCount || gVivaPMICGroups[group].con0 == 0 ||
++	    index >= gVivaPMICGroups[group].nregs || bits > 0xffff || handler == NULL) {
++		return kIOReturnBadArgument;
++	}
++	const VivaPMICGroupRegs *r = &gVivaPMICGroups[group];
++	IOReturn ret = fWorkLoop->runActionBlock(^IOReturn {
++		fTarget[group] = target;
++		fHandler[group] = handler;
++		fPwrap->writePMIC(r->sta0 + 2 * index, bits);           /* stale ones */
++		return fPwrap->writePMIC(r->con0 + 6 * index + 2, bits); /* enable */
++	});
++	IOLog("VIVA PMIC: %s[%u] bits 0x%04x -> %s (%d)\n", r->name, index, bits,
++	    target ? target->getMetaClass()->getClassName() : "?", ret);
++	return ret;
++}
++
++void
++VivaPMIC::interruptOccurred(OSObject *owner, IOInterruptEventSource *src __unused, int count __unused)
++{
++	VivaPMIC *self = OSDynamicCast(VivaPMIC, owner);
++	if (self != NULL) {
++		self->service();
++	}
++}
++
++/* Work loop: every pending group, until the PMIC lets the line go. */
++void
++VivaPMIC::service(void)
++{
++	fInterrupts++;
++	for (int round = 0; round < 8; round++) {
++		uint32_t top = 0;
++		if (read(VIVA_PMIC_TOP_INT_STATUS0, &top) != kIOReturnSuccess || (top & 0x1ff) == 0) {
++			return;
++		}
++		for (unsigned int g = 0; g < kVivaPMICGroupCount; g++) {
++			const VivaPMICGroupRegs *r = &gVivaPMICGroups[g];
++			if (!(top & (1u << g)) || r->con0 == 0) {
++				continue;
++			}
++			for (unsigned int n = 0; n < r->nregs; n++) {
++				uint32_t sta = 0;
++				if (read(r->sta0 + 2 * n, &sta) != kIOReturnSuccess || sta == 0) {
++					continue;
++				}
++				fPwrap->writePMIC(r->sta0 + 2 * n, sta);
++				if (fHandler[g] != NULL) {
++					fHandler[g](fTarget[g], g, n, sta);
++				} else {
++					/* nobody asked for it: off */
++					fStray++;
++					fPwrap->writePMIC(r->con0 + 6 * n + 4, sta);
++					IOLog("VIVA PMIC: stray %s[%u] 0x%04x disabled\n", r->name, n, sta);
++				}
++			}
++		}
++	}
++	IOLog("VIVA PMIC: line still pending after 8 rounds\n");
++}
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/VivaPMIC.h b/iokit/Kernel/arm/VivaPMIC.h
+new file mode 100644
+index 0000000..275c1bd
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaPMIC.h
+@@ -0,0 +1,106 @@
++/*
++ * viva (MT6781): the PMIC bus. VivaPwrap (the SoC's PMIC wrapper) carries
++ * PMIC register access; VivaPMIC (the MT6366 behind it, MT6358 register
++ * layout) owns the PMIC interrupt line and hands PMIC interrupt groups to
++ * its children (VivaPMICKeys, later charger/RTC/...).
++ *
++ * Device tree: /arm-io/pwrap/pmic/keys; each level publishes its children
++ * as VivaDTNub nubs, so drivers match them by "compatible" as usual.
++ */
++#ifndef _IOKIT_ARM_VIVAPMIC_H
++#define _IOKIT_ARM_VIVAPMIC_H
++
++#include <IOKit/IOService.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOInterruptEventSource.h>
++
++/* A device-tree child of a bus driver (the platform expert's IOPlatformDevice needs the PE as provider). */
++class VivaDTNub : public IOService {
++	OSDeclareDefaultStructors(VivaDTNub);
++public:
++	virtual bool compareName(OSString *name, OSString **matched = NULL) const APPLE_KEXT_OVERRIDE;
++	/* Publish every device-tree child of `dtEntry` as a nub of `parent`. */
++	static void publishChildren(IOService *parent, IORegistryEntry *dtEntry);
++};
++
++class VivaPwrap : public IOService {
++	OSDeclareDefaultStructors(VivaPwrap);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn readPMIC(uint32_t addr, uint32_t *value);
++	/* Only the PMIC interrupt enable/status registers (writeAllowed) can be written. */
++	IOReturn writePMIC(uint32_t addr, uint32_t value);
++	static bool writeAllowed(uint32_t addr);
++
++private:
++	bool waitFSM(uint32_t fsm);
++	inline uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(fRegs + off); }
++	inline void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(fRegs + off) = v; }
++
++	IOMemoryMap *fMap;
++	vm_offset_t  fRegs;
++	IOLock      *fLock;
++	uint32_t     fTimeouts;
++};
++
++/* PMIC interrupt groups (MT6358 "sp_top"), in TOP_INT_STATUS0 bit order. */
++enum {
++	kVivaPMICGroupBUCK = 0, kVivaPMICGroupLDO = 1, kVivaPMICGroupPSC = 2, kVivaPMICGroupSCK = 3,
++	kVivaPMICGroupBM = 4, kVivaPMICGroupHK = 5, kVivaPMICGroupAUD = 7, kVivaPMICGroupMISC = 8,
++	kVivaPMICGroupCount = 9,
++};
++
++/*
++ * Per group (include/linux/mfd/mt6358/registers.h, Xiaomi viva-r-oss): register n of a
++ * group has INT_CON = con0 + 6n (SET +2, CLR +4) and INT_STATUS = sta0 + 2n (write 1 to clear).
++ * nregs from the DT's mediatek,pmic-irqs. con0 == 0: no such group (bit 6 is XPP, unused).
++ */
++struct VivaPMICGroupRegs {
++	uint16_t con0, sta0, nregs;
++	const char *name;
++};
++static const VivaPMICGroupRegs gVivaPMICGroups[kVivaPMICGroupCount] = {
++	{ 0x1318, 0x1324, 1, "BUCK" }, { 0x1a50, 0x1a68, 2, "LDO" }, { 0x0910, 0x091c, 1, "PSC" },
++	{ 0x052e, 0x053a, 1, "SCK" },  { 0x0c32, 0x0c4a, 2, "BM" },  { 0x0f92, 0x0f9e, 1, "HK" },
++	{ 0, 0, 0, "XPP" },            { 0x2228, 0x2234, 1, "AUD" }, { 0x0188, 0x0194, 1, "MISC" },
++};
++#define VIVA_PMIC_TOP_INT_STATUS0 0x19e
++#define VIVA_PMIC_HWCID         0x008
++
++/* PSC group bits */
++#define VIVA_PMIC_PSC_PWRKEY    (1u << 0)
++#define VIVA_PMIC_PSC_HOMEKEY   (1u << 1)
++#define VIVA_PMIC_PSC_PWRKEY_R  (1u << 2)
++#define VIVA_PMIC_PSC_HOMEKEY_R (1u << 3)
++
++#define VIVA_PMIC_TOPSTATUS     0x028   /* bit 1 PWRKEY_DEB, bit 3 HOMEKEY_DEB (0 = pressed) */
++
++class VivaPMIC : public IOService {
++	OSDeclareDefaultStructors(VivaPMIC);
++public:
++	/* Work-loop context: `status` = the group's status register `index` (already acknowledged). */
++	typedef void (*Handler)(OSObject *target, uint32_t group, uint32_t index, uint32_t status);
++
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOWorkLoop *getWorkLoop(void) const APPLE_KEXT_OVERRIDE;
++
++	IOReturn read(uint32_t addr, uint32_t *value) { return fPwrap->readPMIC(addr, value); }
++	/* Enable `bits` of a group's interrupt register `index` and send them to `handler`. */
++	IOReturn registerGroupInterrupt(uint32_t group, uint32_t index, uint32_t bits, OSObject *target, Handler handler);
++
++private:
++	static void interruptOccurred(OSObject *owner, IOInterruptEventSource *src, int count);
++	void service(void);
++
++	VivaPwrap              *fPwrap;
++	IOWorkLoop             *fWorkLoop;
++	IOInterruptEventSource *fInterrupt;
++	OSObject               *fTarget[kVivaPMICGroupCount];
++	Handler                 fHandler[kVivaPMICGroupCount];
++	uint32_t                fInterrupts, fStray;
++};
++
++#endif /* _IOKIT_ARM_VIVAPMIC_H */
+diff --git a/iokit/Kernel/arm/VivaPwrap.cpp b/iokit/Kernel/arm/VivaPwrap.cpp
+index 6c48d02..bdd6c61 100644
+--- a/iokit/Kernel/arm/VivaPwrap.cpp
++++ b/iokit/Kernel/arm/VivaPwrap.cpp
+@@ -8,12 +8,14 @@
+  * (drivers/soc/mediatek/mtk-pmic-wrap.c, pwrap_mt6781, viva-r-oss):
+  *   wait WACS2_RDATA.FSM == IDLE, WACS2_CMD = (addr >> 1) << 16,
+  *   wait FSM == WFVLDCLR, data = WACS2_RDATA[15:0], WACS2_VLDCLR = 1.
+- * WACS2_CMD bit 31 would make it a PMIC *write*. This step is read-only:
+- * there is no write path, and readPMIC() refuses anything that could set
+- * bit 31. The regulators live in the same PMIC; writes come later, behind
+- * an explicit register whitelist.
++ * A write is WACS2_CMD = 1 << 31 | (addr >> 1) << 16 | data. The regulators
++ * live in the same PMIC, so writePMIC() only accepts the interrupt enable
++ * SET/CLR and status registers of the PMIC interrupt groups (writeAllowed(),
++ * table in VivaPMIC.h); everything else is refused and logged.
+  *
+- * C entry point viva_pwrap_read() for the USB link's "pmic" command.
++ * The PMIC is a device-tree child (/arm-io/pwrap/pmic): published as a
++ * VivaDTNub, matched by VivaPMIC. C entry point viva_pwrap_read() for the
++ * USB link's "pmic" command (reads only).
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -22,6 +24,9 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOLocks.h>
++#include <IOKit/IODeviceTreeSupport.h>
++
++#include "VivaPMIC.h"
+ 
+ #define PWRAP_INIT_DONE0        0x090
+ #define PWRAP_WACS2_EN          0x09c
+@@ -44,24 +49,6 @@
+ #define MT6358_PSC_TOP_INT_STATUS0 0x91c
+ #define MT6358_PSC_TOP_INT_RAW_STATUS0 0x91e
+ 
+-class VivaPwrap : public IOService {
+-	OSDeclareDefaultStructors(VivaPwrap);
+-
+-public:
+-	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+-	IOReturn readPMIC(uint32_t addr, uint32_t *value);
+-
+-private:
+-	bool waitFSM(uint32_t fsm);
+-	inline uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(fRegs + off); }
+-	inline void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(fRegs + off) = v; }
+-
+-	IOMemoryMap *fMap;
+-	vm_offset_t  fRegs;
+-	IOLock      *fLock;
+-	uint32_t     fTimeouts;
+-};
+-
+ OSDefineMetaClassAndStructors(VivaPwrap, IOService);
+ 
+ static VivaPwrap *gVivaPwrap;
+@@ -107,6 +94,7 @@ VivaPwrap::start(IOService *provider)
+ 
+ 	gVivaPwrap = this;
+ 	registerService();
++	VivaDTNub::publishChildren(this, provider);
+ 	return true;
+ }
+ 
+@@ -150,6 +138,79 @@ VivaPwrap::readPMIC(uint32_t addr, uint32_t *value)
+ 	return ret;
+ }
+ 
++bool
++VivaPwrap::writeAllowed(uint32_t addr)
++{
++	for (unsigned int g = 0; g < kVivaPMICGroupCount; g++) {
++		const VivaPMICGroupRegs *r = &gVivaPMICGroups[g];
++		for (unsigned int n = 0; r->con0 != 0 && n < r->nregs; n++) {
++			uint32_t con = r->con0 + 6 * n;
++			if (addr == con + 2 || addr == con + 4 || addr == (uint32_t)(r->sta0 + 2 * n)) {
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
++IOReturn
++VivaPwrap::writePMIC(uint32_t addr, uint32_t value)
++{
++	if (!writeAllowed(addr) || value > 0xffff) {
++		IOLog("VIVA PWRAP: refused PMIC write 0x%04x <- 0x%x\n", addr, value);
++		return kIOReturnNotPermitted;
++	}
++	IOReturn ret = kIOReturnTimeout;
++	IOLockLock(fLock);
++	if (WACS_FSM(rd32(PWRAP_WACS2_RDATA)) == WACS_FSM_WFVLDCLR) {
++		wr32(PWRAP_WACS2_VLDCLR, 1);
++	}
++	if (waitFSM(WACS_FSM_IDLE)) {
++		wr32(PWRAP_WACS2_CMD, 0x80000000u | ((addr >> 1) << 16) | value);
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(fLock);
++	return ret;
++}
++
++/* Device-tree children of the PMIC bus. */
++OSDefineMetaClassAndStructors(VivaDTNub, IOService);
++
++bool
++VivaDTNub::compareName(OSString *name, OSString **matched) const
++{
++	return IODTCompareNubName(this, name, matched);
++}
++
++void
++VivaDTNub::publishChildren(IOService *parent, IORegistryEntry *dtEntry)
++{
++	OSIterator *iter = dtEntry->getChildIterator(gIODTPlane);
++	if (iter == NULL) {
++		return;
++	}
++	OSArray *children = OSArray::withCapacity(4);
++	IORegistryEntry *child;
++	while (children && (child = (IORegistryEntry *)iter->getNextObject())) {
++		children->setObject(child);     /* init() below re-parents the entry: iterate a copy */
++	}
++	iter->release();
++	for (unsigned int i = 0; children && i < children->getCount(); i++) {
++		child = (IORegistryEntry *)children->getObject(i);
++		VivaDTNub *nub = new VivaDTNub;
++		if (nub == NULL) {
++			continue;
++		}
++		if (!nub->init(child, gIODTPlane) || !nub->attach(parent)) {
++			nub->release();
++			continue;
++		}
++		nub->registerService();
++		nub->release();
++	}
++	OSSafeReleaseNULL(children);
++}
++
+ extern "C" int
+ viva_pwrap_read(uint32_t addr, uint32_t *value)
+ {
+diff --git a/iokit/Kernel/arm/hid/VivaPMICKeys.cpp b/iokit/Kernel/arm/hid/VivaPMICKeys.cpp
+new file mode 100644
+index 0000000..e92adcb
+--- /dev/null
++++ b/iokit/Kernel/arm/hid/VivaPMICKeys.cpp
+@@ -0,0 +1,138 @@
++/*
++ * viva (MT6781): the MT6366 PMIC's key inputs as an HID button service.
++ * Matches /arm-io/pwrap/pmic/keys ("mediatek,mt6366-keys"), a child of
++ * VivaPMIC (../VivaPMIC.cpp). On viva PWRKEY is the side (power) button and
++ * HOMEKEY is volume up (live DT: kpd-hw-pwrkey / kpd-hw-rstkey,
++ * CONFIG_KPD_PWRKEY_USE_PMIC).
++ *
++ * The PMIC raises PSC interrupts on press (pwrkey/homekey) and release
++ * (pwrkey_r/homekey_r); the state is then read from TOPSTATUS (PWRKEY_DEB
++ * bit 1, HOMEKEY_DEB bit 3, 0 = pressed; measured 2026-11-03), so a lost
++ * edge cannot leave a key stuck. The ADT property "keymap" = <key usage>
++ * pairs: key 0 = PWRKEY, 1 = HOMEKEY, usage on the HID consumer page.
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOWorkLoop.h>
++
++#include "IOHIDEventService.h"
++#include "IOHIDEvent.h"
++#include "IOHIDUsageTables.h"
++#include "../VivaPMIC.h"
++
++extern "C" uint64_t mach_absolute_time(void);
++
++#define PMIC_KEYS       2
++static const uint32_t kKeyDebBit[PMIC_KEYS] = { 1u << 1, 1u << 3 };    /* TOPSTATUS */
++static const uint32_t kKeyPress[PMIC_KEYS] = { VIVA_PMIC_PSC_PWRKEY, VIVA_PMIC_PSC_HOMEKEY };
++static const uint32_t kKeyRelease[PMIC_KEYS] = { VIVA_PMIC_PSC_PWRKEY_R, VIVA_PMIC_PSC_HOMEKEY_R };
++
++class VivaPMICKeys : public IOHIDEventService {
++	OSDeclareDefaultStructors(VivaPMICKeys);
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOWorkLoop *getWorkLoop(void) const APPLE_KEXT_OVERRIDE;
++
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Consumer; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Csmr_ConsumerControl; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 0x6366; }
++	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString("MT6366 keys"); }
++
++private:
++	static void pmicInterrupt(OSObject *target, uint32_t group, uint32_t index, uint32_t status);
++	void update(uint32_t status);
++	void send(unsigned int key, bool down);
++
++	VivaPMIC *fPMIC;
++	UInt32    fUsage[PMIC_KEYS];
++	bool      fDown[PMIC_KEYS];
++	uint32_t  fEvents;
++};
++
++OSDefineMetaClassAndStructors(VivaPMICKeys, IOHIDEventService);
++
++/* The PMIC's work loop: interrupts and HID clients are serialized on it. */
++IOWorkLoop *
++VivaPMICKeys::getWorkLoop(void) const
++{
++	return fPMIC ? fPMIC->getWorkLoop() : NULL;
++}
++
++bool
++VivaPMICKeys::start(IOService *provider)
++{
++	fPMIC = OSDynamicCast(VivaPMIC, provider->getProvider());
++	if (fPMIC == NULL || !IOHIDEventService::start(provider)) {
++		IOLog("VIVA PMIC KEYS: no PMIC\n");
++		return false;
++	}
++	fUsage[0] = kHIDUsage_Csmr_Power;
++	fUsage[1] = kHIDUsage_Csmr_VolumeIncrement;
++	OSData *map = OSDynamicCast(OSData, provider->getProperty("keymap"));
++	if (map != NULL) {
++		const uint32_t *cells = (const uint32_t *)map->getBytesNoCopy();
++		for (unsigned int i = 0; i + 1 < map->getLength() / sizeof(uint32_t); i += 2) {
++			if (cells[i] < PMIC_KEYS) {
++				fUsage[cells[i]] = cells[i + 1];
++			}
++		}
++	}
++	uint32_t top = 0;
++	fPMIC->read(VIVA_PMIC_TOPSTATUS, &top);
++	for (unsigned int k = 0; k < PMIC_KEYS; k++) {
++		fDown[k] = (top & kKeyDebBit[k]) == 0;
++	}
++	IOReturn ret = fPMIC->registerGroupInterrupt(kVivaPMICGroupPSC, 0,
++	    VIVA_PMIC_PSC_PWRKEY | VIVA_PMIC_PSC_HOMEKEY | VIVA_PMIC_PSC_PWRKEY_R | VIVA_PMIC_PSC_HOMEKEY_R,
++	    this, &VivaPMICKeys::pmicInterrupt);
++	IOLog("VIVA PMIC KEYS: power -> 0x%x, home -> 0x%x, topstatus 0x%04x (%d)\n",
++	    (unsigned)fUsage[0], (unsigned)fUsage[1], top, ret);
++	if (ret != kIOReturnSuccess) {
++		return false;
++	}
++	registerService();
++	return true;
++}
++
++void
++VivaPMICKeys::pmicInterrupt(OSObject *target, uint32_t group __unused, uint32_t index __unused, uint32_t status)
++{
++	VivaPMICKeys *self = OSDynamicCast(VivaPMICKeys, target);
++	if (self != NULL) {
++		self->update(status);
++	}
++}
++
++void
++VivaPMICKeys::send(unsigned int k, bool down)
++{
++	fDown[k] = down;
++	fEvents++;
++	IOLog("VIVA PMIC KEYS: key 0x%x %s\n", (unsigned)fUsage[k], down ? "down" : "up");
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, fUsage[k], down);
++	if (event != NULL) {
++		dispatchEvent(event);
++		event->release();
++	}
++}
++
++/* Work loop. State from TOPSTATUS; a press and release that both happened before we looked is a tap. */
++void
++VivaPMICKeys::update(uint32_t status)
++{
++	uint32_t top = 0;
++	if (fPMIC->read(VIVA_PMIC_TOPSTATUS, &top) != kIOReturnSuccess) {
++		return;
++	}
++	for (unsigned int k = 0; k < PMIC_KEYS; k++) {
++		bool down = (top & kKeyDebBit[k]) == 0;
++		if (down != fDown[k]) {
++			send(k, down);
++		} else if (!down && (status & kKeyPress[k]) && (status & kKeyRelease[k])) {
++			send(k, true);
++			send(k, false);
++		}
++	}
++}
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 273ce6c..610eb7a 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -83,6 +83,21 @@ const char * gIOKernelConfigTables =
+     "     'IONameMatch'     = 'mediatek,mt6781-pwrap';"
+     "   },"
+     "   {"
++    "     'IOClass'         = VivaEINT;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'mediatek,mt6781-eint';"
++    "   },"
++    "   {"
++    "     'IOClass'         = VivaPMIC;"
++    "     'IOProviderClass' = VivaDTNub;"
++    "     'IONameMatch'     = 'mediatek,mt6366-pmic';"
++    "   },"
++    "   {"
++    "     'IOClass'         = VivaPMICKeys;"
++    "     'IOProviderClass' = VivaDTNub;"
++    "     'IONameMatch'     = 'mediatek,mt6366-keys';"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetHIDButtons;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDButtons;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 856d35d..09d9840 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,9 +17,12 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetGIC.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/VivaPwrap.cpp                                   optional iokitcpp
++iokit/Kernel/arm/VivaEINT.cpp                                    optional iokitcpp
++iokit/Kernel/arm/VivaPMIC.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/VivaKeypad.cpp                              optional iokitcpp
++iokit/Kernel/arm/hid/VivaPMICKeys.cpp                            optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp

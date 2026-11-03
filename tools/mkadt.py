@@ -101,9 +101,10 @@ def spi(n, flags):
     return u32(32 + n, flags)
 
 
-def viva_devices(ph, gic_ph):
+def viva_devices(ph, phandle, gic_ph):
     """viva /arm-io devices with their own IOKit drivers (addresses and SPIs from the viva DTB)."""
     io = lambda pa, size: u64(pa - SOC_BASE, size)
+    eint_ph = next(phandle)
     return [
         # MediaTek keypad (kp@10010000, SPI 73 edge): iokit/Kernel/arm/hid/VivaKeypad.cpp.
         # keymap = <bit usage> pairs (HID consumer page). Volume down is kpd-hw-init-map
@@ -116,12 +117,34 @@ def viva_devices(ph, gic_ph):
             ('interrupts', spi(0x49, IRQ_EDGE_RISING)),
             ('keymap', u32(0, HID_CSMR_VOLUME_DOWN)),
         ]),
-        # PMIC wrapper (pwrap@1000d000) to the MT6366: iokit/Kernel/arm/VivaPwrap.cpp, read only.
+        # External interrupts (eint@1000b000, GIC SPI 186 level): iokit/Kernel/arm/VivaEINT.cpp,
+        # an interrupt controller under the GIC; children use interrupts = <EINT flags>.
+        node('eint', [
+            ('AAPL,phandle', u32(eint_ph)),
+            ('compatible', cstr('mediatek,mt6781-eint')),
+            ('reg', io(0x1000b000, 0x1000)),
+            ('interrupt-controller', b''),
+            ('#interrupt-cells', u32(2)),
+            ('interrupt-parent', u32(gic_ph)),
+            ('interrupts', spi(0xba, IRQ_LEVEL_HIGH)),
+        ]),
+        # PMIC wrapper (pwrap@1000d000): iokit/Kernel/arm/VivaPwrap.cpp, a bus for the MT6366
+        # (VivaPMIC.cpp, interrupt EINT 144 level high) and its key inputs (hid/VivaPMICKeys.cpp:
+        # keymap <key usage>, key 0 PWRKEY = power, 1 HOMEKEY = volume up).
         node('pwrap', [
             ph(),
             ('compatible', cstr('mediatek,mt6781-pwrap')),
             ('reg', io(0x1000d000, 0x1000)),
-        ]),
+        ], [node('pmic', [
+            ph(),
+            ('compatible', cstr('mediatek,mt6366-pmic')),
+            ('interrupt-parent', u32(eint_ph)),
+            ('interrupts', u32(144, IRQ_LEVEL_HIGH)),
+        ], [node('keys', [
+            ph(),
+            ('compatible', cstr('mediatek,mt6366-keys')),
+            ('keymap', u32(0, HID_CSMR_POWER, 1, HID_CSMR_VOLUME_UP)),
+        ])])]),
     ]
 
 
@@ -252,7 +275,7 @@ def build(seed=None, qemu=False, highmem=False, viva=False, viva_ufs=False):
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
-        ])] + (viva_devices(ph, gic_ph) if viva else []))
+        ])] + (viva_devices(ph, phandle, gic_ph) if viva else []))
 
     fbcon = node('sweet-fbcon', [
         ph(),
