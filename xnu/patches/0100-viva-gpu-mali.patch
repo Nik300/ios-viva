@@ -40,10 +40,10 @@ index 91ff7ec..8e06076 100644
  	}
 diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
 new file mode 100644
-index 0000000..a3b284a
+index 0000000..0c88d0f
 --- /dev/null
 +++ b/iokit/Kernel/arm/VivaGPU.cpp
-@@ -0,0 +1,1975 @@
+@@ -0,0 +1,2063 @@
 +/*
 + * viva (MT6781): Mali-G57 MC2 driver (see VivaGPU.h).
 + *
@@ -114,6 +114,8 @@ index 0000000..a3b284a
 +#define GPU_FAULT_ADDRESS_LO    0x040
 +#define GPU_FAULT_ADDRESS_HI    0x044
 +#define GPU_AFBC_FEATURES       0x04c
++#define GPU_TIMESTAMP_LO        0x098
++#define GPU_TIMESTAMP_HI        0x09c
 +#define GPU_THREAD_MAX_THREADS  0x0a0
 +#define GPU_THREAD_MAX_WG       0x0a4
 +#define GPU_THREAD_MAX_BARRIER  0x0a8
@@ -153,7 +155,6 @@ index 0000000..a3b284a
 +#define GPU_CMD_SOFT_RESET      0x01
 +#define GPU_CMD_HARD_RESET      0x02
 +#define COHERENCY_NONE          31
-+#define SC_TLS_HASH_ENABLE      (1u << 17)
 +#define SC_VAR_ALGORITHM        (1u << 29)
 +#define JM_IDVS_GROUP_SIZE(n)   ((uint32_t)(n) << 16)
 +
@@ -178,7 +179,6 @@ index 0000000..a3b284a
 +#define JS_CMD_START            1
 +#define JS_CMD_HARD_STOP        3
 +#define JS_CFG_START_FLUSH_CLEAN_INV    (3u << 8)
-+#define JS_CFG_START_MMU                (1u << 10)
 +#define JS_CFG_END_FLUSH_CLEAN_INV      (3u << 12)
 +#define JS_CFG_THREAD_PRI(n)            ((uint32_t)(n) << 16)
 +
@@ -350,15 +350,17 @@ index 0000000..a3b284a
 +	return ns / NSEC_PER_MSEC;
 +}
 +
-+/* Clean (+ invalidate) the CPU caches for physical memory, by VA through the physical aperture (PoC). */
++/* CPU cache maintenance for physical memory, by VA through the physical aperture (to PoC). */
 +static void
-+cacheRangePA(uint64_t pa, uint64_t len, bool invalidate)
++cacheRangePA(uint64_t pa, uint64_t len, int op)
 +{
 +	uint64_t end = pa + len;
 +	for (uint64_t line = pa & ~63ull; line < end; line += 64) {
 +		uintptr_t va = (uintptr_t)phystokv(line);
-+		if (invalidate) {
++		if (op == kVivaCacheFlush) {
 +			__asm__ volatile ("dc civac, %0" : : "r"(va) : "memory");
++		} else if (op == kVivaCacheInvalidate) {
++			__asm__ volatile ("dc ivac, %0" : : "r"(va) : "memory");
 +		} else {
 +			__asm__ volatile ("dc cvac, %0" : : "r"(va) : "memory");
 +		}
@@ -376,8 +378,8 @@ index 0000000..a3b284a
 +	}
 +}
 +
-+static void
-+cacheRangeMD(IOMemoryDescriptor *md, uint64_t offset, uint64_t len, bool invalidate)
++void
++cacheRangeMD(IOMemoryDescriptor *md, uint64_t offset, uint64_t len, int op)
 +{
 +	while (len > 0) {
 +		IOByteCount seg = 0;
@@ -386,7 +388,7 @@ index 0000000..a3b284a
 +			return;
 +		}
 +		seg = MIN((uint64_t)seg, len);
-+		cacheRangePA(pa, seg, invalidate);
++		cacheRangePA(pa, seg, op);
 +		offset += seg;
 +		len -= seg;
 +	}
@@ -517,7 +519,7 @@ index 0000000..a3b284a
 +			return 0;
 +		}
 +		bzero(page->getBytesNoCopy(), page_size);
-+		cacheRangePA(pa, page_size, false);
++		cacheRangePA(pa, page_size, kVivaCacheClean);
 +		fPool->setObject(page);
 +		page->release();
 +		gpu->chargeMemory(page_size);
@@ -548,7 +550,7 @@ index 0000000..a3b284a
 +				return NULL;
 +			}
 +			t[idx] = next | PTE_TABLE;
-+			cacheRangePA(pa + 8 * idx, 8, false);
++			cacheRangePA(pa + 8 * idx, 8, kVivaCacheClean);
 +			e = t[idx];
 +		}
 +		pa = e & PTE_ADDR;
@@ -707,7 +709,13 @@ index 0000000..a3b284a
 +		return false;
 +	}
 +	uint32_t idx = (uint32_t)((addr - va) / HEAP_CHUNK);
-+	if (idx >= chunkCount || chunks[idx] != NULL || !vm->gpu->chargeMemory(HEAP_CHUNK)) {
++	if (idx >= chunkCount) {
++		return false;
++	}
++	if (chunks[idx] != NULL) {
++		return true;            /* another unit faulted on it before the flush: already mapped */
++	}
++	if (!vm->gpu->chargeMemory(HEAP_CHUNK)) {
 +		return false;
 +	}
 +	uint64_t len = MIN(HEAP_CHUNK, vaSize - (uint64_t)idx * HEAP_CHUNK);
@@ -717,7 +725,7 @@ index 0000000..a3b284a
 +		vm->gpu->chargeMemory(-(int64_t)HEAP_CHUNK);
 +		return false;
 +	}
-+	cacheRangeMD(c, 0, len, true);
++	cacheRangeMD(c, 0, len, kVivaCacheFlush);
 +	if (!vm->map(va + (uint64_t)idx * HEAP_CHUNK, c, 0, len, PTE_AP_UNPRIV | PTE_SH_IS | PTE_AF | PTE_NG | PTE_XN)) {
 +		c->release();
 +		vm->gpu->chargeMemory(-(int64_t)HEAP_CHUNK);
@@ -728,7 +736,7 @@ index 0000000..a3b284a
 +}
 +
 +void
-+VivaGPUBO::cacheOp(uint64_t offset, uint64_t len, bool invalidate)
++VivaGPUBO::cacheOp(uint64_t offset, uint64_t len, int op)
 +{
 +	if (memory == NULL) {
 +		return;
@@ -736,7 +744,7 @@ index 0000000..a3b284a
 +	if (len == 0 || offset + len > size) {
 +		len = offset < size ? size - offset : 0;
 +	}
-+	cacheRangeMD(memory, memOffset + offset, len, invalidate);
++	cacheRangeMD(memory, memOffset + offset, len, op);
 +}
 +
 +/* ---- accelerator ---- */
@@ -887,11 +895,30 @@ index 0000000..a3b284a
 +
 +/* ---- MFG power ---- */
 +
++/* MFG1 bus protection steps (infracfg_ao), set in this order on power-off, released in reverse. */
++static const struct { uint32_t set, clr, sta, mask; } gMfgProt[4] = {
++	{ INFRA_PROT1_SET, INFRA_PROT1_CLR, INFRA_PROT1_STA1, 0x18000000 },
++	{ INFRA_PROT_SET, INFRA_PROT_CLR, INFRA_PROT_STA1, 0x00600000 },
++	{ INFRA_PROT_SET, INFRA_PROT_CLR, INFRA_PROT_STA1, 0x02000000 },
++	{ INFRA_PROT1_SET, INFRA_PROT1_CLR, INFRA_PROT1_STA1, 0x20000000 },
++};
++
++void
++VivaGPUAccelerator::protRelease(int from)
++{
++	for (int i = from; i >= 0; i--) {
++		wr32(fInfra, gMfgProt[i].clr, gMfgProt[i].mask);
++	}
++}
++
 +bool
 +VivaGPUAccelerator::mtcmosOn(uint32_t n, char **out, char *end)
 +{
 +	uint32_t con = SPM_MFG_PWR_CON(n), bit = MFG_STATUS_BIT(n);
 +	if ((rd32(fSpm, SPM_PWR_STATUS) & bit) && (rd32(fSpm, SPM_PWR_STATUS_2ND) & bit)) {
++		if (n == 1) {
++			protRelease();  /* a power-off that gave up may have left it set */
++		}
 +		say(out, end, "  MFG%u already on (pwr_con 0x%08x)\n", n, rd32(fSpm, con));
 +		return true;
 +	}
@@ -911,35 +938,29 @@ index 0000000..a3b284a
 +		return false;
 +	}
 +	if (n == 1) {
-+		/* release the bus protection, last step first */
-+		wr32(fInfra, INFRA_PROT1_CLR, 0x20000000);
-+		wr32(fInfra, INFRA_PROT_CLR, 0x02000000);
-+		wr32(fInfra, INFRA_PROT_CLR, 0x00600000);
-+		wr32(fInfra, INFRA_PROT1_CLR, 0x18000000);
++		protRelease();
 +	}
 +	say(out, end, "  MFG%u on (pwr_con 0x%08x)\n", n, rd32(fSpm, con));
 +	return true;
 +}
 +
-+void
++/* false: the domain was left on (MFG1 whose bus did not drain). */
++bool
 +VivaGPUAccelerator::mtcmosOff(uint32_t n, char **out, char *end)
 +{
 +	uint32_t con = SPM_MFG_PWR_CON(n), bit = MFG_STATUS_BIT(n);
 +	if (!(rd32(fSpm, SPM_PWR_STATUS) & bit) && !(rd32(fSpm, SPM_PWR_STATUS_2ND) & bit)) {
-+		return;
++		return true;
 +	}
 +	if (n == 1) {
-+		static const struct { uint32_t set, sta, mask; } steps[4] = {
-+			{ INFRA_PROT1_SET, INFRA_PROT1_STA1, 0x18000000 }, { INFRA_PROT_SET, INFRA_PROT_STA1, 0x00600000 },
-+			{ INFRA_PROT_SET, INFRA_PROT_STA1, 0x02000000 }, { INFRA_PROT1_SET, INFRA_PROT1_STA1, 0x20000000 },
-+		};
 +		for (int i = 0; i < 4; i++) {
-+			wr32(fInfra, steps[i].set, steps[i].mask);
-+			if (!pollUs(1000, [&]{ return (rd32(fInfra, steps[i].sta) & steps[i].mask) == steps[i].mask; })) {
-+				/* the bus did not drain: powering off now could hang it; leave MFG1 on */
++			wr32(fInfra, gMfgProt[i].set, gMfgProt[i].mask);
++			if (!pollUs(1000, [&]{ return (rd32(fInfra, gMfgProt[i].sta) & gMfgProt[i].mask) == gMfgProt[i].mask; })) {
++				/* the bus did not drain: powering off now could hang it; leave MFG1 on and usable */
 +				say(out, end, "  MFG1: bus protection step %d not acknowledged (sta 0x%08x), left on\n", i + 1,
-+				    rd32(fInfra, steps[i].sta));
-+				return;
++				    rd32(fInfra, gMfgProt[i].sta));
++				protRelease(i);
++				return false;
 +			}
 +		}
 +	}
@@ -955,6 +976,7 @@ index 0000000..a3b284a
 +	if (!pollUs(1000, [&]{ return !(rd32(fSpm, SPM_PWR_STATUS) & bit) && !(rd32(fSpm, SPM_PWR_STATUS_2ND) & bit); })) {
 +		say(out, end, "  MFG%u: still on after power off\n", n);
 +	}
++	return true;
 +}
 +
 +/* Set a rail's VOSEL and enable it (VivaPwrap only lets the GPU rails through, within limits). */
@@ -965,6 +987,38 @@ index 0000000..a3b284a
 +		return false;
 +	}
 +	return fPwrap->writeRegulator(enAddr, 0x1, 1) == kIOReturnSuccess;
++}
++
++/* MFGPLL at 300 MHz, mfg_sel parked on mainpll_d5 while it changes (gpufreq's frequency switch). */
++void
++VivaGPUAccelerator::mfgClock(char **out, char *end)
++{
++	uint32_t cfg = rd32(fTopck, CK_CFG_0);
++	if (rd32(fApmixed, PLL_MFG_CON0) & 1) {
++		wr32(fTopck, CK_CFG_0_CLR, CK_MFG_SEL_MASK);
++		wr32(fTopck, CK_CFG_0_SET, CK_MFG_MAINPLL_D5 << CK_MFG_SEL_SHIFT);
++		wr32(fTopck, CK_CFG_UPDATE, CK_CFG_UPDATE_MFG);
++		IODelay(20);
++	}
++	if (!(rd32(fApmixed, PLL_MFG_PWR_CON0) & 1)) {
++		set32(fApmixed, PLL_MFG_PWR_CON0, 1u << 0);
++		IODelay(1);
++	}
++	clr32(fApmixed, PLL_MFG_PWR_CON0, 1u << 1);
++	IODelay(1);
++	wr32(fApmixed, PLL_MFG_CON1, MFGPLL_CON1_VALUE);
++	set32(fApmixed, PLL_MFG_CON0, 1u << 0);
++	IODelay(20);
++	if (cfg & CK_MFG_PDN) {
++		wr32(fTopck, CK_CFG_0_CLR, CK_MFG_PDN);
++	}
++	wr32(fTopck, CK_CFG_0_CLR, CK_MFG_SEL_MASK);
++	wr32(fTopck, CK_CFG_0_SET, CK_MFG_MFGPLL << CK_MFG_SEL_SHIFT);
++	wr32(fTopck, CK_CFG_UPDATE, CK_CFG_UPDATE_MFG);
++	IODelay(20);
++	say(out, end, "clock: mfgpll con0 0x%08x con1 0x%08x pwr 0x%08x, clk_cfg_0 0x%08x (was 0x%08x)\n",
++	    rd32(fApmixed, PLL_MFG_CON0), rd32(fApmixed, PLL_MFG_CON1), rd32(fApmixed, PLL_MFG_PWR_CON0),
++	    rd32(fTopck, CK_CFG_0), cfg);
 +}
 +
 +bool
@@ -982,9 +1036,15 @@ index 0000000..a3b284a
 +	say(out, end, "rails before: vgpu %s %u uV, vsram_gpu %s %u uV\n", vgEn ? "on" : "off", UV(vgSel),
 +	    vsEn ? "on" : "off", UV(vsSel));
 +
-+	/* lowering: VGPU first; raising: VSRAM first (VSRAM >= VGPU + 0.1 V throughout) */
-+	bool ok;
-+	if (vgEn && vgSel > VGPU_SEL) {
++	/*
++	 * Lowering (the preloader left the rails higher): clock down first, then VGPU, then VSRAM.
++	 * Raising: VSRAM, VGPU, then the clock. VSRAM >= VGPU + 0.1 V throughout.
++	 */
++	bool ok, lowering = vgEn && vgSel > VGPU_SEL;
++	if (lowering) {
++		mfgClock(out, end);
++	}
++	if (lowering) {
 +		ok = regulatorSet(PMIC_VGPU_EN, PMIC_VGPU_VOSEL, VGPU_SEL);
 +		IODelay(300);
 +		ok = ok && regulatorSet(PMIC_VSRAM_EN, PMIC_VSRAM_VOSEL, VSRAM_SEL);
@@ -1009,33 +1069,9 @@ index 0000000..a3b284a
 +		return false;
 +	}
 +
-+	/* MFGPLL at 300 MHz, mfg_sel parked on mainpll_d5 while it changes */
-+	uint32_t cfg = rd32(fTopck, CK_CFG_0);
-+	if (rd32(fApmixed, PLL_MFG_CON0) & 1) {
-+		wr32(fTopck, CK_CFG_0_CLR, CK_MFG_SEL_MASK);
-+		wr32(fTopck, CK_CFG_0_SET, CK_MFG_MAINPLL_D5 << CK_MFG_SEL_SHIFT);
-+		wr32(fTopck, CK_CFG_UPDATE, CK_CFG_UPDATE_MFG);
-+		IODelay(5);
++	if (!lowering) {
++		mfgClock(out, end);     /* raising: voltage first, then the clock */
 +	}
-+	if (!(rd32(fApmixed, PLL_MFG_PWR_CON0) & 1)) {
-+		set32(fApmixed, PLL_MFG_PWR_CON0, 1u << 0);
-+		IODelay(1);
-+	}
-+	clr32(fApmixed, PLL_MFG_PWR_CON0, 1u << 1);
-+	IODelay(1);
-+	wr32(fApmixed, PLL_MFG_CON1, MFGPLL_CON1_VALUE);
-+	set32(fApmixed, PLL_MFG_CON0, 1u << 0);
-+	IODelay(20);
-+	if (cfg & CK_MFG_PDN) {
-+		wr32(fTopck, CK_CFG_0_CLR, CK_MFG_PDN);
-+	}
-+	wr32(fTopck, CK_CFG_0_CLR, CK_MFG_SEL_MASK);
-+	wr32(fTopck, CK_CFG_0_SET, CK_MFG_MFGPLL << CK_MFG_SEL_SHIFT);
-+	wr32(fTopck, CK_CFG_UPDATE, CK_CFG_UPDATE_MFG);
-+	IODelay(5);
-+	say(out, end, "clock: mfgpll con0 0x%08x con1 0x%08x pwr 0x%08x, clk_cfg_0 0x%08x (was 0x%08x)\n",
-+	    rd32(fApmixed, PLL_MFG_CON0), rd32(fApmixed, PLL_MFG_CON1), rd32(fApmixed, PLL_MFG_PWR_CON0),
-+	    rd32(fTopck, CK_CFG_0), cfg);
 +
 +	/* power domains MFG0 -> MFG3 */
 +	wr32(fSpm, SPM_POWERON_CONFIG_EN, SPM_PROJECT_KEY);
@@ -1067,6 +1103,7 @@ index 0000000..a3b284a
 +void
 +VivaGPUAccelerator::mfgOff(char **out, char *end)
 +{
++	wr32(fSpm, SPM_POWERON_CONFIG_EN, SPM_PROJECT_KEY);
 +	uint32_t st = rd32(fSpm, SPM_PWR_STATUS) & rd32(fSpm, SPM_PWR_STATUS_2ND);
 +	if ((st & MFG_STATUS_BIT(0)) && (st & MFG_STATUS_BIT(1))) {
 +		/* wait for the GPU bus to go idle */
@@ -1078,7 +1115,11 @@ index 0000000..a3b284a
 +		wr32(fMfgcfg, MFG_CG_SET, MFG_CG_BG3D);
 +	}
 +	for (int n = 3; n >= 0; n--) {
-+		mtcmosOff((uint32_t)n, out, end);
++		if (!mtcmosOff((uint32_t)n, out, end)) {
++			wr32(fMfgcfg, MFG_CG_CLR, MFG_CG_BG3D);
++			say(out, end, "MFG off aborted: MFG0/MFG1, clock and rails left on\n");
++			return;
++		}
 +	}
 +	st = rd32(fSpm, SPM_PWR_STATUS) & rd32(fSpm, SPM_PWR_STATUS_2ND);
 +	if (!(st & MFG_STATUS_BIT(0))) {
@@ -1219,12 +1260,8 @@ index 0000000..a3b284a
 +		return false;
 +	}
 +	readFeatures();
-+	/* Panfrost's quirks for this GPU: TLS hashing, IDVS group size, r0p0 varying algorithm */
-+	uint32_t sc = rd(GPU_SHADER_CONFIG) | SC_TLS_HASH_ENABLE;
-+	if ((fGpuId & 0xfff0) == 0) {
-+		sc |= SC_VAR_ALGORITHM;
-+	}
-+	wr(GPU_SHADER_CONFIG, sc);
++	/* Panfrost's quirks for G57: TTRX_2968/TTRX_3162 varying algorithm (all revisions), IDVS group size */
++	wr(GPU_SHADER_CONFIG, rd(GPU_SHADER_CONFIG) | SC_VAR_ALGORITHM);
 +	wr(GPU_JM_CONFIG, rd(GPU_JM_CONFIG) | JM_IDVS_GROUP_SIZE(0xf));
 +	wr(GPU_COHERENCY_ENABLE, COHERENCY_NONE);
 +	if (!powerCores()) {
@@ -1251,6 +1288,9 @@ index 0000000..a3b284a
 +	wr(GPU_IRQ_MASK, GPU_IRQ_FAULT | GPU_IRQ_MULTIPLE_FAULT);
 +	wr(JOB_INT_MASK, jobMask);
 +	wr(MMU_INT_MASK, mmuMask);
++	if ((fMmuFeatures & 0xff) != 48) {
++		say(out, end, "warning: MMU reports %u VA bits, page tables assume 48\n", fMmuFeatures & 0xff);
++	}
 +	uint32_t cores = (uint32_t)__builtin_popcountll(fShaderPresent);
 +	say(out, end, "VIVA GPU: id 0x%08x (product 0x%04x r%up%u) cores %u (0x%llx) l2 on (0x%llx), "
 +	    "as 0x%x js 0x%x mmu 0x%08x coherency 0x%x\n", fGpuId, fGpuId >> 16, (fGpuId >> 12) & 0xf,
@@ -1290,13 +1330,14 @@ index 0000000..a3b284a
 +		mfgOff(out, end);
 +		return;
 +	}
-+	failAll(kIOReturnOffline);
 +	for (int i = 0; i < 3; i++) {
 +		fIrq[i]->disable();
 +	}
 +	wr(GPU_IRQ_MASK, 0);
 +	wr(JOB_INT_MASK, 0);
 +	wr(MMU_INT_MASK, 0);
++	softReset();            /* nothing runs any more: job memory can be released */
++	failAll(kIOReturnOffline);
 +	for (uint32_t as = 0; as < fASCount; as++) {
 +		if (fAS[as] != NULL) {
 +			fAS[as]->asSlot = -1;
@@ -1396,7 +1437,13 @@ index 0000000..a3b284a
 +{
 +	vm->lastUse = ++fLRU;
 +	if (vm->asSlot >= 0) {
-+		return true;
++		if (vm->asFaulted && vm->running == 0) {
++			asProgram(vm->asSlot, vm);
++			wr(MMU_INT_CLEAR, (1u << vm->asSlot) | (1u << (16 + vm->asSlot)));
++			wr(MMU_INT_MASK, rd(MMU_INT_MASK) | (1u << vm->asSlot) | (1u << (16 + vm->asSlot)));
++			vm->asFaulted = false;
++		}
++		return !vm->asFaulted;
 +	}
 +	int pick = -1;
 +	for (uint32_t i = 0; i < fASCount; i++) {
@@ -1413,8 +1460,11 @@ index 0000000..a3b284a
 +	}
 +	if (fAS[pick] != NULL) {
 +		fAS[pick]->asSlot = -1;
++		fAS[pick]->asFaulted = false;
 +	}
 +	asProgram(pick, vm);
++	wr(MMU_INT_CLEAR, (1u << pick) | (1u << (16 + pick)));
++	wr(MMU_INT_MASK, rd(MMU_INT_MASK) | (1u << pick) | (1u << (16 + pick)));
 +	fAS[pick] = vm;
 +	vm->asSlot = pick;
 +	return true;
@@ -1518,7 +1568,7 @@ index 0000000..a3b284a
 +			OSSafeReleaseNULL(bo->busy);
 +			bo->busy = fence;
 +			if (bo->cacheMaint) {
-+				bo->cacheOp(0, 0, true);        /* CPU writes out before the GPU reads */
++				bo->cacheOp(0, 0, kVivaCacheFlush);     /* CPU writes out before the GPU reads */
 +			}
 +		}
 +	}
@@ -1579,9 +1629,12 @@ index 0000000..a3b284a
 +	wr(js + JS_AFFINITY_NEXT_LO, (uint32_t)fShaderPresent);
 +	wr(js + JS_AFFINITY_NEXT_HI, (uint32_t)(fShaderPresent >> 32));
 +	wr(js + JS_CONFIG_NEXT, (uint32_t)job->vm->asSlot | JS_CFG_THREAD_PRI(8) | JS_CFG_START_FLUSH_CLEAN_INV |
-+	    JS_CFG_END_FLUSH_CLEAN_INV | JS_CFG_START_MMU);
++	    JS_CFG_END_FLUSH_CLEAN_INV);
 +	wr(js + JS_COMMAND_NEXT, JS_CMD_START);
-+	fTimer->setTimeoutMS(TIMER_MS);
++	if (!fTimerArmed) {
++		fTimerArmed = true;
++		fTimer->setTimeoutMS(TIMER_MS);
++	}
 +}
 +
 +void
@@ -1604,7 +1657,7 @@ index 0000000..a3b284a
 +	for (unsigned int i = 0; job->bos != NULL && i < job->bos->getCount(); i++) {
 +		VivaGPUBO *bo = (VivaGPUBO *)job->bos->getObject(i);
 +		if (bo->cacheMaint) {
-+			bo->cacheOp(0, 0, true);        /* drop CPU lines so the CPU sees what the GPU wrote */
++			bo->cacheOp(0, 0, kVivaCacheInvalidate);        /* drop CPU lines: the CPU sees what the GPU wrote */
 +		}
 +	}
 +	job->fence->signalled = true;
@@ -1644,9 +1697,10 @@ index 0000000..a3b284a
 +{
 +	fResets++;
 +	IOLog("VIVA GPU: reset (%s)\n", why);
-+	failAll(kIOReturnAborted);
 +	wr(JOB_INT_MASK, 0);
 +	wr(MMU_INT_MASK, 0);
++	softReset();            /* stop the GPU before the jobs' memory is released */
++	failAll(kIOReturnAborted);
 +	for (uint32_t as = 0; as < fASCount; as++) {
 +		if (fAS[as] != NULL) {
 +			fAS[as]->asSlot = -1;
@@ -1655,7 +1709,12 @@ index 0000000..a3b284a
 +	}
 +	char buf[256], *p = buf;
 +	if (!maliInit(&p, buf + sizeof(buf))) {
-+		IOLog("VIVA GPU: reset failed: %s", buf);
++		IOLog("VIVA GPU: reset failed, GPU unusable until gpu off/on: %s", buf);
++		for (int i = 0; i < 3; i++) {
++			fIrq[i]->disable();
++		}
++		failAll(kIOReturnOffline);
++		fPowered = false;
 +		return;
 +	}
 +	kick();
@@ -1695,6 +1754,7 @@ index 0000000..a3b284a
 +		uint32_t fs = self->rd(AS_BASE(as) + AS_FAULTSTATUS);
 +		uint64_t addr = self->rd(AS_BASE(as) + AS_FAULTADDRESS_LO) |
 +		    (uint64_t)self->rd(AS_BASE(as) + AS_FAULTADDRESS_HI) << 32;
++		self->wr(MMU_INT_CLEAR, bits);  /* before the flush resumes the GPU: a new fault must not be lost */
 +		VivaGPUVM *vm = self->fAS[as];
 +		bool handled = false;
 +		if (vm != NULL && (bits & (1u << as)) && (fs & 0xf8) == 0xc0) {
@@ -1715,14 +1775,17 @@ index 0000000..a3b284a
 +				    ((fs >> 8) & 3) == 1 ? "execute" : ((fs >> 8) & 3) == 2 ? "read" :
 +				    ((fs >> 8) & 3) == 3 ? "write" : "atomic", fs >> 16);
 +			}
-+			/* kill the address space: the job fails, the VM is re-bound on its next job */
++			/*
++			 * Kill the address space: the job on it fails. The slot stays owned by the VM (not handed to
++			 * another one while that job is still on the hardware) with its interrupts masked; the VM's
++			 * next job reprograms it.
++			 */
 +			self->asDisable((int)as);
++			self->wr(MMU_INT_MASK, self->rd(MMU_INT_MASK) & ~((1u << as) | (1u << (16 + as))));
 +			if (vm != NULL) {
-+				vm->asSlot = -1;
++				vm->asFaulted = true;
 +			}
-+			self->fAS[as] = NULL;
 +		}
-+		self->wr(MMU_INT_CLEAR, bits);
 +	}
 +}
 +
@@ -1746,6 +1809,11 @@ index 0000000..a3b284a
 +			if (slot < 2) {
 +				self->completeJob(slot, kIOReturnIOError, status);
 +			}
++			if ((status & 0xff) == 0x48) {
++				self->wr(JOB_INT_CLEAR, stat & (done | fail));
++				self->resetGPU("job bus fault (TTRX_3076: later fragment jobs may hang)");
++				return;
++			}
 +		} else if (slot < 2) {
 +			self->completeJob(slot, kIOReturnSuccess, 0x01);
 +		}
@@ -1758,7 +1826,11 @@ index 0000000..a3b284a
 +VivaGPUAccelerator::jobTimer(OSObject *owner, IOTimerEventSource *src __unused)
 +{
 +	VivaGPUAccelerator *self = OSDynamicCast(VivaGPUAccelerator, owner);
-+	if (self == NULL || !self->fPowered) {
++	if (self == NULL) {
++		return;
++	}
++	self->fTimerArmed = false;
++	if (!self->fPowered) {
 +		return;
 +	}
 +	uint64_t now = nowMs();
@@ -1771,7 +1843,10 @@ index 0000000..a3b284a
 +		busy = true;
 +		if (self->fStopDeadline[slot] != 0 && now >= self->fStopDeadline[slot]) {
 +			self->resetGPU("a job ignored its hard stop");
-+			self->fTimer->setTimeoutMS(TIMER_MS);
++			if (self->fPowered && (self->fRunning[0] || self->fRunning[1])) {
++				self->fTimerArmed = true;
++				self->fTimer->setTimeoutMS(TIMER_MS);
++			}
 +			return;
 +		}
 +		if (self->fStopDeadline[slot] == 0 && now - job->startMs > JOB_TIMEOUT_MS) {
@@ -1784,6 +1859,7 @@ index 0000000..a3b284a
 +		}
 +	}
 +	if (busy) {
++		self->fTimerArmed = true;
 +		self->fTimer->setTimeoutMS(TIMER_MS);
 +	}
 +}
@@ -1839,7 +1915,18 @@ index 0000000..a3b284a
 +	case VGPU_PARAM_NR_CORE_GROUPS: *value = (uint64_t)__builtin_popcountll(fL2Present); break;
 +	case VGPU_PARAM_THREAD_TLS_ALLOC: *value = fThreadTlsAlloc; break;
 +	case VGPU_PARAM_AFBC_FEATURES: *value = fAfbcFeatures; break;
-+	case VGPU_PARAM_SYSTEM_TIMESTAMP: *value = mach_absolute_time(); break;
++	case VGPU_PARAM_SYSTEM_TIMESTAMP:
++		if (fPowered) {         /* the GPU's copy of the system counter, what its jobs write */
++			uint32_t hi, lo;
++			do {
++				hi = rd(GPU_TIMESTAMP_HI);
++				lo = rd(GPU_TIMESTAMP_LO);
++			} while (hi != rd(GPU_TIMESTAMP_HI));
++			*value = (uint64_t)hi << 32 | lo;
++		} else {
++			*value = mach_absolute_time();
++		}
++		break;
 +	case VGPU_PARAM_SYSTEM_TIMESTAMP_FREQUENCY: *value = gPEClockFrequencyInfo.timebase_frequency_hz; break;
 +	case VGPU_PARAM_ALLOWED_JM_CTX_PRIORITIES: *value = 1u << 1; break;
 +	case VGPU_PARAM_SELECTED_COHERENCY: *value = VGPU_COHERENCY_NONE; break;
@@ -1889,6 +1976,7 @@ index 0000000..a3b284a
 +	fSelfVM->retain();
 +	bo->kind = kVivaBONormal;
 +	bo->memory = mem;
++	bo->cacheMaint = true;  /* written and read through the kernel's cacheable mapping */
 +	bo->size = bo->vaSize = page_size;
 +	chargeMemory(page_size);
 +	bo->va = fSelfVM->allocVA(page_size, page_size);
@@ -2021,10 +2109,10 @@ index 0000000..a3b284a
 +#endif /* SWEET */
 diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
 new file mode 100644
-index 0000000..a43977e
+index 0000000..4d2ab35
 --- /dev/null
 +++ b/iokit/Kernel/arm/VivaGPU.h
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,266 @@
 +/*
 + * viva (MT6781): Mali-G57 MC2 GPU (Valhall v9, job manager) for the
 + * Metal driver (VivaMTLDriver.bundle, Mesa Panfrost in userspace).
@@ -2061,6 +2149,10 @@ index 0000000..a43977e
 +#include "viva_gpu_uapi.h"
 +
 +class VivaPwrap;
++
++/* CPU cache maintenance (to PoC): before the GPU reads (clean/flush), after it wrote (invalidate). */
++enum { kVivaCacheClean, kVivaCacheFlush, kVivaCacheInvalidate };
++void cacheRangeMD(IOMemoryDescriptor *md, uint64_t offset, uint64_t len, int op);
 +class VivaGPUAccelerator;
 +class SweetSurface;
 +
@@ -2100,6 +2192,7 @@ index 0000000..a43977e
 +	uint32_t  running;              /* jobs on the hardware with this VM */
 +	uint64_t  lastUse;              /* LRU stamp for address-space eviction */
 +	uint32_t  faults;
++	bool      asFaulted;            /* its AS was disabled by a fault: reprogram before the next job */
 +
 +private:
 +	uint64_t *tableFor(uint64_t va, bool create);
@@ -2121,8 +2214,8 @@ index 0000000..a43977e
 +	virtual void free(void) APPLE_KEXT_OVERRIDE;
 +	/* Heap BO: back the 2 MiB chunk containing `va` (GPU fault). */
 +	bool growHeap(uint64_t va);
-+	/* CPU cache clean (+ invalidate) of [offset, offset + len) of the BO (len 0 = all). */
-+	void cacheOp(uint64_t offset, uint64_t len, bool invalidate);
++	/* CPU cache maintenance (kVivaCache*) of [offset, offset + len) of the BO (len 0 = all). */
++	void cacheOp(uint64_t offset, uint64_t len, int op);
 +
 +	VivaGPUVM          *vm;
 +	VivaGPUBOKind       kind;
@@ -2183,7 +2276,9 @@ index 0000000..a43977e
 +	void mfgDump(char **out, char *end);
 +	bool regulatorSet(uint32_t enAddr, uint32_t voselAddr, uint32_t sel);
 +	bool mtcmosOn(uint32_t idx, char **out, char *end);
-+	void mtcmosOff(uint32_t idx, char **out, char *end);
++	bool mtcmosOff(uint32_t idx, char **out, char *end);
++	void mfgClock(char **out, char *end);
++	void protRelease(int from = 3);
 +	/* Mali */
 +	bool maliInit(char **out, char *end);
 +	bool softReset(void);
@@ -2221,7 +2316,7 @@ index 0000000..a43977e
 +	vm_offset_t             fMali, fMfgcfg, fSpm, fTopck, fApmixed, fInfra;
 +	VivaPwrap              *fPwrap;
 +	int                     fMode;          /* vivagpu boot-arg */
-+	bool                    fPowered, fPublished, fAcpDone;
++	bool                    fPowered, fPublished, fAcpDone, fTimerArmed;
 +	char                    fFenceEvent;
 +
 +	/* features (read once after the first power on) */
@@ -2286,10 +2381,10 @@ index 0000000..a43977e
 +#endif /* _IOKIT_ARM_VIVAGPU_H */
 diff --git a/iokit/Kernel/arm/VivaGPUUserClient.cpp b/iokit/Kernel/arm/VivaGPUUserClient.cpp
 new file mode 100644
-index 0000000..2fabdcc
+index 0000000..71a1c89
 --- /dev/null
 +++ b/iokit/Kernel/arm/VivaGPUUserClient.cpp
-@@ -0,0 +1,789 @@
+@@ -0,0 +1,793 @@
 +/*
 + * viva (MT6781): user client of the Mali driver (see VivaGPU.h), the
 + * kernel side of viva_gpu_uapi.h. One connection = one GPU address space
@@ -2301,9 +2396,10 @@ index 0000000..2fabdcc
 + * accelerator's gate and copied back. Arrays the structures point to are
 + * read from the calling task with copyin() before taking the gate.
 + *
-+ * Semantics follow DRM_PANFROST_* and DRM binary syncobjs, with two
++ * Semantics follow DRM_PANFROST_* and DRM binary syncobjs, with three
 + * leniencies the userspace mock also has: an in-sync without a fence is no
-+ * dependency (DRM fails the submit), and TRANSFER copies "no fence".
++ * dependency (DRM fails the submit), TRANSFER copies "no fence", and a
++ * syncobj without a fence waits (times out) instead of failing with EINVAL.
 + * Timeouts are absolute CLOCK_MONOTONIC nanoseconds (mach_continuous_time
 + * on Darwin). WAIT_BO answers kIOReturnBusy (EBUSY) when the BO is still
 + * busy at the deadline, what Panfrost expects.
@@ -2772,6 +2868,12 @@ index 0000000..2fabdcc
 +				return kIOReturnNoMemory;
 +			}
 +			b->memory = mem;
++			/*
++			 * The allocator zeroed it through the kernel's cacheable mapping (the cache mode only applies to
++			 * later mappings): push the zeros out and drop the lines before the GPU or a WC user mapping
++			 * sees the pages.
++			 */
++			cacheRangeMD(mem, 0, size, kVivaCacheFlush);
 +		}
 +		b->va = fVM->allocVA(size, align);
 +		if (b->va == 0) {
@@ -2882,10 +2984,7 @@ index 0000000..2fabdcc
 +				}
 +				VivaGPUFence *f = fSyncobjs[handles[i]].fence;
 +				if (f == NULL) {
-+					if (!(a->flags & VGPU_SYNCOBJ_WAIT_FOR_SUBMIT)) {
-+						return kIOReturnBadArgument;    /* DRM: nothing to wait for */
-+					}
-+					continue;
++					continue;       /* no fence yet: unsignalled (DRM would fail without WAIT_FOR_SUBMIT) */
 +				}
 +				if (f->signalled) {
 +					signalled++;
