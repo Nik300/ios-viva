@@ -207,8 +207,8 @@ reg = Mali, mfgcfg, SPM, topckgen, apmixed, infracfg_ao; SPI 274-276 GPU/MMU/JOB
   Next: userspace on the phone (`gpu/ios/build.sh` needs Xcode: test_vgpu with `gpu publish`, then the Metal bundle).
 - Not yet: DVFS, runtime power gating, IOSurface cache flush cost (whole surface per job), performance counters.
 
-Patches 0101-0109 (2026-11-03, written against CI run 41572312019's build tree, compile-checked with
-`tools/xnu-cc.py`, NOT built or tested yet): the userspace requests in `~/Developer/ios-viva/gpu/docs/RICHIESTE-KERNEL.md`.
+Patches 0101-0109 (2026-11-03, built: CI run 41580171845, image `out/xnu-ufs-rw-0109.img` with
+`cpus=6 vivausb=3 vivagpu=2`, vivad in the xnu-kernel artifact; NOT tested on the phone yet): the userspace requests in `~/Developer/ios-viva/gpu/docs/RICHIESTE-KERNEL.md`.
 Build with `VIVA_EXTRA="cpus=6 vivausb=3 vivagpu=2"` (user request: vivagpu=2 from now on).
 - 0101 (K1) unknown user-client types on VivaGPUAccelerator get a `VivaGPUProbeClient` (boot-arg `vivagpuprobe=0`
   refuses them as before): every selector/trap/memory type/notification logged (48 lines per client) and answered
