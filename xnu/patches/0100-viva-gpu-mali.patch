@@ -40,10 +40,10 @@ index 91ff7ec..8e06076 100644
  	}
 diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
 new file mode 100644
-index 0000000..0c88d0f
+index 0000000..204fd4f
 --- /dev/null
 +++ b/iokit/Kernel/arm/VivaGPU.cpp
-@@ -0,0 +1,2063 @@
+@@ -0,0 +1,2080 @@
 +/*
 + * viva (MT6781): Mali-G57 MC2 driver (see VivaGPU.h).
 + *
@@ -87,8 +87,6 @@ index 0000000..0c88d0f
 +#include "VivaGPU.h"
 +#include "VivaPMIC.h"
 +#include "SweetSurface.h"
-+
-+extern "C" vm_map_address_t phystokv(uint64_t pa);
 +
 +#ifndef MIN
 +#define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -350,48 +348,38 @@ index 0000000..0c88d0f
 +	return ns / NSEC_PER_MSEC;
 +}
 +
-+/* CPU cache maintenance for physical memory, by VA through the physical aperture (to PoC). */
++/*
++ * CPU cache maintenance (to PoC) by kernel virtual address. Always through a kernel mapping of the buffer:
++ * on this port the physical aperture (phystokv) only covers RAM from 0xc0000000, and kernel allocations
++ * come from below it too.
++ */
 +static void
-+cacheRangePA(uint64_t pa, uint64_t len, int op)
++cacheVA(const void *p, uint64_t len, int op)
 +{
-+	uint64_t end = pa + len;
-+	for (uint64_t line = pa & ~63ull; line < end; line += 64) {
-+		uintptr_t va = (uintptr_t)phystokv(line);
++	uintptr_t end = (uintptr_t)p + len;
++	for (uintptr_t line = (uintptr_t)p & ~(uintptr_t)63; line < end; line += 64) {
 +		if (op == kVivaCacheFlush) {
-+			__asm__ volatile ("dc civac, %0" : : "r"(va) : "memory");
++			__asm__ volatile ("dc civac, %0" : : "r"(line) : "memory");
 +		} else if (op == kVivaCacheInvalidate) {
-+			__asm__ volatile ("dc ivac, %0" : : "r"(va) : "memory");
++			__asm__ volatile ("dc ivac, %0" : : "r"(line) : "memory");
 +		} else {
-+			__asm__ volatile ("dc cvac, %0" : : "r"(va) : "memory");
++			__asm__ volatile ("dc cvac, %0" : : "r"(line) : "memory");
 +		}
 +	}
 +	__asm__ volatile ("dsb sy" : : : "memory");
 +}
 +
-+/* Clean page-table entries written through a cacheable kernel address (the GPU's table walk is not coherent). */
++/* Page-table entries written through the kernel's cacheable mapping (the GPU's table walk is not coherent). */
 +static void
 +cleanVA(const void *p, size_t len)
 +{
-+	uintptr_t end = (uintptr_t)p + len;
-+	for (uintptr_t line = (uintptr_t)p & ~(uintptr_t)63; line < end; line += 64) {
-+		__asm__ volatile ("dc cvac, %0" : : "r"(line) : "memory");
-+	}
++	cacheVA(p, len, kVivaCacheClean);
 +}
 +
 +void
-+cacheRangeMD(IOMemoryDescriptor *md, uint64_t offset, uint64_t len, int op)
++cacheBuffer(IOBufferMemoryDescriptor *md, uint64_t offset, uint64_t len, int op)
 +{
-+	while (len > 0) {
-+		IOByteCount seg = 0;
-+		addr64_t pa = md->getPhysicalSegment(offset, &seg, kIOMemoryMapperNone);
-+		if (pa == 0 || seg == 0) {
-+			return;
-+		}
-+		seg = MIN((uint64_t)seg, len);
-+		cacheRangePA(pa, seg, op);
-+		offset += seg;
-+		len -= seg;
-+	}
++	cacheVA((const uint8_t *)md->getBytesNoCopy() + offset, len, op);
 +}
 +
 +static const char *
@@ -518,8 +506,15 @@ index 0000000..0c88d0f
 +			page->release();
 +			return 0;
 +		}
++		if (fPoolCount == kPoolMax) {
++			page->release();
++			return 0;
++		}
 +		bzero(page->getBytesNoCopy(), page_size);
-+		cacheRangePA(pa, page_size, kVivaCacheClean);
++		cleanVA(page->getBytesNoCopy(), page_size);
++		fPoolPA[fPoolCount] = pa;
++		fPoolKVA[fPoolCount] = (uint8_t *)page->getBytesNoCopy();
++		fPoolCount++;
 +		fPool->setObject(page);
 +		page->release();
 +		gpu->chargeMemory(page_size);
@@ -532,13 +527,26 @@ index 0000000..0c88d0f
 +	return pa;
 +}
 +
-+/* The level 3 table for `va`, created on the way if `create`. Kernel pointer through the physical aperture. */
++/* Kernel address of a table (physical address) from the pool. */
++uint64_t *
++VivaGPUVM::tableKVA(uint64_t pa)
++{
++	uint64_t base = pa & ~(uint64_t)(page_size - 1);
++	for (uint32_t i = 0; i < fPoolCount; i++) {
++		if (fPoolPA[i] == base) {
++			return (uint64_t *)(fPoolKVA[i] + (pa - base));
++		}
++	}
++	panic("VIVA GPU: page table 0x%llx not in the pool", pa);
++}
++
++/* The level 3 table for `va`, created on the way if `create`. */
 +uint64_t *
 +VivaGPUVM::tableFor(uint64_t va, bool create)
 +{
 +	uint64_t pa = rootPA;
 +	for (int level = 0; level < 3; level++) {
-+		uint64_t *t = (uint64_t *)phystokv(pa);
++		uint64_t *t = tableKVA(pa);
 +		uint32_t idx = (uint32_t)(va >> (39 - 9 * level)) & 511;
 +		uint64_t e = t[idx];
 +		if ((e & 3) != PTE_TABLE) {
@@ -550,12 +558,12 @@ index 0000000..0c88d0f
 +				return NULL;
 +			}
 +			t[idx] = next | PTE_TABLE;
-+			cacheRangePA(pa + 8 * idx, 8, kVivaCacheClean);
++			cleanVA(&t[idx], 8);
 +			e = t[idx];
 +		}
 +		pa = e & PTE_ADDR;
 +	}
-+	return (uint64_t *)phystokv(pa);
++	return tableKVA(pa);
 +}
 +
 +bool
@@ -696,6 +704,7 @@ index 0000000..0c88d0f
 +		}
 +		memory->release();
 +	}
++	OSSafeReleaseNULL(kmap);
 +	OSSafeReleaseNULL(surface);
 +	OSSafeReleaseNULL(busy);
 +	OSSafeReleaseNULL(vm);
@@ -725,7 +734,7 @@ index 0000000..0c88d0f
 +		vm->gpu->chargeMemory(-(int64_t)HEAP_CHUNK);
 +		return false;
 +	}
-+	cacheRangeMD(c, 0, len, kVivaCacheFlush);
++	cacheBuffer(c, 0, len, kVivaCacheFlush);
 +	if (!vm->map(va + (uint64_t)idx * HEAP_CHUNK, c, 0, len, PTE_AP_UNPRIV | PTE_SH_IS | PTE_AF | PTE_NG | PTE_XN)) {
 +		c->release();
 +		vm->gpu->chargeMemory(-(int64_t)HEAP_CHUNK);
@@ -744,7 +753,15 @@ index 0000000..0c88d0f
 +	if (len == 0 || offset + len > size) {
 +		len = offset < size ? size - offset : 0;
 +	}
-+	cacheRangeMD(memory, memOffset + offset, len, op);
++	IOBufferMemoryDescriptor *buf = OSDynamicCast(IOBufferMemoryDescriptor, memory);
++	if (buf != NULL) {
++		cacheBuffer(buf, memOffset + offset, len, op);
++		return;
++	}
++	if (kmap == NULL && (kmap = memory->map()) == NULL) {        /* user memory, physical surfaces */
++		return;
++	}
++	cacheVA((const uint8_t *)kmap->getVirtualAddress() + memOffset + offset, len, op);
 +}
 +
 +/* ---- accelerator ---- */
@@ -2109,10 +2126,10 @@ index 0000000..0c88d0f
 +#endif /* SWEET */
 diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
 new file mode 100644
-index 0000000..4d2ab35
+index 0000000..288c5da
 --- /dev/null
 +++ b/iokit/Kernel/arm/VivaGPU.h
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,272 @@
 +/*
 + * viva (MT6781): Mali-G57 MC2 GPU (Valhall v9, job manager) for the
 + * Metal driver (VivaMTLDriver.bundle, Mesa Panfrost in userspace).
@@ -2152,7 +2169,7 @@ index 0000000..4d2ab35
 +
 +/* CPU cache maintenance (to PoC): before the GPU reads (clean/flush), after it wrote (invalidate). */
 +enum { kVivaCacheClean, kVivaCacheFlush, kVivaCacheInvalidate };
-+void cacheRangeMD(IOMemoryDescriptor *md, uint64_t offset, uint64_t len, int op);
++void cacheBuffer(IOBufferMemoryDescriptor *md, uint64_t offset, uint64_t len, int op);
 +class VivaGPUAccelerator;
 +class SweetSurface;
 +
@@ -2196,10 +2213,15 @@ index 0000000..4d2ab35
 +
 +private:
 +	uint64_t *tableFor(uint64_t va, bool create);
++	uint64_t *tableKVA(uint64_t pa);
 +	uint64_t  newTable(void);
 +	OSArray  *fPool;                /* IOBufferMemoryDescriptor: 16 KiB pages, 4 tables each */
 +	uint64_t  fFreePA;              /* next free 4 KiB table in the last pool page */
 +	uint32_t  fFreeLeft;
++	enum { kPoolMax = 640 };        /* 2560 tables: 4 GiB of VA needs 2048 level-3 tables + 5 */
++	uint64_t  fPoolPA[kPoolMax];
++	uint8_t  *fPoolKVA[kPoolMax];
++	uint32_t  fPoolCount;
 +	struct Range { uint64_t start, end; };
 +	Range    *fRanges;              /* allocated VA, sorted */
 +	uint32_t  fRangeCount, fRangeCap;
@@ -2231,6 +2253,7 @@ index 0000000..4d2ab35
 +	IOBufferMemoryDescriptor **chunks;      /* heap: one per 2 MiB of VA, NULL until the GPU faults on it */
 +	uint32_t            chunkCount;
 +	SweetSurface       *surface;
++	IOMemoryMap        *kmap;       /* kernel mapping for cache maintenance (non-buffer memory) */
 +};
 +
 +struct VivaGPUJob;
@@ -2381,7 +2404,7 @@ index 0000000..4d2ab35
 +#endif /* _IOKIT_ARM_VIVAGPU_H */
 diff --git a/iokit/Kernel/arm/VivaGPUUserClient.cpp b/iokit/Kernel/arm/VivaGPUUserClient.cpp
 new file mode 100644
-index 0000000..71a1c89
+index 0000000..5916189
 --- /dev/null
 +++ b/iokit/Kernel/arm/VivaGPUUserClient.cpp
 @@ -0,0 +1,793 @@
@@ -2873,7 +2896,7 @@ index 0000000..71a1c89
 +			 * later mappings): push the zeros out and drop the lines before the GPU or a WC user mapping
 +			 * sees the pages.
 +			 */
-+			cacheRangeMD(mem, 0, size, kVivaCacheFlush);
++			cacheBuffer(mem, 0, size, kVivaCacheFlush);
 +		}
 +		b->va = fVM->allocVA(size, align);
 +		if (b->va == 0) {

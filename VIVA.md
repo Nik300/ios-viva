@@ -187,6 +187,13 @@ reg = Mali, mfgcfg, SPM, topckgen, apmixed, infracfg_ao; SPI 274-276 GPU/MMU/JOB
   faults disable the AS and fail the chain; 3 s timeout -> hard stop -> soft reset.
 - Boot-arg `vivagpu`: 0 (default) off; 1 started, unpowered (USB link `gpu ...`); 2 power at boot + publish.
   Link: `gpu [status|mfg|on|off|regs|selftest [fault]|publish]` (`mfg` is read-only).
+- First test (2026-11-03, run 41569069049): `gpu mfg`: the preloader leaves VGPU 0.9 V and VSRAM_GPU 1.0 V on,
+  MFGPLL on at 300 MHz (con1 0x031713b1), mfg_sel = 1, MFG0-3 off. `gpu on` WORKS: rails to 0.65/0.85 V, MFG0-3 on,
+  GPU_ID 0x90930010 (G57 r0p1), shader 0x5, l2 0x1, stack 0x5, AS 0xff, JS 0x7, MMU_FEATURES 0x2830 (48-bit VA),
+  COHERENCY_FEATURES 0x1, L2_FEATURES 0x08130206, THREAD_FEATURES 0x48000, JS features 0x20e/0x1c9e/0x1e.
+  `gpu selftest` panicked: `phystokv_range: illegal PA 0x6860c000; phys base 0xc0000000` - on this port the
+  physical aperture only covers RAM from 0xc0000000 while kernel allocations also come from below: never use
+  phystokv; cache maintenance and page tables go through kernel mappings (fixed in the next build).
 - Not yet: DVFS, runtime power gating, IOSurface cache flush cost (whole surface per job), performance counters.
 
 Workflow notes:
