@@ -365,7 +365,7 @@ Patch 0119 (2026-11-04, CI run 41733230639, image `out/xnu-ufs-rw-0119.img` = 01
   automatically: Panfrost uses one out_sync for all submits, so the driver must TRANSFER the final fence in.
   `gpu calls` shows promises made/pending/timed out.
 
-Patch 0120 (2026-11-04, NOT tested on the phone yet): absolute timeouts (WAIT_BO, SYNCOBJ_WAIT) were compared with
+Patch 0120 (2026-11-04, CI run 41738470270, image `out/xnu-ufs-rw-0120.img` = 0118-0120, NOT tested on the phone yet): absolute timeouts (WAIT_BO, SYNCOBJ_WAIT) were compared with
 mach_continuous_time, but Mesa computes them with clock_gettime(CLOCK_MONOTONIC), which Darwin's Libc derives as
 gettimeofday - kern.boottime (follows the calendar: timed/NTP set and slew it). Reported by the userspace agent: a
 deadline 1 s ahead came back expired at once (driver workaround: completion waits without a finite timeout, gpu
