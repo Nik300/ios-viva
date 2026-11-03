@@ -159,8 +159,12 @@ def main():
     for line in sys.stdin:
         line = line.strip()
         if line:
-            sys.stdout.write('\n> %s\n%s' % (line, link.command(line)))
+            text = '\n> %s\n%s' % (line, link.command(line))
+            sys.stdout.write(text)
             sys.stdout.flush()
+            if link.log:        # commands and replies go to the log file too
+                link.log.write(text.encode())
+                link.log.flush()
 
 
 if __name__ == '__main__':
