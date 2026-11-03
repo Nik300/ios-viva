@@ -1,0 +1,76 @@
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index 551fdee..8a4a7bc 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -315,6 +315,17 @@ nowMs(void)
+ 	return ns / NSEC_PER_MSEC;
+ }
+ 
++uint64_t
++viva_gpu_monotonic_ns(void)
++{
++	clock_sec_t sec, bsec;
++	clock_usec_t usec, busec;
++	clock_get_calendar_microtime(&sec, &usec);
++	clock_get_boottime_microtime(&bsec, &busec);
++	int64_t us = ((int64_t)sec - (int64_t)bsec) * USEC_PER_SEC + ((int64_t)usec - (int64_t)busec);
++	return us > 0 ? (uint64_t)us * NSEC_PER_USEC : 0;
++}
++
+ /*
+  * CPU cache maintenance (to PoC) by kernel virtual address, always through a kernel mapping of the buffer.
+  * (The "illegal PA 0x6860c000" panics that led here were 0x16860c000 truncated to 32 bits by XNU's
+@@ -3072,6 +3083,11 @@ VivaGPUAccelerator::clocksDump(char **out, char *end)
+ 	}
+ 	say(out, end, "ap_pll_con3 0x%08x con4 0x%08x (CPU PLL hardware-control select bits)\n", rd32(fApmixed, PLL_AP_CON3),
+ 	    rd32(fApmixed, PLL_AP_CON4));
++	/* timeouts: userspace CLOCK_MONOTONIC (what deadlines use since 0120) vs Mach continuous time (before) */
++	uint64_t mono = viva_gpu_monotonic_ns(), cont;
++	absolutetime_to_nanoseconds(mach_continuous_time(), &cont);
++	say(out, end, "clocks: CLOCK_MONOTONIC (calendar - boottime) %llu ms, mach_continuous_time %llu ms, difference %lld ms\n",
++	    mono / NSEC_PER_MSEC, cont / NSEC_PER_MSEC, ((int64_t)cont - (int64_t)mono) / (int64_t)NSEC_PER_MSEC);
+ }
+ 
+ void
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+index 3d890da..a70f319 100644
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -47,6 +47,12 @@ class VivaPwrap;
+  * uses it runs, and dropping those dirty lines loses its writes (stale job descriptors: GPU faults, missing tiles).
+  */
+ enum { kVivaCacheClean, kVivaCacheFlush };
++/*
++ * Userspace's CLOCK_MONOTONIC in ns, the clock of every absolute timeout of the UAPI (Mesa: os_time_get_nano). On
++ * Darwin it is NOT mach_continuous_time: Libc computes it as gettimeofday - kern.boottime, so it follows the calendar
++ * (set by timed/NTP, slewed) and drifts from Mach time. Same formula here, from the same kernel values.
++ */
++uint64_t viva_gpu_monotonic_ns(void);
+ void cacheBuffer(IOBufferMemoryDescriptor *md, uint64_t offset, uint64_t len, int op);
+ class VivaGPUAccelerator;
+ class VivaGPUBO;
+diff --git a/iokit/Kernel/arm/VivaGPUUserClient.cpp b/iokit/Kernel/arm/VivaGPUUserClient.cpp
+index dd6669e..a379a97 100644
+--- a/iokit/Kernel/arm/VivaGPUUserClient.cpp
++++ b/iokit/Kernel/arm/VivaGPUUserClient.cpp
+@@ -17,8 +17,8 @@
+  * leniencies the userspace mock also has: an in-sync without a fence is no
+  * dependency (DRM fails the submit), TRANSFER copies "no fence", and a
+  * syncobj without a fence waits (times out) instead of failing with EINVAL.
+- * Timeouts are absolute CLOCK_MONOTONIC nanoseconds (mach_continuous_time
+- * on Darwin). WAIT_BO answers kIOReturnBusy (EBUSY) when the BO is still
++ * Timeouts are absolute CLOCK_MONOTONIC nanoseconds as userspace reads it
++ * (Darwin's Libc: calendar - boottime, viva_gpu_monotonic_ns; not Mach time). WAIT_BO answers kIOReturnBusy (EBUSY) when the BO is still
+  * busy at the deadline, what Panfrost expects.
+  */
+ #include <pexpert/arm64/board_config.h>
+@@ -50,8 +50,7 @@ OSDefineMetaClassAndStructors(VivaGPUUserClient, IOUserClient);
+ static uint64_t
+ deadlineFor(int64_t timeoutNs, bool *expired)
+ {
+-	uint64_t now;
+-	absolutetime_to_nanoseconds(mach_continuous_time(), &now);
++	uint64_t now = viva_gpu_monotonic_ns();     /* the clock Mesa computed timeoutNs from */
+ 	*expired = false;
+ 	if (timeoutNs < 0 || (uint64_t)timeoutNs >= now + 365ull * 24 * 3600 * NSEC_PER_SEC) {
+ 		return 0;
