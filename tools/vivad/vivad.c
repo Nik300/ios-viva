@@ -18,8 +18,16 @@
  * At start it runs every executable in /private/var/root/viva-tests/autorun
  * (name order, one after the other) the same way, with IDs a1, a2, ...
  * Without the link device (old kernel) the output goes to /dev/console.
+ *
+ * Low Power Mode bridge: powerd posts com.apple.system.lowpowermode with the
+ * mode as the notification state; vivad copies it into sysctl
+ * kern.viva_lowpower (iokit/Kernel/arm/VivaBattery.cpp: GPU ceiling, panel
+ * copy duty), at start and on every change, link device or not.
  */
 #include <dirent.h>
+#include <dispatch/dispatch.h>
+#include <notify.h>
+#include <sys/sysctl.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -319,6 +327,39 @@ command(char *line)
     }
 }
 
+#define LPM_NOTIFY  "com.apple.system.lowpowermode"
+
+static void
+lpm_apply(int token, const char *why)
+{
+    uint64_t state = 0;
+    uint32_t st = notify_get_state(token, &state);
+    int on = state != 0, old = -1;
+    size_t len = sizeof(old);
+    if (st != NOTIFY_STATUS_OK) {
+        say("vivad: lpm: notify_get_state failed (%u)\n", st);
+        return;
+    }
+    int err = sysctlbyname("kern.viva_lowpower", &old, &len, &on, sizeof(on));
+    say("vivad: lpm (%s): powerd state %llu -> kern.viva_lowpower %d (was %d)%s\n", why,
+        (unsigned long long)state, on, old, err ? " FAILED (old kernel?)" : "");
+}
+
+static void
+lpm_bridge(void)
+{
+    static int token = -1;
+    uint32_t st = notify_register_dispatch(LPM_NOTIFY, &token,
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^(int t) {
+            lpm_apply(t, "change");
+        });
+    if (st != NOTIFY_STATUS_OK) {
+        say("vivad: lpm: notify_register_dispatch failed (%u)\n", st);
+        return;
+    }
+    lpm_apply(token, "start");
+}
+
 int
 main(void)
 {
@@ -326,6 +367,7 @@ main(void)
     mkdir(TESTS_DIR, 0755);
     mkdir(AUTORUN_DIR, 0755);
     chdir(TESTS_DIR);
+    lpm_bridge();       /* before the link: Low Power Mode works without USB too */
     int fd;
     for (int tries = 0; (fd = open(LINK_DEV, O_RDWR)) < 0; tries++) {
         if (tries == 30) {      /* old kernel without the device: autorun to the console, then keep waiting */
@@ -339,7 +381,7 @@ main(void)
         close(out_fd);
     }
     out_fd = fd;
-    say("vivad: ready (pid %d)\n", getpid());
+    say("vivad: ready (pid %d), low power mode bridge on %s\n", getpid(), LPM_NOTIFY);
     pthread_t t;
     if (pthread_create(&t, NULL, autorun, NULL) == 0) {
         pthread_detach(t);

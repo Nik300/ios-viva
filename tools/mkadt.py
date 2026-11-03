@@ -186,6 +186,37 @@ def viva_devices(ph, phandle, gic_ph):
                 ('reg-fw-request', u32(0x4180)),
             ]),
         ]),
+        # I2C3 (i2c3@1100f000, SPI 108 level, 400 kHz, same source clock as I2C0): the battery bus. LK
+        # charges through it, so it is normally clocked; reg 1 + imp-cg-bit = its IMP_IIC_WRAP gate
+        # (clk-mt6781.c imp_ap_i2c3, STA 0xe00 / CLR 0xe04 bit 3), opened by VivaI2C if closed.
+        node('i2c3', [
+            ph(),
+            ('compatible', cstr('mediatek,mt6781-i2c')),
+            ('reg', io(0x1100f000, 0x1000) + io(0x11017000, 0x1000)),
+            ('interrupt-parent', u32(gic_ph)),
+            ('interrupts', spi(0x6c, IRQ_LEVEL_HIGH)),
+            ('bus-id', u32(3)),
+            ('imp-cg-bit', u32(3)),
+            ('clock-frequency', u32(400000)),
+            ('source-clock', u32(124800000)),
+            ('clock-div', u32(5)),
+            ('ext-time-config', u32(0x1801)),
+        ], [
+            # TI bq27z561 fuel gauge (0x55) + Silergy SYV690 charger (0x6a, INT = EINT 11 falling):
+            # iokit/Kernel/arm/VivaBattery.cpp, the IOPMPowerSource. Charge limits: the live DT's
+            # syv690 safety-max-charge-voltage 4450 mV (VREG step: 4448) / safety-max-charge-current 3000 mA.
+            node('battery', [
+                ph(),
+                ('compatible', cstr('ti,bq27z561')),
+                ('i2c-address', u32(0x55)),
+                ('charger-address', u32(0x6a)),
+                ('interrupt-parent', u32(eint_ph)),
+                ('interrupts', u32(11, IRQ_EDGE_FALLING)),
+                ('design-capacity', u32(5000)),
+                ('charge-voltage-max', u32(4448)),
+                ('charge-current-max', u32(3000)),
+            ]),
+        ]),
         # Mali-G57 MC2 (mali@13000000; GIC SPI 274/275/276 = GPU, MMU, JOB, level high; EVENT and PWR
         # belong to ARM's kbase and stay unused): iokit/Kernel/arm/VivaGPU.cpp, started only with the
         # boot-arg vivagpu=1|2. reg: the Mali, then the MFG power blocks it drives: mfgcfg, SPM,
