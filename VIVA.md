@@ -145,6 +145,13 @@ under SweetGIC, SPI 186), VivaPwrap as a bus (VivaDTNub children) with writePMIC
 enable SET/CLR + status registers, VivaPMIC (all PMIC interrupts off at start, EINT 144 on its work loop),
 VivaPMICKeys (power, volume up). ADT: /arm-io/eint, /arm-io/pwrap/pmic/keys.
 
+Touch path (from Xiaomi viva-r-oss + live DTB, 2026-11-03): driver goodix_gtx8 (CONFIG_TOUCHSCREEN_MTK_TOUCH),
+GT9896 "Normandy" protocol: 16-bit register addresses, event head at 0x824E (byte 0 bit 7 = touch event,
+byte 1 low nibble = finger count), 8 bytes per finger (id, x16 LE, y16 LE, w, ...), checksum = byte sum
+over 4 + 8n bytes == 0, then write 0 to 0x824E; version at 0x8240; reset = GPIO17 low 2 ms, high, 110 ms.
+I2C0 0x11007000 (SPI 105 level), clock: infra1 CG bit 29 (on at boot) + imp_iic_wrap 0x11017e00 bit 0.
+`tools/viva-touch-probe.py` reads gates and pin states (peek only).
+
 Workflow notes:
 - Kernel patches are made against a local xnu-8796.141.3 tree with all
   `xnu/patches/*.patch` applied in order (`git apply`; 0031/0041 need the CI's HFS
