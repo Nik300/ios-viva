@@ -20,7 +20,7 @@ is added next to it (`--viva` in `tools/mkadt.py`, `shim/viva.c`,
 | XNU RAM | 0xc0000000–0x1be000000 (last 32 MiB block below dramc-rk1) |
 | GICv3 | GICD 0x0c000000, GICR 0x0c040000; redistributor stride 0x20000 works (6-core boot) |
 | Timer | 13 MHz, virtual timer PPI 11 = INTID 27 |
-| CPUs | 6× Cortex-A55 (MPIDR 0x000–0x500), 2× big (0x600, 0x700). `cpus=6` boots to the lock screen; the big cores are untested |
+| CPUs | 6× Cortex-A55 (MPIDR 0x000–0x500), 2× Cortex-A76 (0x600, 0x700), all PSCI CPU_ON (live DTB). `cpus=6` boots to the lock screen; `cpus=8` (0110) untested |
 | UFS | MediaTek ufshci at 0x11270000, left running by LK. CAP 0x1587071f (64-bit DMA, 32 slots). LUN 0/1: no GPT (preloader); **LUN 2**: GPT, `userdata` at block 0x2ff800, 109735 MiB (= fastboot's 0x1aca7f8000) |
 
 ## Safety
@@ -248,6 +248,16 @@ Build with `VIVA_EXTRA="cpus=6 vivausb=3 vivagpu=2"` (user request: vivagpu=2 fr
   layer (found by its address), else LK's values are restored and the CPU copy runs. No vblank sync yet (tearing
   possible). `disp regs` is a read-only dump of OVL0/OVL0_2L/larb ports: run it first (larb port bit 0 set would
   mean the M4U translates: then scanout cannot work with physical addresses).
+
+Patch 0110 "big cores" (2026-11-03, NOT tested on the phone yet): `cpus=8` brings up the two A76s too (the
+kernel already allowed 8 since sweet's 0078; mkadt emits cpu6/cpu7 = MPIDR 0x600/0x700, GICR found by
+affinity, set/way ops read CCSIDR per core). 0110 adds the Cortex-A76 erratum 1286807 / A55 2441007
+workaround (sync_tlb_flush: DSB, dummy `tlbi vale1is, xzr`, DSB, like Linux REPEAT_TLBI) and logs each core's
+MIDR (`SWEET CPU: cpu=6 mpidr=0x600 midr=0x414fd0b. (A76 rNpM) came alive`). Still one homogeneous cluster: the
+scheduler does not prefer the A76s (AMP/P-E clusters = `__ARM_AMP__`, a much larger change).
+`tools/viva-mkboot.sh` now defaults to `VIVA_EXTRA="cpus=8 vivausb=3 vivagpu=2"`. If a big core fails:
+`SWEET CPU: cpu=6 PSCI CPU_ON rc=N` (firmware refused) or `NOT alive after 5s` (entry/MMU/GIC); fall back
+with `VIVA_EXTRA="cpus=6 vivausb=3 vivagpu=2"`.
 
 Workflow notes:
 - Kernel patches are made against a local xnu-8796.141.3 tree with all

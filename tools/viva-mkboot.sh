@@ -7,7 +7,8 @@
 #   ufs-ro     UFS node, writes refused (no ufsrw): finds "userdata" and tries to mount it
 #   ufs-rw     iOS root in userdata, read-write; writes stay inside that partition
 # Env: VIVA_CMDLINE replaces the whole command line; VIVA_EXTRA sets single
-# boot-args on top of it (e.g. VIVA_EXTRA="cpus=6 vivausb=3").
+# boot-args on top of it (default "cpus=8 vivausb=3 vivagpu=2": all eight cores
+# incl. the two A76s, USB link, GPU on; VIVA_EXTRA= turns the defaults off).
 # Every stage turns off sweet's Qualcomm drivers (keys, touch, USB, persistent
 # log): their fixed MMIO addresses are other blocks on MT6781.
 set -euo pipefail
@@ -26,7 +27,7 @@ ufs-rw) ADT_FLAGS=(--viva --ufs)
 esac
 CMDLINE=${VIVA_CMDLINE:-$CMDLINE}
 # VIVA_EXTRA="cpus=6 vivausb=3": set/replace single boot-args (XNU uses the first match)
-for arg in ${VIVA_EXTRA:-}; do
+for arg in ${VIVA_EXTRA-cpus=8 vivausb=3 vivagpu=2}; do
 	key=${arg%%=*}
 	CMDLINE="$(printf ' %s ' "$CMDLINE" | sed -E "s/ -?$key(=[^ ]*)? / /g; s/^ +//; s/ +$//") $arg"
 done
