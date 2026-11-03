@@ -25,8 +25,8 @@ Questo documento è solo il piano: nessun codice è stato scritto.
 | Shader | AIR → GLSL 4.10 (testo), AIR → OpenCL C | **AIR → NIR** → compilatore Valhall di Mesa (binari nativi, niente testo) |
 | Memoria dei buffer `device`/`constant` | texture buffer R32UI + offset (GL 4.1 non ha SSBO) | **puntatori GPU a 64 bit veri** (load/store globali di Valhall): layout e aritmetica di puntatori esatti |
 | Famiglia dichiarata | Mac2 + Common3 | **Apple4** (+ Common), come l'A11 |
-| Registrazione | kext Lilu che aggiunge `MetalPluginName` all'acceleratore AMD | il **nostro** kernel pubblica direttamente il servizio che Metal cerca |
-| Posizione del bundle | `/Library/GPUBundles` | root HFS+ scrivibile (`/System/Library/Extensions` o dove indica la Fase G0) |
+| Registrazione | kext Lilu che aggiunge `MetalPluginName` all'acceleratore AMD | il **nostro** kernel pubblica un servizio di classe `IOAcceleratorES` con `MetalPluginName`/`MetalPluginClassName` (verificato, vedi "Fatti verificati") |
+| Posizione del bundle | `/Library/GPUBundles` | `/System/Library/Extensions/VivaMTLDriver.bundle` sulla root HFS+ scrivibile (percorso fisso in Metal di iOS 16) |
 | Library validation | deroga in AMFI tramite kext | AMFI è già la nostra (patch 0025/0035/0036): da verificare solo che un bundle firmato ad-hoc venga caricato |
 | Presentazione | `CAMetalLayer` → IOSurface → `CGLTexImageIOSurface2D` | IOSurface del nostro `SweetSurface` importate come BO della GPU (zero copie); a schermo con `AppleCLCD` |
 | Componenti tolti | — | Liquid Glass (`TSGlass*`), TeraScale Swift, interposer, spoof degli entitlement e del modello, app di controllo macOS, OpenCL |
@@ -123,16 +123,17 @@ parallelo dopo G0.
 
 ### G0 – Ricognizione e infrastruttura
 Domande, ognuna da chiudere con una prova (comando + output) in questo file:
-1. **Come Metal di iOS 16 trova il driver**: classe IOKit cercata (`IOAccelerator`? `IOGPU`?), proprietà
-   (`MetalPluginName`, `MetalPluginClassName`, altre), dove cerca il bundle, se l'AGX vive solo nella shared cache e se
-   un bundle su disco viene accettato. Classe base del device (`IOGPUMetalDevice : _MTLDevice`?) e selettore di init.
-   *(in corso: vedi "Fatti verificati")*
+1. ✅ **Come Metal di iOS 16 trova il driver**: risposto offline (vedi "Fatti verificati"). Resta da provare sul
+   telefono che `NSBundle` carichi un bundle **fuori dalla shared cache** (l'AGX vive solo nella cache).
+   Da chiarire: cosa fa QuartzCore con `IOGPUDeviceCreate`/`IOGPUDeviceSetDisplayParams` (soft-link a IOGPU.framework,
+   che parla con il user client di `IOGPUFamily`) quando trova un device: se il server di render lo chiama, il nostro
+   user client dovrà rispondere a quei selettori o QuartzCore dovrà tollerarne il fallimento.
 2. **ABI privata di `_MTLDevice` di iOS 16**: feature profile per Apple4, ivar `_limits`, selettori delle varianti
    (`newVertexVariantWithCompilerOutput:…` ecc.), `bitcodeData` di `_MTLFunction`, compilatore (MTLCompilerService,
    plugin). Gli strumenti `re/introspect`, `protocheck` di metal-shim si ricompilano per iOS e girano sul telefono.
-3. **libLLVM su iOS**: esiste nella shared cache una libLLVM con l'API C (come `GPUCompiler.framework` su macOS)?
-   Se no, si porta nel bundle un lettore di bitcode (LLVM statico ridotto a BitReader + Core + pass usati: più grande
-   ma sotto controllo) e la versione del bitcode AIR di iOS 16 va confrontata con quella supportata.
+3. ✅ **libLLVM su iOS**: `/usr/lib/libLLVM.dylib` (LLVM 31001.722.3.1) è nella shared cache ed esporta 958
+   funzioni dell'API C (`LLVMParseBitcodeInContext2`, `LLVMGetBitcodeModule*`, ...): `TSLLVM.h` funziona com'è, con
+   `dlopen` di quel percorso. Da verificare sul telefono: `LLVMRunPasses` e i pass usati da metal-shim.
 4. **Cosa usa CoreAnimation**: estrarre `default.metallib` di QuartzCore, CoreImage, UIKit/UIKitCore, VectorKit,
    RenderBox dalla shared cache di iOS 16 e passarli in `tools/airdump`: formati, programmable blending, memoryless,
    tile shader, XR10, function constant. Questo decide le priorità di G5-G6.
@@ -219,8 +220,20 @@ Infrastruttura (prima di qualsiasi codice GPU, perché ogni ciclo oggi costa un 
   RenderBox) come base di confronto con il traduttore GLSL.
 
 ### G5 – Driver Metal per iOS 16 (bundle + kernel)
-- **Kernel**: servizio acceleratore con le proprietà trovate in G0 (classe che Metal cerca, `MetalPluginName =
-  VivaMTLDriver`, `MetalPluginClassName = VivaMtlDevice`, statistiche minime). Con `vivagpu=0` non viene pubblicato.
+- **Kernel**: la classe `IOAcceleratorES` (sottoclasse di `IOService`, definita nella patch perché il nostro kernel non
+  ha `IOGPUFamily`) e sotto di essa `VivaGPUAccelerator`, nub `/arm-io/gpu`, con `MetalPluginName = VivaMTLDriver` e
+  `MetalPluginClassName = VivaMtlDevice` (obbligatoria: senza, Metal usa `NSPrincipalClass`). Metal fa
+  `IOServiceMatching("IOAcceleratorES")` e poi `[[cls alloc] initWithAcceleratorPort:service]`. Con `vivagpu=0` il
+  servizio non viene pubblicato.
+- **Classe del device**: `VivaMtlDevice : _MTLDevice` direttamente, come `TSMtlDevice` su macOS, **non**
+  `IOGPUMetalDevice`: quella catena (`IOGPUMetalCommandQueue`, `IOGPUMetalBuffer`, ...) presuppone il user client
+  closed source di `IOGPUFamily` (`s_new_resource`, `s_submit_command_buffers`, memoria condivisa per i comandi).
+  Se G5 mostra che qualche framework controlla `isKindOfClass:IOGPUMetalDevice`, si valuta un IOGPU minimo.
+- **Compilatore**: come su macOS, la traduzione avviene nel processo leggendo `-[_MTLFunction bitcodeData]` e
+  sovrascrivendo la creazione delle pipeline; nessun plugin per `MTLCompilerService`. Un plugin
+  (`MTLCompilerCreate`/`BuildRequestWithOptions`/`ReleaseReply`/`Delete` e gli `AIRNT*`, percorso sotto
+  `/System/Library/Extensions/*.bundle` o `/System/Library/PrivateFrameworks/*.framework`) resta un'opzione per
+  spostare la compilazione fuori dalle app, se servirà.
 - **Bundle** `VivaMTLDriver.bundle` nella root (percorso da G0), compilato per arm64 iOS 16, firmato ad-hoc.
   Frontend portato sull'ABI di iOS 16: profilo Apple4, limiti, classi base delle code/encoder di iOS 16, catch-all.
 - **Policy** (`/private/var/db/vivagpu/policy.plist` + boot-arg): all'inizio solo un elenco di processi abilitati
@@ -268,8 +281,7 @@ Come la Fase 5 di metal-shim: un'app per volta, stub e correzioni per ciascuna, 
 ## Rischi aperti
 | Rischio | Effetto | Mitigazione |
 |---|---|---|
-| Metal di iOS cerca il driver solo nella shared cache, o richiede le classi di IOGPU.framework e il kext IOGPUFamily (closed source) | il bundle non viene caricato | G0 domanda 1; in alternativa sottoclassi di `IOGPUMetal*` con un IOGPU di kernel minimo, o patch mirata alla shared cache |
-| Niente libLLVM con API C nella shared cache di iOS | il traduttore non legge l'AIR | LLVM ridotto statico nel bundle (G0 domanda 3) |
+| `NSBundle` rifiuta un bundle fuori dalla shared cache, o un framework richiede `IOGPUMetalDevice`/IOGPU (QuartzCore usa `IOGPUDeviceCreate`) | il bundle non viene caricato, o `backboardd` non usa il device | prova in G0; user client che risponde ai selettori IOGPU usati da QuartzCore, o IOGPU minimo nel kernel |
 | Sequenza di accensione MFG sbagliata (tensioni) | GPU instabile o danni | OPP fissa e conservativa presa da `viva-r-oss`, vincoli `vsram`/`vgpu`, elenco bianco dei registri PMIC, letture di verifica prima di ogni scrittura |
 | GPU non coerente con la CPU | dati vecchi tra CPU e GPU | mappature write-combined; manutenzione esplicita delle cache dove serve |
 | Pagine da 16 KiB in Mesa | allocazioni sbagliate | patch in G3, test sul Mac con pagine da 16 KiB (Apple Silicon: già 16 KiB) |
@@ -279,4 +291,31 @@ Come la Fase 5 di metal-shim: un'app per volta, stub e correzioni per ciascuna, 
 | ABI privata di Metal di iOS 16 diversa da Tahoe | frontend da adattare | introspezione sul telefono in G0, catch-all come rete di sicurezza |
 
 ## Fatti verificati
-*(da compilare durante G0)*
+### 2026-11-03: come iOS 16.7.16 carica il driver Metal (offline, root `ios16-root.img` montata in sola lettura)
+Strumenti: `ipsw` 3.1.741 (`dyld extract`, `class-dump`, `extract --kernel`), `dyld_info`, `otool -tV`.
+- **Ricerca del device** (`_MTLRegisterDevices`, disassemblato): `IOServiceMatching("IOAcceleratorES")` →
+  per ogni servizio legge `MetalPluginName` (CFString), carica `/System/Library/Extensions/<nome>.bundle`, prende
+  `[bundle classNamed:MetalPluginClassName]` (oppure `principalClass` se la proprietà manca), richiede
+  `isSubclassOfClass:_MTLDevice`, poi `[[cls alloc] initWithAcceleratorPort:service]` e `_MTLAddDevice`.
+- **Kernel di Apple**: kext `AGXG10P`, personalità con `IOProviderClass=AppleARMIODevice`, `IONameMatch=gpu,t8015`,
+  `IOMatchCategory=IOAcceleratorES`, `MetalPluginName=AGXMetalA11`; il kext aggiunge a runtime
+  `MetalPluginClassName=AGXA11Device` e `MetalStatisticsName=AGXMetalStatisticsExternalA11`. Le classi
+  `IOAcceleratorES`, `IOGPU`, `IOGPUDevice`, `IOGPUDeviceUserClient` stanno in `IOGPUFamily` (closed source;
+  l'ereditarietà esatta tra `IOGPU` e `IOAcceleratorES` non è stata ricostruita).
+- **Userspace di Apple**: `AGXMetalA11.bundle` su disco ha solo `Info.plist` (nessuna chiave Metal) e metallib di
+  runtime; il codice è nella shared cache. Catena: `AGXA11Device : AGXA11FamilyDevice : IOGPUMetalDevice : _MTLDevice`.
+  Code, buffer, texture, heap, encoder derivano da `IOGPUMetal*`, che derivano dalle classi `_MTL*` (le stesse basi
+  usate da metal-shim). Metal ha anche la vecchia famiglia `MTLIOAccel*`, non usata dall'AGX.
+- **Compilatore**: plugin `AGXCompilerCore.framework` (esporta `MTLCompilerCreate`, `…BuildRequest`,
+  `…BuildRequestWithOptions`, `…BuildRequestWithSerializedBitcode`, `…ReleaseReply`, `…Delete`, `AIRNT*`); il
+  percorso è scritto nel driver e passato a `MTLCompilerService` come `pluginPath`. `MTLCompiler.framework` ha
+  probabilmente una lista di percorsi ammessi (`/System/Library/Extensions/`, `/System/Library/PrivateFrameworks/`;
+  non dimostrato).
+- **libLLVM**: `/usr/lib/libLLVM.dylib` nella cache, 958 simboli `LLVM*` dell'API C.
+- **QuartzCore**: `CA::OGL::MetalContext`, `GLESContext`, `SWContext` (renderer software, quello di oggi);
+  importa `MTLCreateSystemDefaultDevice`, soft-link a `IOGPUDeviceCreate`/`IOGPUDeviceSetDisplayParams`, cita
+  `IOAcceleratorES`. Variabili d'ambiente: `CA_NO_ACCEL`, `CA_ENABLE_OGL`, `CA_FORCE_GENERIC_SHADERS` (utile se gli
+  shader specifici per AGX danno problemi), `CADynamicBackendSwitching`.
+- **IOSurface nell'AGX**: `newTextureWithDescriptor:iosurface:plane:`, `newBufferWithIOSurface:`; usa
+  `IOSurfaceGetBaseAddressOfPlane`, `GetBytesPerRowOfPlane`, `IsTiled`, `AlignProperty`, `CopyValue`, `Lock`.
+  Serve quindi `IOSurfaceCopyValue` funzionante in `SweetSurface` (oggi restituisce sempre NULL, TODO della 0046).
