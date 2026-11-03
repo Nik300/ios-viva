@@ -1,0 +1,788 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 72bcf94..dfbedb9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -40,6 +40,17 @@
+  * shadow registers are bypassed on MT6781, so the switch is not tied to
+  * vblank yet (a frame may tear).
+  *
++ * GPU-drawn frames (K0c): backboardd hands a surface to SwapEnd right after
++ * committing its command buffer, without waiting for the GPU (on Apple the
++ * display driver waits). Swaps are therefore queued in order (the last
++ * SWEET_FB_QUEUE) and a tick shows the newest one whose surfaces have no GPU
++ * job pending (viva_gpu_surface_idle), dropping it and the older ones. If
++ * none is ready nothing is shown and the next vsync tick tries again (no
++ * waiting in the timer). A copy during which a new job used one of the
++ * surfaces is redone at the next tick. After sweetfb_gpuwait ticks (default
++ * 12, 200 ms) the newest frame is shown anyway; sweetfb_gpuwait=0 turns the
++ * wait off.
++ *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+@@ -77,6 +88,7 @@ enum {
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+ #define SWEET_FB_LAYERS                 4
++#define SWEET_FB_QUEUE                  4       /* swaps waiting for the GPU (K0c) */
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+@@ -132,11 +144,20 @@ public:
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
+-	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
++	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap (redrawn when the display comes on) */
+ 	bool          fDirty;
++	uint8_t       fQueue[SWEET_FB_QUEUE][SWEET_FB_SWAP_REC_SIZE];       /* swaps not shown yet, oldest first */
++	uint64_t      fQueueSeq[SWEET_FB_QUEUE];
++	uint32_t      fQueueCount;
++	uint64_t      fSeq;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	/* K0c: frames held back for the GPU */
++	bool          fRetry;         /* the pending frame waits for the GPU: try again at the next tick */
++	uint32_t      fGpuTicks;      /* consecutive ticks the pending frame waited */
++	uint32_t      fGpuWaitMax;    /* sweetfb_gpuwait: ticks before showing it anyway */
++	uint64_t      fGpuWaits, fGpuRecopies, fGpuForced;
+ 
+ 	/* viva direct scanout (see the top) */
+ 	IOLock       *fScanLock;      /* scanout state: present() vs. the link command */
+@@ -155,6 +176,7 @@ public:
+ 	bool dispMap(void);
+ 	bool findLKLayer(char **out, char *end);
+ 	bool scanout(const uint8_t *rec);
++	bool layersIdle(const uint8_t *rec, uint64_t *jobs);
+ 	void scanoutStop(void);
+ 	void dispCommand(const char *args, char *out, size_t len);
+ 
+@@ -162,7 +184,8 @@ public:
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+-	void present(const uint8_t *rec);
++	bool present(const uint8_t *rec, bool force, uint64_t jobs);
++	int presentQueued(const uint8_t *recs, uint32_t n);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -238,6 +261,8 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	fGpuWaitMax = 12;
++	PE_parse_boot_argn("sweetfb_gpuwait", &fGpuWaitMax, sizeof(fGpuWaitMax));
+ 	fScanOvl = -1;
+ 	fScanLock = IOLockAlloc();
+ 	uint32_t scan = 0;
+@@ -295,19 +320,51 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
+-	bool flush = fb->fDirty && (fb->fScanOn || (count % fb->fFlushTicks) == 0);     /* scanout: every vsync */
+-	uint8_t *rec = NULL;
++	/* scanout or a frame held back for the GPU: every vsync */
++	bool flush = fb->fDirty && (fb->fScanOn || fb->fRetry || (count % fb->fFlushTicks) == 0);
++	uint8_t *recs = NULL;
++	uint64_t seqs[SWEET_FB_QUEUE];
++	uint32_t n = 0;
+ 	if (flush) {
+-		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+-		if (rec != NULL) {
+-			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++		recs = (uint8_t *)IOMallocData(SWEET_FB_QUEUE * SWEET_FB_SWAP_REC_SIZE);
++		if (recs != NULL) {
++			if (fb->fQueueCount != 0) {
++				n = fb->fQueueCount;
++				memcpy(recs, fb->fQueue, n * SWEET_FB_SWAP_REC_SIZE);
++				memcpy(seqs, fb->fQueueSeq, n * sizeof(seqs[0]));
++			} else {
++				n = 1;                  /* redraw of the latest frame */
++				memcpy(recs, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++				seqs[0] = 0;
++			}
+ 			fb->fDirty = false;
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
+-	if (rec != NULL) {
+-		fb->present(rec);
+-		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++	if (n != 0) {
++		int shown = fb->presentQueued(recs, n);
++		IOLockLock(fb->fLock);
++		if (shown >= 0 && seqs[shown] != 0) {
++			uint32_t keep = 0;      /* drop the shown swap and the older ones */
++			for (uint32_t i = 0; i < fb->fQueueCount; i++) {
++				if (fb->fQueueSeq[i] > seqs[shown]) {
++					if (keep != i) {
++						memcpy(fb->fQueue[keep], fb->fQueue[i], SWEET_FB_SWAP_REC_SIZE);
++						fb->fQueueSeq[keep] = fb->fQueueSeq[i];
++					}
++					keep++;
++				}
++			}
++			fb->fQueueCount = keep;
++		}
++		fb->fRetry = shown < 0;         /* held back for the GPU: try again at the next tick */
++		if (shown < 0 || fb->fQueueCount != 0) {
++			fb->fDirty = true;
++		}
++		IOLockUnlock(fb->fLock);
++	}
++	if (recs != NULL) {
++		IOFreeData(recs, SWEET_FB_QUEUE * SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+@@ -393,6 +450,14 @@ AppleCLCD::swap(const uint8_t *rec)
+ {
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	if (fQueueCount == SWEET_FB_QUEUE) {
++		/* the oldest swap was never shown: drop it */
++		memmove(fQueue[0], fQueue[1], (SWEET_FB_QUEUE - 1) * SWEET_FB_SWAP_REC_SIZE);
++		memmove(&fQueueSeq[0], &fQueueSeq[1], (SWEET_FB_QUEUE - 1) * sizeof(fQueueSeq[0]));
++		fQueueCount--;
++	}
++	memcpy(fQueue[fQueueCount], rec, SWEET_FB_SWAP_REC_SIZE);
++	fQueueSeq[fQueueCount++] = ++fSeq;
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+ 	/* the format of every layer CoreAnimation sets (SwapSetLayer), logged when it changes */
+@@ -422,17 +487,83 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
+-void
+-AppleCLCD::present(const uint8_t *rec)
++/*
++ * K0c: no GPU job pending on any enabled layer's surface. *jobs = the GPU jobs that used them so far (it only
++ * grows: a change means a new job touched one of them).
++ */
++bool
++AppleCLCD::layersIdle(const uint8_t *rec, uint64_t *jobs)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	bool idle = true;
++	*jobs = 0;
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		if (!(mask & (1u << layer)) || id == 0) {
++			continue;
++		}
++		SweetSurface *s = sweet_surface_copy(id);
++		if (s == NULL || s == fSurface) {
++			OSSafeReleaseNULL(s);
++			continue;
++		}
++		uint64_t n = 0;
++		if (!viva_gpu_surface_idle(s, &n)) {
++			idle = false;
++		}
++		*jobs += n;
++		s->release();
++	}
++	return idle;
++}
+ 
++/*
++ * K0c: show the newest of the n queued swaps (oldest first) whose surfaces the GPU has finished. Returns its index,
++ * or -1 when none is ready yet (or its copy has to be redone): nothing shown, retry at the next tick.
++ */
++int
++AppleCLCD::presentQueued(const uint8_t *recs, uint32_t n)
++{
++	uint64_t jobs = 0;
++	int pick = -1;
++	for (int i = (int)n - 1; i >= 0; i--) {
++		if (layersIdle(recs + (size_t)i * SWEET_FB_SWAP_REC_SIZE, &jobs)) {
++			pick = i;
++			break;
++		}
++	}
++	bool force = false;
++	if (pick < 0) {
++		if (fGpuWaitMax != 0 && fGpuTicks < fGpuWaitMax) {
++			fGpuTicks++;
++			fGpuWaits++;
++			return -1;
++		}
++		pick = (int)n - 1;
++		force = true;
++		if (fGpuWaitMax != 0 && ++fGpuForced <= 8) {
++			IOLog("SWEET FB: frame shown after waiting %u vsyncs for the GPU\n", fGpuTicks);
++		}
++	}
++	return present(recs + (size_t)pick * SWEET_FB_SWAP_REC_SIZE, force, jobs) ? pick : -1;
++}
++
++/*
++ * Show a swap whose surfaces the GPU has finished (jobs = their GPU job count then; force: shown as it is). false:
++ * a new GPU job used a surface during the copy, which may be mixed: redo it at the next tick.
++ */
++bool
++AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
++{
++	uint32_t mask = get32(rec, 0x104);
++	uint64_t jobsAfter = 0;
+ 
+ 	IOLockLock(fScanLock);
+ 	bool scanned = fScanOn && scanout(rec);
+ 	IOLockUnlock(fScanLock);
+ 	if (scanned) {
+-		return;
++		fGpuTicks = 0;
++		return true;
+ 	}
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+@@ -529,6 +660,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	/* a GPU job used a surface while it was copied (CoreAnimation reuses it): the copy may be mixed, redo it */
++	if (!force && (!layersIdle(rec, &jobsAfter) || jobsAfter != jobs)) {
++		fGpuTicks++;
++		fGpuRecopies++;
++		return false;
++	}
++	fGpuTicks = 0;
++	return true;
+ }
+ 
+ /* ---- viva direct scanout ---- */
+@@ -794,6 +933,8 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
+ 		    "%llu copied%s%s\n", fWidth, fHeight, fLogicalW, fLogicalH, fScanOn ? "on" : "off",
+ 		    fScanActive ? " (active)" : "", fScanOvl >= 0 ? fScanLayer : "?", fScanFrames, fScanFallbacks,
+ 		    fScanWhy ? ", last reason: " : "", fScanWhy ? fScanWhy : "");
++		disp_say(&p, end, "GPU sync (K0c): %llu vsyncs waited for the GPU, %llu copies redone, %llu frames shown anyway "
++		    "(sweetfb_gpuwait=%u)\n", fGpuWaits, fGpuRecopies, fGpuForced, fGpuWaitMax);
+ 		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off]\n");
+ 	}
+ 	IOLockUnlock(fScanLock);
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index ea37868..74db484 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -90,6 +90,8 @@ enum {
+ #define SWEET_SURFACE_BULK_SIZE         0x70
+ #define SWEET_SURFACE_MAX_VALUES        (256u << 10)    /* serialized values per surface */
+ #define kIOSurfaceLockReadOnly          0x1
++#define kIOSurfaceLockAvoidSync         0x2     /* do not wait for pending GPU access: kIOReturnCannotLock instead */
++#define SWEET_SURFACE_LOCK_WAIT_MS      1000    /* longest wait for the GPU in IOSurfaceLock */
+ 
+ static IOLock       *sweet_surface_lock;
+ static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
+@@ -117,6 +119,7 @@ SweetSurface::free()
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSSafeReleaseNULL(values);
++	OSSafeReleaseNULL(gpuFence);
+ 	OSObject::free();
+ }
+ 
+@@ -1112,6 +1115,14 @@ IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	/* like Apple's: the lock waits for the GPU jobs pending on the surface (AvoidSync: fail instead) */
++	if (!viva_gpu_surface_idle(s, NULL)) {
++		if ((uintptr_t)options & kIOSurfaceLockAvoidSync) {
++			s->release();
++			return kIOReturnCannotLock;
++		}
++		viva_gpu_surface_wait(s, SWEET_SURFACE_LOCK_WAIT_MS);
++	}
+ 	sweet_surface_before_cpu_access(s);
+ 	if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && OSDynamicCast(IOBufferMemoryDescriptor, s->memory)) {
+ 		OSCompareAndSwap(0, 1, &s->cpuDirty);
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index d66858e..9149e0a 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -51,6 +51,14 @@ public:
+ 	OSDictionary             *values;       /* IOSurfaceSetValue (non-bulk), under the surface table lock */
+ 	bool                      contig;       /* physically contiguous below 4 GiB (scanout candidate) */
+ 
++	/*
++	 * viva GPU (VivaGPU.cpp, under its gate): fence of the last GPU job that used the surface, from any
++	 * connection (every job also waits for the one before on the surface, so this one signals last), and how
++	 * many jobs used it so far.
++	 */
++	OSObject                 *gpuFence;
++	uint64_t                  gpuJobs;
++
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+@@ -80,6 +88,14 @@ uint64_t sweet_surface_before_device_read(SweetSurface *surface);
+ uint64_t sweet_surface_before_cpu_access(SweetSurface *surface);
+ void sweet_surface_device_wrote(SweetSurface *surface);
+ 
++/*
++ * viva GPU (VivaGPU.cpp), any thread but the GPU's work loop: no GPU job using the surface is pending (true when
++ * the GPU driver is not running); *jobs (optional) = GPU jobs that used it so far. surface_wait sleeps until it
++ * is idle, at most timeoutMs (kIOReturnTimeout).
++ */
++bool viva_gpu_surface_idle(SweetSurface *surface, uint64_t *jobs);
++IOReturn viva_gpu_surface_wait(SweetSurface *surface, uint32_t timeoutMs);
++
+ /*
+  * Size of the surfaces the display may scan out directly (viva OVL, SweetFramebuffer.cpp; 0 = none): such
+  * 4-byte single-plane surfaces are allocated physically contiguous below 4 GiB when possible.
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index 649164e..ac54d03 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -447,9 +447,49 @@ VivaGPUVM::free(void)
+ 	if (fRanges != NULL) {
+ 		IODeleteData(fRanges, Range, fRangeCap);
+ 	}
++	if (inv != NULL) {
++		IODelete(inv, VivaGPUBO *, invCap);
++	}
+ 	OSObject::free();
+ }
+ 
++/* Gated. Without memory for the list the BO stays unlisted (invPending false): the caller invalidates at once. */
++void
++VivaGPUVM::invAdd(VivaGPUBO *bo)
++{
++	if (bo->invPending) {
++		return;
++	}
++	if (invCount == invCap) {
++		uint32_t cap = invCap ? invCap * 2 : 64;
++		VivaGPUBO **bigger = IONew(VivaGPUBO *, cap);
++		if (bigger == NULL) {
++			return;
++		}
++		if (inv != NULL) {
++			bcopy(inv, bigger, invCount * sizeof(*inv));
++			IODelete(inv, VivaGPUBO *, invCap);
++		}
++		inv = bigger;
++		invCap = cap;
++	}
++	inv[invCount++] = bo;
++	bo->invPending = true;
++}
++
++/* Gated. */
++void
++VivaGPUVM::invRemove(VivaGPUBO *bo)
++{
++	for (uint32_t i = 0; i < invCount; i++) {
++		if (inv[i] == bo) {
++			inv[i] = inv[--invCount];
++			break;
++		}
++	}
++	bo->invPending = false;
++}
++
+ /* A zeroed 4 KiB table (physical address), carved from 16 KiB wired pages. */
+ uint64_t
+ VivaGPUVM::newTable(void)
+@@ -675,6 +715,9 @@ VivaGPUBO::free(void)
+ 	if (kind == kVivaBOHeap && vm != NULL) {
+ 		vm->gpu->heapRemove(this);
+ 	}
++	if (invPending && vm != NULL) {
++		vm->invRemove(this);
++	}
+ 	if (chunks != NULL) {
+ 		for (uint32_t i = 0; i < chunkCount; i++) {
+ 			if (chunks[i] != NULL) {
+@@ -787,6 +830,12 @@ VivaGPUAccelerator::start(IOService *provider)
+ 	fMarginMv = MIN(MAX(fMarginMv, 0), 100);
+ 	fCacheMode = 1;
+ 	PE_parse_boot_argn("vivagpucache", &fCacheMode, sizeof(fCacheMode));
++	int flag = 1;
++	PE_parse_boot_argn("vivagpulazy", &flag, sizeof(flag));
++	fLazy = flag != 0 && fCacheMode != 0;
++	flag = 1;
++	PE_parse_boot_argn("vivagpuwc", &flag, sizeof(flag));
++	fWC = flag != 0 && fCacheMode != 0;
+ 	int64_t mib = GPU_MEMORY_LIMIT >> 20;
+ 	PE_parse_boot_argn("vivagpumemtotal", &mib, sizeof(mib));
+ 	fMemLimit = mib << 20;
+@@ -2042,6 +2091,13 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
+ 		return kIOReturnNotReady;
+ 	}
+ 	uint64_t t0 = mach_absolute_time(), cacheNs = 0, cacheBytes = 0;
++	OSArray *ownDeps = NULL;
++	if (deps == NULL && bos != NULL && bos->getCount() != 0) {
++		deps = ownDeps = OSArray::withCapacity(4);
++		if (deps == NULL) {
++			return kIOReturnNoMemory;
++		}
++	}
+ 	VivaGPUJob *job = IOMallocType(VivaGPUJob);
+ 	job->vm = vm;
+ 	vm->retain();
+@@ -2056,12 +2112,32 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
+ 		bos->retain();
+ 		for (unsigned int i = 0; i < bos->getCount(); i++) {
+ 			VivaGPUBO *bo = (VivaGPUBO *)bos->getObject(i);
++			/*
++			 * K0, implicit sync as Linux's panfrost_job.c: every BO counts as written, so the job waits for the
++			 * last job on each of its BOs (Mesa submits a batch's vertex/tiler and fragment chains without an
++			 * in-sync between them, and every batch shares the tiler heap). An IOSurface also waits for the last
++			 * job on it in any other connection. Each busy fence then signals after every earlier job on the BO.
++			 */
++			addImplicitDep(deps, bo->busy, fence);
+ 			fence->retain();
+ 			OSSafeReleaseNULL(bo->busy);
+ 			bo->busy = fence;
++			if (bo->kind == kVivaBOSurface && bo->surface != NULL) {
++				SweetSurface *s = bo->surface;
++				addImplicitDep(deps, OSDynamicCast(VivaGPUFence, s->gpuFence), fence);
++				if (s->gpuFence != fence) {
++					fence->retain();
++					OSSafeReleaseNULL(s->gpuFence);
++					s->gpuFence = fence;
++					s->gpuJobs++;
++				}
++			}
+ 			uint64_t c0 = mach_absolute_time(), bytes = 0;
+ 			if (bo->cacheMaint) {
+ 				bytes = bo->cacheOp(0, 0, kVivaCacheFlush);     /* CPU writes out before the GPU reads */
++				if (bo->invPending) {
++					bo->vm->invRemove(bo);                  /* the flush also dropped the stale lines */
++				}
+ 			} else if (bo->lazySurface) {
+ 				bytes = sweet_surface_before_device_read(bo->surface);
+ 			}
+@@ -2088,9 +2164,70 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
+ 	absolutetime_to_nanoseconds(cacheNs, &ns);
+ 	fSubmitCacheNs += ns;
+ 	fSubmitCacheBytes += cacheBytes;
++	OSSafeReleaseNULL(ownDeps);
+ 	return kIOReturnSuccess;
+ }
+ 
++/* Gated: K0, the job also waits for `f` (another job's fence on one of its BOs), once, unless done already. */
++void
++VivaGPUAccelerator::addImplicitDep(OSArray *deps, VivaGPUFence *f, VivaGPUFence *self)
++{
++	if (f == NULL || f == self || f->signalled || deps == NULL ||
++	    deps->getNextIndexOfObject(f, 0) != (unsigned int)-1) {
++		return;
++	}
++	if (deps->setObject(f)) {
++		fImplicitDeps++;
++	}
++}
++
++bool
++VivaGPUAccelerator::boIdle(VivaGPUBO *bo)
++{
++	if (bo->busy != NULL && !bo->busy->signalled) {
++		return false;
++	}
++	return bo->kind != kVivaBOSurface || bo->surface == NULL || surfaceIdle(bo->surface, NULL);
++}
++
++bool
++VivaGPUAccelerator::surfaceIdle(SweetSurface *s, uint64_t *jobs)
++{
++	VivaGPUFence *f = OSDynamicCast(VivaGPUFence, s->gpuFence);
++	if (jobs != NULL) {
++		*jobs = s->gpuJobs;
++	}
++	return f == NULL || f->signalled;
++}
++
++/* Gated. */
++void
++VivaGPUAccelerator::invalidatePending(VivaGPUVM *vm, VivaGPUBO *only)
++{
++	if (vm == NULL || vm->invCount == 0 || (only != NULL && !only->invPending)) {
++		return;
++	}
++	uint64_t c0 = mach_absolute_time(), bytes = 0;
++	for (uint32_t i = 0; i < vm->invCount;) {
++		VivaGPUBO *bo = vm->inv[i];
++		if ((only != NULL && bo != only) || !boIdle(bo)) {
++			i++;            /* a job still uses it: stays listed */
++			continue;
++		}
++		/* civac: drops the lines older than the GPU's writes, keeps what the CPU wrote meanwhile */
++		bytes += bo->cacheOp(0, 0, kVivaCacheFlush);
++		bo->invPending = false;
++		vm->inv[i] = vm->inv[--vm->invCount];
++	}
++	if (bytes != 0) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - c0, &ns);
++		fLazyWaits++;
++		fLazyNs += ns;
++		fLazyBytes += bytes;
++	}
++}
++
+ /* Gated. */
+ void
+ VivaGPUAccelerator::boMapped(VivaGPUBO *bo)
+@@ -2108,10 +2245,14 @@ void
+ VivaGPUAccelerator::cacheStats(char **out, char *end)
+ {
+ 	uint64_t n = fSubmits ? fSubmits : 1, jobs = fJobs ? fJobs : 1;
+-	say(out, end, "cache (vivagpucache=%d): submit avg %llu us (maintenance %llu us, %llu KiB), completion "
+-	    "maintenance avg %llu us (%llu KiB) over %llu submits\n", fCacheMode, fSubmitNs / n / 1000,
+-	    fSubmitCacheNs / n / 1000, fSubmitCacheBytes / n >> 10, fDoneCacheNs / jobs / 1000,
++	say(out, end, "cache (vivagpucache=%d, vivagpuwc=%d, vivagpulazy=%d): submit avg %llu us (maintenance %llu us, "
++	    "%llu KiB), completion maintenance avg %llu us (%llu KiB) over %llu submits\n", fCacheMode, fWC, fLazy,
++	    fSubmitNs / n / 1000, fSubmitCacheNs / n / 1000, fSubmitCacheBytes / n >> 10, fDoneCacheNs / jobs / 1000,
+ 	    fDoneCacheBytes / jobs >> 10, fSubmits);
++	uint64_t w = fLazyWaits ? fLazyWaits : 1;
++	say(out, end, "lazy invalidation: %llu BOs listed after jobs, %llu waits invalidated %llu KiB (avg %llu us, "
++	    "%llu KiB), %llu list overflows; implicit dependencies %llu\n", fLazyListed, fLazyWaits, fLazyBytes >> 10,
++	    fLazyNs / w / 1000, fLazyBytes / w >> 10, fLazyOverflows, fImplicitDeps);
+ }
+ 
+ void
+@@ -2187,6 +2328,23 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status)
+ 	for (unsigned int i = 0; job->bos != NULL && i < job->bos->getCount(); i++) {
+ 		VivaGPUBO *bo = (VivaGPUBO *)job->bos->getObject(i);
+ 		if (bo->cacheMaint) {
++			if (bo->kind == kVivaBONormal && !(bo->flags & VGPU_BO_NOEXEC) && fLazy) {
++				continue;       /* shader code: the GPU never writes it */
++			}
++			/*
++			 * K0b: the fence signals now; the CPU lines are dropped when userspace waits for the GPU (WAIT_BO,
++			 * syncobj wait), once per BO however many jobs used it. Without room in the list: at once.
++			 */
++			if (fLazy && bo->vm != NULL) {
++				if (!bo->invPending) {
++					bo->vm->invAdd(bo);
++					fLazyListed++;
++				}
++				if (bo->invPending) {
++					continue;
++				}
++				fLazyOverflows++;
++			}
+ 			/* drop stale CPU lines so the CPU sees what the GPU wrote; civac keeps lines the CPU dirtied meanwhile */
+ 			bytes += bo->cacheOp(0, 0, kVivaCacheFlush);
+ 		} else if (bo->lazySurface) {
+@@ -2537,6 +2695,7 @@ VivaGPUAccelerator::selftest(bool fault, char **out, char *end)
+ 	fSelfVM->retain();
+ 	fSelfVM->bos++;
+ 	bo->kind = kVivaBONormal;
++	bo->flags = VGPU_BO_NOEXEC;             /* GPU-written: listed for invalidation (vivagpulazy) */
+ 	bo->memory = mem;
+ 	bo->cacheMaint = bo->cacheable = true;  /* written and read through the kernel's cacheable mapping */
+ 	bo->size = bo->vaSize = page_size;
+@@ -2574,6 +2733,7 @@ VivaGPUAccelerator::selftest(bool fault, char **out, char *end)
+ 		clock_interval_to_deadline(1000, kMillisecondScale, &deadline);
+ 		ret = waitFence(fence, deadline);
+ 	}
++	invalidatePending(fSelfVM, bo);         /* what userspace's wait does */
+ 	uint32_t got = w[0x200 / 4], exc = w[0];
+ 	say(out, end, "selftest%s: submit/wait 0x%x after %llu ms, fence %s 0x%x, job status 0x%02x (%s), "
+ 	    "value 0x%08x (expected 0x%08x), MMU faults +%llu\n", fault ? " fault" : "", ret, nowMs() - t0,
+@@ -2686,6 +2846,49 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
+ 	});
+ }
+ 
++/* K0c: the display (AppleCLCD) and IOSurfaceLock wait for the GPU's writes to a surface. */
++bool
++viva_gpu_surface_idle(SweetSurface *surface, uint64_t *jobs)
++{
++	VivaGPUAccelerator *gpu = gVivaGPU;
++	if (gpu == NULL || surface == NULL || gpu->gate() == NULL) {
++		if (jobs != NULL) {
++			*jobs = 0;
++		}
++		return true;
++	}
++	__block bool idle = true;
++	__block uint64_t n = 0;
++	gpu->gate()->runActionBlock(^IOReturn {
++		idle = VivaGPUAccelerator::surfaceIdle(surface, &n);
++		return kIOReturnSuccess;
++	});
++	if (jobs != NULL) {
++		*jobs = n;
++	}
++	return idle;
++}
++
++IOReturn
++viva_gpu_surface_wait(SweetSurface *surface, uint32_t timeoutMs)
++{
++	VivaGPUAccelerator *gpu = gVivaGPU;
++	if (gpu == NULL || surface == NULL || gpu->gate() == NULL) {
++		return kIOReturnSuccess;
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline(timeoutMs, kMillisecondScale, &deadline);
++	return gpu->gate()->runActionBlock(^IOReturn {
++		while (!VivaGPUAccelerator::surfaceIdle(surface, NULL)) {
++			IOReturn r = gpu->sleepUntil(deadline);
++			if (r != kIOReturnSuccess) {
++				return VivaGPUAccelerator::surfaceIdle(surface, NULL) ? kIOReturnSuccess : r;
++			}
++		}
++		return kIOReturnSuccess;
++	});
++}
++
+ extern "C" void
+ viva_gpu_link(const char *args, char *out, size_t outLen)
+ {
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+index ce5dd59..d3c95a3 100644
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -43,6 +43,7 @@ class VivaPwrap;
+ enum { kVivaCacheClean, kVivaCacheFlush };
+ void cacheBuffer(IOBufferMemoryDescriptor *md, uint64_t offset, uint64_t len, int op);
+ class VivaGPUAccelerator;
++class VivaGPUBO;
+ class SweetSurface;
+ 
+ /* Metal of iOS 16 looks GPUs up with IOServiceMatching("IOAcceleratorES") (IOGPUFamily is not in this kernel). */
+@@ -92,6 +93,15 @@ public:
+ 	uint32_t   bos;
+ 	VivaGPUVM *nextVM;              /* the accelerator's list of live VMs */
+ 
++	/*
++	 * Lazy invalidation (vivagpulazy=1): CPU-maintained BOs the GPU used since the CPU last dropped their lines.
++	 * Not retained (a BO leaves the list when freed); flushed when userspace waits (WAIT_BO, syncobj wait).
++	 */
++	void invAdd(VivaGPUBO *bo);
++	void invRemove(VivaGPUBO *bo);
++	VivaGPUBO **inv;
++	uint32_t    invCount, invCap;
++
+ private:
+ 	uint64_t *tableFor(uint64_t va, bool create);
+ 	uint64_t *tableKVA(uint64_t pa);
+@@ -136,7 +146,8 @@ public:
+ 	bool                lazySurface;/* cacheable IOSurface: cleaned only after a CPU write lock (SweetSurface) */
+ 	bool                cacheable;  /* CPU-cacheable memory (SYNC_BO applies) */
+ 	bool                prepared;   /* memory->prepare() done (user memory) */
+-	VivaGPUFence       *busy;       /* fence of the last job using it */
++	bool                invPending; /* in vm->inv: the GPU used it, the CPU lines are not dropped yet */
++	VivaGPUFence       *busy;       /* fence of the last job using it (it signals after every earlier one) */
+ 	IOBufferMemoryDescriptor **chunks;      /* heap: one per 2 MiB of VA, NULL until the GPU faults on it */
+ 	uint32_t            chunkCount;
+ 	SweetSurface       *surface;
+@@ -166,6 +177,17 @@ public:
+ 	    VivaGPUFence *fence);
+ 	/* Gated: sleep until the fence signals or the absolute deadline (0 = forever) passes. */
+ 	IOReturn waitFence(VivaGPUFence *fence, uint64_t deadline);
++	/* Gated: no pending job uses the BO (for an IOSurface: in any connection). */
++	static bool boIdle(VivaGPUBO *bo);
++	/* Gated: no pending job uses the surface (any connection); *jobs = jobs that used it so far. */
++	static bool surfaceIdle(SweetSurface *surface, uint64_t *jobs);
++	/*
++	 * Gated, lazy invalidation: drop the CPU lines of the idle BOs of vm->inv (only = that BO alone, if listed),
++	 * so the CPU reads what the GPU wrote. Called when userspace waits for the GPU.
++	 */
++	void invalidatePending(VivaGPUVM *vm, VivaGPUBO *only);
++	bool lazyInvalidate(void) const { return fLazy; }
++	bool writeCombined(void) const { return fWC; }
+ 	/* Gated: sleep until any fence or syncobj changes (kIOReturnTimeout, kIOReturnAborted). */
+ 	IOReturn sleepUntil(uint64_t deadline);
+ 	void wakeWaiters(void) { fGate->commandWakeup(&fFenceEvent, false); }
+@@ -213,6 +235,7 @@ private:
+ 	void asDisable(int as);
+ 	bool asBind(VivaGPUVM *vm);
+ 	/* jobs */
++	void addImplicitDep(OSArray *deps, VivaGPUFence *f, VivaGPUFence *self);
+ 	void kick(void);
+ 	void startJob(uint32_t slot, VivaGPUJob *job);
+ 	void completeJob(uint32_t slot, IOReturn error, uint32_t status);
+@@ -272,6 +295,13 @@ private:
+ 	 */
+ 	int      fCacheMode;
+ 	uint64_t fSubmits, fSubmitNs, fSubmitCacheNs, fSubmitCacheBytes, fDoneCacheNs, fDoneCacheBytes;
++	/*
++	 * K0b: vivagpulazy (1 default): after a job only list the CPU-maintained BOs, their lines are dropped when
++	 * userspace waits (0: after every job, as before). vivagpuwc (1 default): BOs without VGPU_BO_WB_MMAP are
++	 * write-combined like on Linux (Mesa with DRM 1.5 expects that): no CPU cache maintenance at all.
++	 */
++	bool     fLazy, fWC;
++	uint64_t fImplicitDeps, fLazyListed, fLazyBytes, fLazyNs, fLazyWaits, fLazyOverflows;
+ 	void cacheStats(char **out, char *end);
+ public:
+ 	int cacheMode(void) const { return fCacheMode; }
+diff --git a/iokit/Kernel/arm/VivaGPUUserClient.cpp b/iokit/Kernel/arm/VivaGPUUserClient.cpp
+index b14602e..9586a4c 100644
+--- a/iokit/Kernel/arm/VivaGPUUserClient.cpp
++++ b/iokit/Kernel/arm/VivaGPUUserClient.cpp
+@@ -326,7 +326,7 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
+ 			uint64_t deadline = deadlineFor(a->timeout_ns, &expired);
+ 			b->retain();
+ 			IOReturn ret = kIOReturnSuccess;
+-			while (b->busy != NULL && !b->busy->signalled) {
++			while (!VivaGPUAccelerator::boIdle(b)) {
+ 				if (expired) {
+ 					ret = kIOReturnBusy;
+ 					break;
+@@ -339,6 +339,9 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
+ 					break;
+ 				}
+ 			}
++			if (ret == kIOReturnSuccess) {
++				fGPU->invalidatePending(b->vm, b);     /* K0b: the CPU is about to read what the GPU wrote */
++			}
+ 			b->release();
+ 			return ret;
+ 		}
+@@ -472,8 +475,14 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
+ 				b->release();
+ 				return kIOReturnNoMemory;
+ 			}
++			/*
++			 * K0b: write-combined unless userspace asks for VGPU_BO_WB_MMAP, as Linux maps panfrost BOs on a
++			 * non-coherent GPU (Mesa with DRM 1.5 relies on it): CPU writes reach memory without any cache
++			 * maintenance before or after jobs. vivagpuwc=0: cacheable, maintained by the kernel as before.
++			 */
++			bool wc = fGPU->writeCombined() && !(flags & VGPU_BO_WB_MMAP);
+ 			IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, size, page_size);
++			    kIODirectionInOut | kIOMemoryKernelUserShared | (wc ? kIOMapWriteCombineCache : 0), size, page_size);
+ 			if (mem == NULL) {
+ 				fGPU->chargeMemory(fVM, -(int64_t)size);
+ 				b->vaSize = 0;
+@@ -481,14 +490,16 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
+ 				return kIOReturnNoMemory;
+ 			}
+ 			b->memory = mem;
+-			/*
+-			 * Cacheable everywhere (write-combined BOs used to panic: pmap_sync_page_attributes_phys
+-			 * truncated physical addresses above 4 GiB, fixed in 0112). The kernel keeps CPU and GPU
+-			 * coherent: zeros pushed out now, then a clean + invalidate before and after every job.
+-			 */
+-			b->cacheable = true;
+-			b->cacheMaint = fGPU->cacheMode() == 0;        /* else from the first user mapping (boMapped) */
+-			cacheBuffer(mem, 0, size, kVivaCacheFlush);
++			if (!wc) {
++				/*
++				 * Cacheable: the kernel keeps CPU and GPU coherent, zeros pushed out now, then a clean +
++				 * invalidate before and after jobs. (Write-combined pages are zeroed and flushed by XNU when
++				 * their cache mode changes: pmap_sync_page_attributes_phys, fixed for PAs above 4 GiB in 0112.)
++				 */
++				b->cacheable = true;
++				b->cacheMaint = fGPU->cacheMode() == 0;        /* else from the first user mapping (boMapped) */
++				cacheBuffer(mem, 0, size, kVivaCacheFlush);
++			}
+ 		}
+ 		b->va = fVM->allocVA(size, align);
+ 		if (b->va == 0) {
+@@ -618,6 +629,7 @@ VivaGPUUserClient::syncobjWait(struct vgpu_syncobj_wait *a)
+ 			}
+ 			if ((a->flags & VGPU_SYNCOBJ_WAIT_ALL) ? signalled == a->count_handles : signalled > 0) {
+ 				a->first_signaled = first == UINT32_MAX ? 0 : first;
++				fGPU->invalidatePending(fVM, NULL);    /* K0b: the CPU may now read what those jobs wrote */
+ 				return kIOReturnSuccess;
+ 			}
+ 			if (expired) {
