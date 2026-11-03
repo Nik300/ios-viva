@@ -281,6 +281,25 @@ Patches 0111-0113 (2026-11-03, CI run 41593631050, image `out/xnu-ufs-rw-0113.im
   coming. fbcon now honours the mute too (a panic still draws). viva-mkboot.sh adds `sweetfb_noconsole=1` by
   default; link `console on|off` toggles it live; the link log is unaffected.
 
+Patches 0114-0115 (2026-11-03, NOT tested on the phone yet; details and verification in
+`~/Developer/ios-viva/gpu/docs/ANALISI-KERNEL-RENDERING.md`, answers in `gpu/docs/RICHIESTE-KERNEL.md`):
+- **0114** (CI run 41694721285, image `out/xnu-ufs-rw-0114.img`): K0 implicit sync in `submit` (each job waits for
+  the last job on each of its BOs; IOSurfaces carry their own last fence `SweetSurface::gpuFence`, shared across
+  connections; WAIT_BO on a surface waits for other processes too). K0b: BOs without VGPU_BO_WB_MMAP are
+  write-combined (Linux model, `vivagpuwc=0` = cacheable as before; relies on 0112), CPU-maintained BOs are no
+  longer flushed in the completion IRQ but listed and invalidated when userspace waits (WAIT_BO, syncobj wait;
+  `vivagpulazy=0` = old). K0b.3 (JS_HEAD_NEXT) not done: with the shared tiler heap the dependency chain alternates
+  slots. K0c: AppleCLCD queues the last 4 swaps in order and shows the newest whose surfaces have no pending GPU job
+  (`viva_gpu_surface_idle`), retries at the next vsync otherwise, redoes a copy if a job touched a surface meanwhile,
+  shows the newest anyway after `sweetfb_gpuwait` ticks (12; 0 = off). IOSurfaceLock waits for the GPU (AvoidSync ->
+  kIOReturnCannotLock). Link: `gpu status` (lazy invalidation, implicit dependencies), `disp` (GPU sync counters).
+- **0115** (CI run 41696147588, image `out/xnu-ufs-rw-0115.img`): flush reduction (`JS_FLUSH_ID_NEXT` =
+  GPU_LATEST_FLUSH at submit, `vivagpuflushid=0` off); DVFS governor every 50 ms (>85% busy -> `vivagpufreqmax`,
+  default 950; else down to the OPP that would be 70% busy, not within 200 ms of a step up, never below
+  `vivagpufreq`; `vivagpudvfs=0` off, link `gpu dvfs [on|off]`); panel refresh adaptive by default (copies within
+  `sweetfb_duty`=25% of one CPU; `sweetfb_hz=N` = fixed as before), copy time in `disp`.
+- If the GPU's first CREATE_BO panics in pmap (WC path, 0112 not enough): boot with `vivagpuwc=0`.
+
 Workflow notes:
 - Kernel patches are made against a local xnu-8796.141.3 tree with all
   `xnu/patches/*.patch` applied in order (`git apply`; 0031/0041 need the CI's HFS
