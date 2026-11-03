@@ -362,6 +362,10 @@ def build(seed=None, qemu=False, highmem=False, viva=False, viva_ufs=False):
     ])
 
     product_props = d22ap_product()
+    if product_props and viva:
+        # The iPhone X is a P3 display: CoreAnimation would then compose in extended-range 10-bit formats
+        # (w30r/w40a). viva's panel is shown as 8-bit BGRA, so say sRGB (AppleCLCD also converts XR10).
+        product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the

@@ -1,0 +1,374 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..f35e0c4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -348,6 +348,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			continue;
+ 		}
+ 		uintptr_t src = s->kernelAddress();
++		sweet_surface_before_cpu_access(s);     /* the GPU may have drawn it: no stale CPU lines */
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..3223655 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -104,6 +104,42 @@ SweetSurface::kernelAddress()
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+ }
+ 
++/* Clean + invalidate (dc civac: never loses a CPU write) the whole surface, through the kernel mapping. */
++static uint64_t
++sweet_surface_clean(SweetSurface *s)
++{
++	IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++	if (buffer == NULL) {
++		return 0;               /* physical (panel) memory: write-combined, nothing cached */
++	}
++	uintptr_t p = (uintptr_t)buffer->getBytesNoCopy(), end = p + buffer->getLength();
++	for (uintptr_t line = p & ~(uintptr_t)63; line < end; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r"(line) : "memory");
++	}
++	__asm__ volatile ("dsb sy" : : : "memory");
++	return end - p;
++}
++
++uint64_t
++sweet_surface_before_device_read(SweetSurface *s)
++{
++	return OSCompareAndSwap(1, 0, &s->cpuDirty) ? sweet_surface_clean(s) : 0;
++}
++
++uint64_t
++sweet_surface_before_cpu_access(SweetSurface *s)
++{
++	return OSCompareAndSwap(1, 0, &s->gpuDirty) ? sweet_surface_clean(s) : 0;
++}
++
++void
++sweet_surface_device_wrote(SweetSurface *s)
++{
++	if (OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL) {
++		OSCompareAndSwap(0, 1, &s->gpuDirty);
++	}
++}
++
+ static uint32_t *
+ sweet_surface_seed(SweetSurface *s)
+ {
+@@ -697,6 +733,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		} else {
+ 			bzero(mem->getBytesNoCopy(), s->allocSize);
+ 			s->memory = mem;
++			s->cpuDirty = 1;        /* the zeros may still be in the CPU caches */
+ 			s->mapCache = kIOMapDefaultCache;
+ 			if (!sweet_surface_publish(s)) {
+ 				ret = kIOReturnNoResources;
+@@ -822,13 +859,17 @@ sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
+ }
+ 
+ IOReturn
+-IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
++IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
+ 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	sweet_surface_before_cpu_access(s);
++	if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && OSDynamicCast(IOBufferMemoryDescriptor, s->memory)) {
++		OSCompareAndSwap(0, 1, &s->cpuDirty);
++	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
+ 	s->release();
+ 	return ret;
+@@ -842,6 +883,9 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && OSDynamicCast(IOBufferMemoryDescriptor, s->memory)) {
++		OSCompareAndSwap(0, 1, &s->cpuDirty);   /* the writes made while locked */
++	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
+ 	s->release();
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..1f90c80 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -40,6 +40,14 @@ public:
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 
++	/*
++	 * CPU cache state for devices that read and write the pixels without snooping the CPU caches (the viva
++	 * GPU, the display). CPU access goes through IOSurfaceLock/Unlock: a write lock marks the CPU lines dirty,
++	 * any lock first drops the lines a device made stale. Only buffer surfaces (cacheable) track this.
++	 */
++	volatile UInt32           cpuDirty;     /* the CPU may hold dirty lines (write lock since the last clean) */
++	volatile UInt32           gpuDirty;     /* a device wrote the memory since the CPU last dropped its lines */
++
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+@@ -58,6 +66,17 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++/*
++ * Cache maintenance around device access (see cpuDirty/gpuDirty). Each returns the bytes cleaned (0: nothing
++ * to do or not a cacheable surface).
++ *   before_device_read: a device is about to read: clean the CPU's dirty lines to memory
++ *   before_cpu_access:  the CPU is about to read: drop lines older than what a device wrote
++ *   device_wrote:       a device finished writing it
++ */
++uint64_t sweet_surface_before_device_read(SweetSurface *surface);
++uint64_t sweet_surface_before_cpu_access(SweetSurface *surface);
++void sweet_surface_device_wrote(SweetSurface *surface);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index cf5d47f..d481fa0 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -709,11 +709,11 @@ VivaGPUBO::growHeap(uint64_t addr)
+ 	return true;
+ }
+ 
+-void
++uint64_t
+ VivaGPUBO::cacheOp(uint64_t offset, uint64_t len, int op)
+ {
+ 	if (memory == NULL) {
+-		return;
++		return 0;
+ 	}
+ 	if (len == 0 || offset + len > size) {
+ 		len = offset < size ? size - offset : 0;
+@@ -721,12 +721,13 @@ VivaGPUBO::cacheOp(uint64_t offset, uint64_t len, int op)
+ 	IOBufferMemoryDescriptor *buf = OSDynamicCast(IOBufferMemoryDescriptor, memory);
+ 	if (buf != NULL) {
+ 		cacheBuffer(buf, memOffset + offset, len, op);
+-		return;
++		return len;
+ 	}
+ 	if (kmap == NULL && (kmap = memory->map()) == NULL) {        /* user memory, physical surfaces */
+-		return;
++		return 0;
+ 	}
+ 	cacheVA((const uint8_t *)kmap->getVirtualAddress() + memOffset + offset, len, op);
++	return len;
+ }
+ 
+ /* ---- accelerator ---- */
+@@ -748,6 +749,8 @@ VivaGPUAccelerator::start(IOService *provider)
+ 		return false;
+ 	}
+ 	fMode = mode;
++	fCacheMode = 1;
++	PE_parse_boot_argn("vivagpucache", &fCacheMode, sizeof(fCacheMode));
+ 	int64_t mib = GPU_MEMORY_LIMIT >> 20;
+ 	PE_parse_boot_argn("vivagpumemtotal", &mib, sizeof(mib));
+ 	fMemLimit = mib << 20;
+@@ -1859,6 +1862,7 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
+ 	if (!fPowered) {
+ 		return kIOReturnNotReady;
+ 	}
++	uint64_t t0 = mach_absolute_time(), cacheNs = 0, cacheBytes = 0;
+ 	VivaGPUJob *job = IOMallocType(VivaGPUJob);
+ 	job->vm = vm;
+ 	vm->retain();
+@@ -1876,8 +1880,15 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
+ 			fence->retain();
+ 			OSSafeReleaseNULL(bo->busy);
+ 			bo->busy = fence;
++			uint64_t c0 = mach_absolute_time(), bytes = 0;
+ 			if (bo->cacheMaint) {
+-				bo->cacheOp(0, 0, kVivaCacheFlush);     /* CPU writes out before the GPU reads */
++				bytes = bo->cacheOp(0, 0, kVivaCacheFlush);     /* CPU writes out before the GPU reads */
++			} else if (bo->lazySurface) {
++				bytes = sweet_surface_before_device_read(bo->surface);
++			}
++			if (bytes != 0) {
++				cacheBytes += bytes;
++				cacheNs += mach_absolute_time() - c0;
+ 			}
+ 		}
+ 	}
+@@ -1891,9 +1902,39 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
+ 	}
+ 	fQueueTail[slot] = job;
+ 	kick();
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	fSubmits++;
++	fSubmitNs += ns;
++	absolutetime_to_nanoseconds(cacheNs, &ns);
++	fSubmitCacheNs += ns;
++	fSubmitCacheBytes += cacheBytes;
+ 	return kIOReturnSuccess;
+ }
+ 
++/* Gated. */
++void
++VivaGPUAccelerator::boMapped(VivaGPUBO *bo)
++{
++	if (bo->cacheMaint || !bo->cacheable) {
++		return;
++	}
++	/* the GPU may have written it while nobody looked: drop stale lines once, then maintain it like the rest */
++	bo->cacheOp(0, 0, kVivaCacheFlush);
++	bo->cacheMaint = true;
++	bo->lazySurface = false;
++}
++
++void
++VivaGPUAccelerator::cacheStats(char **out, char *end)
++{
++	uint64_t n = fSubmits ? fSubmits : 1, jobs = fJobs ? fJobs : 1;
++	say(out, end, "cache (vivagpucache=%d): submit avg %llu us (maintenance %llu us, %llu KiB), completion "
++	    "maintenance avg %llu us (%llu KiB) over %llu submits\n", fCacheMode, fSubmitNs / n / 1000,
++	    fSubmitCacheNs / n / 1000, fSubmitCacheBytes / n >> 10, fDoneCacheNs / jobs / 1000,
++	    fDoneCacheBytes / jobs >> 10, fSubmits);
++}
++
+ void
+ VivaGPUAccelerator::kick(void)
+ {
+@@ -1963,12 +2004,21 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status)
+ 			    slot, status, jsStatusName(status), job->jc, job->vm->asSlot, nowMs() - job->startMs);
+ 		}
+ 	}
++	uint64_t c0 = mach_absolute_time(), bytes = 0;
+ 	for (unsigned int i = 0; job->bos != NULL && i < job->bos->getCount(); i++) {
+ 		VivaGPUBO *bo = (VivaGPUBO *)job->bos->getObject(i);
+ 		if (bo->cacheMaint) {
+-			bo->cacheOp(0, 0, kVivaCacheInvalidate);        /* drop CPU lines: the CPU sees what the GPU wrote */
++			bytes += bo->cacheOp(0, 0, kVivaCacheInvalidate);       /* drop CPU lines: the CPU sees what the GPU wrote */
++		} else if (bo->lazySurface) {
++			sweet_surface_device_wrote(bo->surface);                /* dropped at the next IOSurfaceLock */
+ 		}
+ 	}
++	if (bytes != 0) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - c0, &ns);
++		fDoneCacheNs += ns;
++		fDoneCacheBytes += bytes;
++	}
+ 	job->fence->signalled = true;
+ 	job->fence->error = error;
+ 	OSSafeReleaseNULL(job->deps);
+@@ -2303,7 +2353,7 @@ VivaGPUAccelerator::selftest(bool fault, char **out, char *end)
+ 	fSelfVM->bos++;
+ 	bo->kind = kVivaBONormal;
+ 	bo->memory = mem;
+-	bo->cacheMaint = true;  /* written and read through the kernel's cacheable mapping */
++	bo->cacheMaint = bo->cacheable = true;  /* written and read through the kernel's cacheable mapping */
+ 	bo->size = bo->vaSize = page_size;
+ 	if (!chargeMemory(fSelfVM, page_size)) {
+ 		bo->vaSize = 0;
+@@ -2427,6 +2477,7 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
+ 			    fRunning[1] != NULL, fQueue[0] != NULL, fQueue[1] != NULL, fJobFaults, fMmuFaults, fFaultsNoReset,
+ 			    fWatchFragment ? ", watching fragment jobs" : "", fHeapGrows, fGpuFaults, fTimeouts, fResets);
+ 			memoryDump(o, end);
++			cacheStats(o, end);
+ 			say(o, end, "usage: gpu [status|mfg|on|off|regs|selftest [fault]|probe|publish]\n");
+ 		}
+ 		return kIOReturnSuccess;
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+index 0e8a07e..fead536 100644
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -111,8 +111,8 @@ public:
+ 	virtual void free(void) APPLE_KEXT_OVERRIDE;
+ 	/* Heap BO: back the 2 MiB chunk containing `va` (GPU fault). */
+ 	bool growHeap(uint64_t va);
+-	/* CPU cache maintenance (kVivaCache*) of [offset, offset + len) of the BO (len 0 = all). */
+-	void cacheOp(uint64_t offset, uint64_t len, int op);
++	/* CPU cache maintenance (kVivaCache*) of [offset, offset + len) of the BO (len 0 = all); bytes done. */
++	uint64_t cacheOp(uint64_t offset, uint64_t len, int op);
+ 
+ 	VivaGPUVM          *vm;
+ 	VivaGPUBOKind       kind;
+@@ -122,7 +122,9 @@ public:
+ 	uint64_t            va, vaSize; /* GPU VA and mapped span (16 KiB multiple) */
+ 	uint64_t            size;       /* size reported to userspace */
+ 	uint32_t            flags, madv;
+-	bool                cacheMaint; /* CPU-cacheable: flush around jobs */
++	bool                cacheMaint; /* CPU-mapped and cacheable: flush before and invalidate after every job */
++	bool                lazySurface;/* cacheable IOSurface: cleaned only after a CPU write lock (SweetSurface) */
++	bool                cacheable;  /* CPU-cacheable memory (SYNC_BO applies) */
+ 	bool                prepared;   /* memory->prepare() done (user memory) */
+ 	VivaGPUFence       *busy;       /* fence of the last job using it */
+ 	IOBufferMemoryDescriptor **chunks;      /* heap: one per 2 MiB of VA, NULL until the GPU faults on it */
+@@ -247,6 +249,15 @@ private:
+ 
+ 	/* counters */
+ 	uint64_t fJobs, fJobFaults, fMmuFaults, fGpuFaults, fResets, fTimeouts, fHeapGrows;
++	/* CPU cache maintenance (vivagpucache: 0 every BO around every job, 1 only CPU-mapped BOs + lazy surfaces) */
++	int      fCacheMode;
++	uint64_t fSubmits, fSubmitNs, fSubmitCacheNs, fSubmitCacheBytes, fDoneCacheNs, fDoneCacheBytes;
++	void cacheStats(char **out, char *end);
++public:
++	int cacheMode(void) const { return fCacheMode; }
++	/* A BO gets a CPU mapping (user mmap): from now on it is maintained around jobs. Gated. */
++	void boMapped(VivaGPUBO *bo);
++private:
+ 	uint64_t fFaultsNoReset;            /* chains killed by an MMU fault without a GPU reset */
+ 	bool     fWatchFragment;            /* since then no fragment chain completed: short timeout on JS0 */
+ 
+diff --git a/iokit/Kernel/arm/VivaGPUUserClient.cpp b/iokit/Kernel/arm/VivaGPUUserClient.cpp
+index 7323500..14f7984 100644
+--- a/iokit/Kernel/arm/VivaGPUUserClient.cpp
++++ b/iokit/Kernel/arm/VivaGPUUserClient.cpp
+@@ -486,7 +486,8 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
+ 			 * for RAM below 0xc0000000, outside XNU's physical aperture). The kernel keeps CPU and GPU
+ 			 * coherent: zeros pushed out now, then a flush before and an invalidate after every job.
+ 			 */
+-			b->cacheMaint = true;
++			b->cacheable = true;
++			b->cacheMaint = fGPU->cacheMode() == 0;        /* else from the first user mapping (boMapped) */
+ 			cacheBuffer(mem, 0, size, kVivaCacheFlush);
+ 		}
+ 		b->va = fVM->allocVA(size, align);
+@@ -666,7 +667,10 @@ VivaGPUUserClient::importSurface(struct vgpu_import_iosurface *a)
+ 		b->memOffset = mapStart;
+ 		b->size = b->vaSize = mapSize;
+ 		fVM->imported += (int64_t)mapSize;
+-		b->cacheMaint = s->mapCache != kIOMapWriteCombineCache && s->mapCache != kIOMapInhibitCache;
++		b->cacheable = OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL &&
++		    s->mapCache != kIOMapWriteCombineCache && s->mapCache != kIOMapInhibitCache;
++		b->cacheMaint = b->cacheable && fGPU->cacheMode() == 0;
++		b->lazySurface = b->cacheable && !b->cacheMaint;
+ 		b->va = fVM->allocVA(mapSize, mapSize >= HEAP_ALIGN ? HEAP_ALIGN : page_size);
+ 		b->gpuOffset = planeOff - mapStart;
+ 		if (!b->prepared || b->va == 0 || !fVM->map(b->va, b->memory, mapStart, mapSize, VivaGPUVM::leafAttrs(false))) {
+@@ -723,6 +727,7 @@ VivaGPUUserClient::importUser(struct vgpu_import_userptr *a)
+ 		b->memory = md;
+ 		md->retain();
+ 		b->prepared = true;
++		b->cacheable = true;
+ 		b->size = b->vaSize = a->size;
+ 		fVM->imported += (int64_t)a->size;
+ 		b->cacheMaint = true;
+@@ -762,7 +767,7 @@ VivaGPUUserClient::syncBO(struct vgpu_sync_bo *a)
+ 			if (ops[i].type > VGPU_SYNC_CPU_CACHE_FLUSH_INVALIDATE) {
+ 				return kIOReturnBadArgument;
+ 			}
+-			if ((b->flags & VGPU_BO_WB_MMAP) || b->cacheMaint) {
++			if (b->cacheable) {
+ 				b->cacheOp(ops[i].offset, ops[i].size, ops[i].type == VGPU_SYNC_CPU_CACHE_FLUSH_INVALIDATE);
+ 			}
+ 		}
+@@ -781,6 +786,7 @@ VivaGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMem
+ 		if (b == NULL || b->memory == NULL || b->kind == kVivaBOHeap) {
+ 			return kIOReturnBadArgument;
+ 		}
++		fGPU->boMapped(b);
+ 		IOMemoryDescriptor *md = b->memory;
+ 		if (b->memOffset != 0) {
+ 			md = IOSubMemoryDescriptor::withSubRange(b->memory, b->memOffset, b->vaSize, kIODirectionInOut);

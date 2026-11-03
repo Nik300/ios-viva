@@ -1,0 +1,575 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index 8e06076..96562e5 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -20,7 +20,17 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
+ #include <machine/machine_routines.h>
++#include <sys/proc.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++#include <sys/stat.h>
++#include <miscfs/devfs/devfs.h>
++#include <sys/conf.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);  /* not exported to the BSD layer */
+ void viva_usb_probe(void);
+@@ -105,8 +115,16 @@ viva_usb_probe(void)
+  * commands. One interface, bulk IN 0x81 and bulk OUT 0x01. Every IN packet
+  * is one frame: 'V', type, u16 payload length (little endian), payload.
+  * Types: 'L' console log bytes (the ring in bsd/dev/sweet_ufs.c, from the
+- * start of the boot), 'R' command reply text, 'E' end of a reply. Every OUT
+- * packet is one text command (see vl_command). Host side: tools/viva-link.py.
++ * start of the boot), 'R' command reply text, 'E' end of a reply, 'F' file
++ * data ("pull", before the reply's text), 'O' output of programs run by
++ * vivad. Every OUT packet is one text command (see vl_command), except while
++ * a "push" receives its file: then OUT packets are raw file data.
++ * Host side: tools/viva-link.py.
++ *
++ * Running programs: /dev/vivalink (root only, created once the root is
++ * mounted) connects the userspace daemon vivad (tools/vivad): "run ..." and
++ * "vivad ..." commands are queued as lines "ID TEXT" for vivad's read();
++ * whatever vivad writes comes out as 'O' frames.
+  *
+  * PHY: LK leaves the T-PHY u2 port forced into suspend; it is woken with the
+  * MediaTek usb20 phy "recover" sequence (as Linux phy-mtk-tphy u2 init) and
+@@ -481,6 +499,392 @@ vl_arg(char **p, uint64_t *v)
+ 	return true;
+ }
+ 
++/* ---- files: push (host -> phone) and pull (phone -> host) ---- */
++
++extern int viva_kern_rename(const char *from, const char *to);        /* bsd/vfs/vfs_syscalls.c */
++extern int viva_kern_mkdir(const char *path, int mode);
++
++#define VL_PUSH_BUF     (64u << 10)
++#define VL_PUSH_MAX     (512ull << 20)
++#define VL_PUSH_IDLE_MS 10000
++
++static struct {
++	bool        active;
++	vnode_t     vp;
++	char        path[256], tmp[272];
++	uint64_t    size, got;
++	uint32_t    fnv, want;
++	uint8_t    *buf;
++	uint32_t    buf_len;
++	uint64_t    last_ms;
++	int         error;
++} vpush;
++
++static struct {
++	bool        active;
++	vnode_t     vp;
++	uint64_t    off, size;
++	uint32_t    fnv;
++} vpull;
++
++static uint64_t
++vl_now_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++static uint32_t
++vl_fnv(uint32_t h, const uint8_t *p, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		h = (h ^ p[i]) * 16777619u;
++	}
++	return h;
++}
++
++/* A path we accept: absolute, no "..", not under /dev. */
++static bool
++vl_path_ok(const char *p)
++{
++	size_t n = strlen(p);
++	if (p[0] != '/' || n >= sizeof(vpush.path) || strncmp(p, "/dev/", 5) == 0) {
++		return false;
++	}
++	for (size_t i = 0; i + 2 < n + 1; i++) {
++		if (p[i] == '/' && p[i + 1] == '.' && p[i + 2] == '.' && (p[i + 3] == '/' || p[i + 3] == 0)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++vl_push_flush(void)
++{
++	if (vpush.buf_len == 0 || vpush.error) {
++		vpush.buf_len = 0;
++		return;
++	}
++	vfs_context_t ctx = vfs_context_kernel();
++	int resid = 0;
++	vpush.error = vn_rdwr(UIO_WRITE, vpush.vp, (caddr_t)vpush.buf, (int)vpush.buf_len,
++	    (off_t)(vpush.got - vpush.buf_len), UIO_SYSSPACE, IO_NOAUTH | IO_UNIT, vfs_context_ucred(ctx), &resid,
++	    vfs_context_proc(ctx));
++	if (vpush.error == 0 && resid != 0) {
++		vpush.error = EIO;
++	}
++	vpush.buf_len = 0;
++}
++
++/* End of a push: the file is renamed into place only when complete and its checksum matches. */
++static void
++vl_push_finish(const char *why)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vl_push_flush();
++	vnode_close(vpush.vp, FWRITE, ctx);
++	vpush.vp = NULLVP;
++	bool complete = why == NULL && vpush.error == 0 && vpush.got == vpush.size;
++	if (complete && vpush.fnv != vpush.want) {
++		why = "checksum mismatch";
++	} else if (why == NULL && vpush.error) {
++		why = "write error";
++	}
++	int err = 0;
++	if (why == NULL) {
++		err = viva_kern_rename(vpush.tmp, vpush.path);
++		if (err) {
++			why = "rename failed";
++		}
++	}
++	vl.reply_len = vl.reply_pos = 0;
++	if (why == NULL) {
++		vl_reply("push %s: %llu bytes, fnv1a 0x%08x, ok\n", vpush.path, vpush.got, vpush.fnv);
++	} else {
++		vl_reply("push %s: FAILED (%s, error %d): %llu of %llu bytes, fnv1a 0x%08x (expected 0x%08x); left in %s\n",
++		    vpush.path, why, vpush.error ? vpush.error : err, vpush.got, vpush.size, vpush.fnv, vpush.want,
++		    vpush.tmp);
++	}
++	vl.reply_end = true;
++	kfree_data(vpush.buf, VL_PUSH_BUF);
++	vpush.buf = NULL;
++	vpush.active = false;
++}
++
++/* "push SIZE MODE FNV PATH": the next SIZE bytes of OUT data go to PATH.vivapush, then renamed to PATH. */
++static void
++vl_push_start(char *rest)
++{
++	uint64_t size, mode, fnv;
++	if (!vl_arg(&rest, &size) || !vl_arg(&rest, &mode) || !vl_arg(&rest, &fnv)) {
++		vl_reply("usage: push SIZE MODE FNV1A PATH (tools/viva-link.py push LOCAL PATH [MODE])\n");
++		return;
++	}
++	while (*rest == ' ') {
++		rest++;
++	}
++	if (size == 0 || size > VL_PUSH_MAX || !vl_path_ok(rest)) {
++		vl_reply("push: bad size or path (absolute, not /dev, at most %llu MiB)\n", VL_PUSH_MAX >> 20);
++		return;
++	}
++	if (rootvnode == NULLVP) {
++		vl_reply("push: no root file system yet\n");
++		return;
++	}
++	strlcpy(vpush.path, rest, sizeof(vpush.path));
++	snprintf(vpush.tmp, sizeof(vpush.tmp), "%s.vivapush", vpush.path);
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int err = vnode_open(vpush.tmp, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, (int)(mode & 07777), VNODE_LOOKUP_NOFOLLOW,
++	    &vp, ctx);
++	if (err == ENOENT) {
++		/* missing parent directories: create them (0755) and retry */
++		char dir[256];
++		strlcpy(dir, vpush.path, sizeof(dir));
++		for (char *p = dir + 1; *p; p++) {
++			if (*p == '/') {
++				*p = 0;
++				(void)viva_kern_mkdir(dir, 0755);
++				*p = '/';
++			}
++		}
++		err = vnode_open(vpush.tmp, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, (int)(mode & 07777),
++		    VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	}
++	if (err) {
++		vl_reply("push %s: cannot create %s (error %d)\n", vpush.path, vpush.tmp, err);
++		return;
++	}
++	vpush.buf = kalloc_data(VL_PUSH_BUF, Z_WAITOK);
++	if (vpush.buf == NULL) {
++		vnode_close(vp, FWRITE, ctx);
++		vl_reply("push: no memory\n");
++		return;
++	}
++	vpush.vp = vp;
++	vpush.size = size;
++	vpush.got = 0;
++	vpush.buf_len = 0;
++	vpush.fnv = 2166136261u;
++	vpush.want = (uint32_t)fnv;
++	vpush.error = 0;
++	vpush.last_ms = vl_now_ms();
++	vpush.active = true;
++	vl_reply("push %s: ready for %llu bytes\n", vpush.path, size);
++}
++
++/* One OUT packet of push data (index 1, RXPKTRDY set). */
++static void
++vl_push_data(void)
++{
++	uint32_t n = rd16(vl.musb, MUSB_RXCOUNT);
++	if (n > vpush.size - vpush.got) {
++		n = (uint32_t)(vpush.size - vpush.got);
++	}
++	if (n > VL_PUSH_BUF - vpush.buf_len) {
++		vl_push_flush();
++	}
++	vl_fifo_read(1, vpush.buf + vpush.buf_len, n);
++	wr16(vl.musb, MUSB_RXCSR, 0);
++	vl.rx_pkts++;
++	vpush.fnv = vl_fnv(vpush.fnv, vpush.buf + vpush.buf_len, n);
++	vpush.buf_len += n;
++	vpush.got += n;
++	vpush.last_ms = vl_now_ms();
++	if (vpush.buf_len == VL_PUSH_BUF) {
++		vl_push_flush();
++	}
++	if (vpush.got == vpush.size) {
++		vl_push_finish(NULL);
++	}
++}
++
++/* "pull PATH": the file as 'F' frames, then a reply line with its size and checksum. */
++static void
++vl_pull_start(char *rest)
++{
++	while (*rest == ' ') {
++		rest++;
++	}
++	if (rest[0] != '/' || rootvnode == NULLVP) {
++		vl_reply("pull: absolute path needed (and a mounted root)\n");
++		return;
++	}
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int err = vnode_open(rest, FREAD, 0, 0, &vp, ctx);
++	if (err) {
++		vl_reply("pull %s: error %d\n", rest, err);
++		return;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	if (vnode_vtype(vp) != VREG || vnode_getattr(vp, &va, ctx) != 0) {
++		vnode_close(vp, FREAD, ctx);
++		vl_reply("pull %s: not a regular file\n", rest);
++		return;
++	}
++	vpull.vp = vp;
++	vpull.off = 0;
++	vpull.size = va.va_data_size;
++	vpull.fnv = 2166136261u;
++	vpull.active = true;
++	strlcpy(vpush.path, rest, sizeof(vpush.path));    /* for the final line */
++}
++
++/* Next 'F' payload (at most max bytes); false at the end (reply text queued). */
++static uint32_t
++vl_pull_chunk(uint8_t *out, uint32_t max)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	uint32_t n = (uint32_t)MIN((uint64_t)max, vpull.size - vpull.off);
++	int resid = 0, err = 0;
++	if (n > 0) {
++		err = vn_rdwr(UIO_READ, vpull.vp, (caddr_t)out, (int)n, (off_t)vpull.off, UIO_SYSSPACE, IO_NOAUTH,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		n -= (uint32_t)resid;
++	}
++	if (err || n == 0) {
++		vnode_close(vpull.vp, FREAD, ctx);
++		vpull.active = false;
++		vl_reply("pull %s: %llu bytes, fnv1a 0x%08x%s\n", vpush.path, vpull.off, vpull.fnv, err ? " (read error)" : "");
++		return 0;
++	}
++	vpull.fnv = vl_fnv(vpull.fnv, out, n);
++	vpull.off += n;
++	return n;
++}
++
++/* ---- /dev/vivalink: commands for vivad, its output back ---- */
++
++LCK_GRP_DECLARE(vl_vivad_grp, "vivalink");
++LCK_MTX_DECLARE(vl_vivad_mtx, &vl_vivad_grp);
++#define VL_OUT_RING     (64u << 10)
++static char     vd_cmds[4096];          /* "ID TEXT\n" lines for vivad */
++static uint32_t vd_cmd_len;
++static uint8_t  vd_out[VL_OUT_RING];    /* vivad output, streamed as 'O' frames */
++static uint32_t vd_out_head, vd_out_tail;       /* free-running */
++static uint64_t vd_out_dropped;
++static uint32_t vd_next_id = 1, vd_readers;
++static int      vd_pid;
++static bool     vd_node;
++
++static int
++vivalink_open(__unused dev_t dev, __unused int flags, __unused int devtype, proc_t p)
++{
++	lck_mtx_lock(&vl_vivad_mtx);
++	vd_pid = proc_pid(p);
++	lck_mtx_unlock(&vl_vivad_mtx);
++	return 0;
++}
++
++static int
++vivalink_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	return 0;
++}
++
++/* One command line per read (blocks until there is one). */
++static int
++vivalink_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	int err = 0;
++	lck_mtx_lock(&vl_vivad_mtx);
++	vd_readers++;
++	while (vd_cmd_len == 0 && err == 0) {
++		err = msleep(&vd_cmd_len, &vl_vivad_mtx, PCATCH | PSOCK, "vivalink", NULL);
++	}
++	vd_readers--;
++	if (err == 0) {
++		uint32_t n = 0;
++		while (n < vd_cmd_len && vd_cmds[n] != '\n') {
++			n++;
++		}
++		n = MIN(n + 1, vd_cmd_len);
++		uint32_t give = (uint32_t)MIN((user_ssize_t)n, uio_resid(uio));
++		err = uiomove(vd_cmds, (int)give, uio);
++		memmove(vd_cmds, vd_cmds + n, vd_cmd_len - n);
++		vd_cmd_len -= n;
++	}
++	lck_mtx_unlock(&vl_vivad_mtx);
++	return err;
++}
++
++static int
++vivalink_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	char chunk[512];
++	int err = 0;
++	while (err == 0 && uio_resid(uio) > 0) {
++		int n = (int)MIN((user_ssize_t)sizeof(chunk), uio_resid(uio));
++		err = uiomove(chunk, n, uio);
++		if (err) {
++			break;
++		}
++		lck_mtx_lock(&vl_vivad_mtx);
++		for (int i = 0; i < n; i++) {
++			if (vd_out_head - vd_out_tail >= VL_OUT_RING) {
++				vd_out_dropped += (uint64_t)(n - i);
++				break;
++			}
++			vd_out[vd_out_head++ % VL_OUT_RING] = (uint8_t)chunk[i];
++		}
++		lck_mtx_unlock(&vl_vivad_mtx);
++	}
++	return err;
++}
++
++static const struct cdevsw vivalink_cdevsw = {
++	.d_open = vivalink_open, .d_close = vivalink_close, .d_read = vivalink_read, .d_write = vivalink_write,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++/* Once the root is mounted (devfs is up): /dev/vivalink, root only. */
++static void
++vl_vivad_node(void)
++{
++	if (vd_node || rootvnode == NULLVP) {
++		return;
++	}
++	vd_node = true;
++	int major = cdevsw_add(-1, &vivalink_cdevsw);
++	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "vivalink") == NULL) {
++		printf("VIVA LINK: no /dev/vivalink (major %d)\n", major);
++	}
++}
++
++/* Queue "ID TEXT" for vivad; 0 if nobody reads or the queue is full. */
++static uint32_t
++vl_vivad_send(const char *text)
++{
++	uint32_t id = 0;
++	lck_mtx_lock(&vl_vivad_mtx);
++	size_t need = strlen(text) + 16;
++	if (vd_readers > 0 && vd_cmd_len + need < sizeof(vd_cmds)) {
++		id = vd_next_id++;
++		vd_cmd_len += (uint32_t)snprintf(vd_cmds + vd_cmd_len, sizeof(vd_cmds) - vd_cmd_len, "%u %s\n", id, text);
++		wakeup(&vd_cmd_len);
++	}
++	lck_mtx_unlock(&vl_vivad_mtx);
++	return id;
++}
++
++static uint32_t
++vl_vivad_out(uint8_t *out, uint32_t max)
++{
++	lck_mtx_lock(&vl_vivad_mtx);
++	uint32_t n = MIN(max, vd_out_head - vd_out_tail);
++	for (uint32_t i = 0; i < n; i++) {
++		out[i] = vd_out[vd_out_tail++ % VL_OUT_RING];
++	}
++	lck_mtx_unlock(&vl_vivad_mtx);
++	return n;
++}
++
+ /*
+  * Commands (one per OUT packet, text):
+  *   ping | stat | help
+@@ -490,7 +894,12 @@ vl_arg(char **p, uint64_t *v)
+  *   pmic ADDR [N]     read N (max 32) 16-bit PMIC registers through pwrap (read only)
+  *   i2c DEV REG N     read N (max 64) bytes from 16-bit register REG of I2C0 device DEV
+  *   i2cw DEV REG B..  write bytes (max 6) to register REG of I2C0 device DEV
+- *   gpu [ARGS]        Mali driver (VivaGPU.cpp): status, mfg, on, off, regs, selftest [fault], publish
++ *   gpu [ARGS]        Mali driver (VivaGPU.cpp): status, mfg, on, off, regs, freq, selftest [fault], probe, publish
++ *   push SIZE MODE FNV PATH  receive a file (raw OUT data follows; written to PATH.vivapush, renamed when
++ *                     its FNV-1a matches; missing directories are created)
++ *   pull PATH         send a file ('F' frames)
++ *   run ARGS..        run a program through vivad (output as 'O' frames, "[ID] exit N" at the end)
++ *   vivad TEXT        any other vivad command (ps, kill ID, tests)
+  *   panic [TEXT]      panic (to test the panic path)
+  *   reboot            watchdog software reset (back through preloader/LK)
+  * peek/poke have no guard: an address in a gated block can hang the bus.
+@@ -522,6 +931,8 @@ vl_command(void)
+ 		    sweet_log_position(), vl.log_pos, vl.log_bytes);
+ 		vl_reply("usb: %llu resets, %llu setups, %llu commands, %llu IN packets, %llu OUT packets\n",
+ 		    vl.resets, vl.setups, vl.cmds, vl.tx_pkts, vl.rx_pkts);
++		vl_reply("vivad: %s (last opener pid %d), %llu output bytes dropped%s\n", vd_readers ? "waiting for commands" :
++		    "not reading", vd_pid, vd_out_dropped, vd_node ? "" : ", /dev/vivalink not created yet");
+ 	} else if (IS("peek") && vl_arg(&rest, &a)) {
+ 		uint64_t words = 1;
+ 		(void)vl_arg(&rest, &words);
+@@ -586,6 +997,23 @@ vl_command(void)
+ 		static char gpu_reply[3072];
+ 		viva_gpu_link(rest, gpu_reply, sizeof(gpu_reply));
+ 		vl_reply("%s", gpu_reply);
++	} else if (IS("push")) {
++		vl_push_start(rest);
++	} else if (IS("pull")) {
++		vl_pull_start(rest);
++	} else if (IS("run") || IS("vivad")) {
++		char line[480];
++		while (*rest == ' ') {
++			rest++;
++		}
++		snprintf(line, sizeof(line), "%s%s", IS("run") ? "run " : "", rest);
++		uint32_t id = *rest ? vl_vivad_send(line) : 0;
++		if (id) {
++			vl_reply("vivad: %u queued (pid %d)\n", id, vd_pid);
++		} else {
++			vl_reply("vivad: not running (no reader on /dev/vivalink%s) or nothing to send\n",
++			    vd_node ? "" : ", not created yet");
++		}
+ 	} else if (IS("rewind")) {
+ 		uint64_t total = sweet_log_position(), back = UINT64_MAX;
+ 		(void)vl_arg(&rest, &back);
+@@ -603,7 +1031,7 @@ vl_command(void)
+ 			delay(5000);
+ 		}
+ 	} else if (IS("help")) {
+-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | gpu [status|mfg|on|off|regs|selftest [fault]|publish] | rewind [BYTES] | panic [TEXT] | reboot\n");
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | panic [TEXT] | reboot\n");
+ 	} else {
+ 		vl_reply("unknown command: %s (try help)\n", c);
+ 	}
+@@ -630,10 +1058,16 @@ vl_tx(void)
+ 		memcpy(pkt + 4, vl.reply + vl.reply_pos, n);
+ 		vl.reply_pos += n;
+ 		type = 'R';
++	} else if (vpull.active && (n = vl_pull_chunk(pkt + 4, room)) > 0) {
++		type = 'F';
++	} else if (vl.reply_pos < vl.reply_len) {          /* the pull's last line */
++		return vl_tx();
+ 	} else if (vl.reply_end) {
+ 		vl.reply_end = false;
+ 		n = 0;
+ 		type = 'E';
++	} else if ((n = vl_vivad_out(pkt + 4, room)) > 0) {
++		type = 'O';
+ 	} else {
+ 		n = sweet_log_copy(&vl.log_pos, (char *)pkt + 4, room);
+ 		if (n == 0) {
+@@ -660,6 +1094,15 @@ vl_rx(void)
+ 	if (!(csr & RXCSR_RXPKTRDY)) {
+ 		return;
+ 	}
++	if (vpush.active) {
++		for (int i = 0; i < 64 && vpush.active && (rd16(vl.musb, MUSB_RXCSR) & RXCSR_RXPKTRDY); i++) {
++			vl_push_data();
++			if (i < 63 && !(rd16(vl.musb, MUSB_RXCSR) & RXCSR_RXPKTRDY)) {
++				delay(5);       /* the host's next packet is usually right behind */
++			}
++		}
++		return;
++	}
+ 	uint32_t n = MIN((uint32_t)rd16(vl.musb, MUSB_RXCOUNT), (uint32_t)sizeof(vl.cmd) - 1);
+ 	vl_fifo_read(1, (uint8_t *)vl.cmd, n);
+ 	wr16(vl.musb, MUSB_RXCSR, 0);
+@@ -708,6 +1151,10 @@ vl_thread(void *arg __unused, wait_result_t wr __unused)
+ 		if ((tx & 1) || (vl.ep0 == EP0_IDLE && (rd16(vl.musb, MUSB_CSR0) & CSR0_RXPKTRDY))) {
+ 			vl_ep0();
+ 		}
++		vl_vivad_node();
++		if (vpush.active && vl_now_ms() - vpush.last_ms > VL_PUSH_IDLE_MS) {
++			vl_push_finish("no data for 10 s");
++		}
+ 		if (vl.configured) {
+ 			wr8(vl.musb, MUSB_INDEX, 1);
+ 			vl_rx();
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 90e68bb..e3b2fe5 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -9705,6 +9705,18 @@ renameat(__unused proc_t p, struct renameat_args *uap, __unused int32_t *retval)
+ 	           uap->tofd, uap->to, UIO_USERSPACE, 0);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* viva USB link "push" (bsd/dev/viva_usb.c): rename a file it wrote, as the kernel (replaces the target). */
++int viva_kern_rename(const char *from, const char *to);
++
++int
++viva_kern_rename(const char *from, const char *to)
++{
++	return renameat_internal(vfs_context_kernel(), AT_FDCWD, CAST_USER_ADDR_T(from), AT_FDCWD,
++	           CAST_USER_ADDR_T(to), UIO_SYSSPACE, 0);
++}
++#endif
++
+ /*
+  * Make a directory file.
+  *
+@@ -14579,3 +14591,17 @@ fs_snapshot(__unused proc_t p, struct fs_snapshot_args *uap,
+ 
+ 	return error;
+ }
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* viva USB link "push": create a directory as the kernel (EEXIST if it is there). */
++int viva_kern_mkdir(const char *path, int mode);
++
++int
++viva_kern_mkdir(const char *path, int mode)
++{
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & ACCESSPERMS);
++	return mkdir1at(vfs_context_kernel(), CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
++}
++#endif

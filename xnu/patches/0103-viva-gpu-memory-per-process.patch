@@ -1,0 +1,351 @@
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index d7dd372..cf5d47f 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -184,7 +184,8 @@
+ #define JOB_TIMEOUT_AFTER_FAULT_MS 500  /* fragment chains after a fault without reset (TTRX_3076 watch) */
+ #define TIMER_MS                250
+ #define HEAP_CHUNK              (2ull << 20)
+-#define GPU_MEMORY_LIMIT        (2048ll << 20)
++#define GPU_MEMORY_LIMIT        (2048ll << 20)  /* default of boot-arg vivagpumemtotal (MiB) */
++#define GPU_PROCESS_LIMIT       (1024ll << 20)  /* default of boot-arg vivagpumem (MiB, per process) */
+ 
+ /* ---- MFG (MediaTek) ---- */
+ 
+@@ -420,6 +421,9 @@ VivaGPUVM::create(VivaGPUAccelerator *g)
+ 	}
+ 	vm->gpu = g;
+ 	vm->asSlot = -1;
++	vm->pid = proc_selfpid();
++	proc_selfname(vm->proc, sizeof(vm->proc));
++	g->vmLink(vm);
+ 	vm->fPool = OSArray::withCapacity(4);
+ 	vm->fRangeCap = 64;
+ 	vm->fRanges = IONewZeroData(Range, vm->fRangeCap);
+@@ -433,11 +437,11 @@ VivaGPUVM::create(VivaGPUAccelerator *g)
+ void
+ VivaGPUVM::free(void)
+ {
+-	if (gpu != NULL && asSlot >= 0) {
+-		gpu->vmDestroyed(this);
++	if (gpu != NULL) {
++		gpu->vmDestroyed(this);         /* frees its AS, unlinks it */
+ 	}
+ 	if (fPool != NULL) {
+-		gpu->chargeMemory(-(int64_t)(fPool->getCount() * page_size));
++		gpu->chargeMemory(this, -(int64_t)(fPool->getCount() * page_size));
+ 	}
+ 	OSSafeReleaseNULL(fPool);
+ 	if (fRanges != NULL) {
+@@ -462,7 +466,7 @@ VivaGPUVM::newTable(void)
+ 			page->release();
+ 			return 0;
+ 		}
+-		if (fPoolCount == kPoolMax) {
++		if (fPoolCount == kPoolMax || !gpu->chargeMemory(this, page_size)) {
+ 			page->release();
+ 			return 0;
+ 		}
+@@ -473,7 +477,6 @@ VivaGPUVM::newTable(void)
+ 		fPoolCount++;
+ 		fPool->setObject(page);
+ 		page->release();
+-		gpu->chargeMemory(page_size);
+ 		fFreePA = pa;
+ 		fFreeLeft = (uint32_t)(page_size / GPU_PAGE);
+ 	}
+@@ -646,7 +649,7 @@ VivaGPUBO::free(void)
+ 		for (uint32_t i = 0; i < chunkCount; i++) {
+ 			if (chunks[i] != NULL) {
+ 				chunks[i]->release();
+-				vm->gpu->chargeMemory(-(int64_t)HEAP_CHUNK);
++				vm->gpu->chargeMemory(vm, -(int64_t)HEAP_CHUNK);
+ 			}
+ 		}
+ 		IODelete(chunks, IOBufferMemoryDescriptor *, chunkCount);
+@@ -656,13 +659,19 @@ VivaGPUBO::free(void)
+ 			memory->complete();
+ 		}
+ 		if (kind == kVivaBONormal && vm != NULL) {
+-			vm->gpu->chargeMemory(-(int64_t)vaSize);
++			vm->gpu->chargeMemory(vm, -(int64_t)vaSize);
++		}
++		if ((kind == kVivaBOSurface || kind == kVivaBOUser) && vm != NULL) {
++			vm->imported -= (int64_t)vaSize;
+ 		}
+ 		memory->release();
+ 	}
+ 	OSSafeReleaseNULL(kmap);
+ 	OSSafeReleaseNULL(surface);
+ 	OSSafeReleaseNULL(busy);
++	if (vm != NULL) {
++		vm->bos--;
++	}
+ 	OSSafeReleaseNULL(vm);
+ 	OSObject::free();
+ }
+@@ -680,20 +689,20 @@ VivaGPUBO::growHeap(uint64_t addr)
+ 	if (chunks[idx] != NULL) {
+ 		return true;            /* another unit faulted on it before the flush: already mapped */
+ 	}
+-	if (!vm->gpu->chargeMemory(HEAP_CHUNK)) {
++	if (!vm->gpu->chargeMemory(vm, HEAP_CHUNK)) {
+ 		return false;
+ 	}
+ 	uint64_t len = MIN(HEAP_CHUNK, vaSize - (uint64_t)idx * HEAP_CHUNK);
+ 	IOBufferMemoryDescriptor *c = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 	    kIODirectionInOut, len, page_size);         /* cacheable: see createBO; GPU-only afterwards */
+ 	if (c == NULL) {
+-		vm->gpu->chargeMemory(-(int64_t)HEAP_CHUNK);
++		vm->gpu->chargeMemory(vm, -(int64_t)HEAP_CHUNK);
+ 		return false;
+ 	}
+ 	cacheBuffer(c, 0, len, kVivaCacheFlush);
+ 	if (!vm->map(va + (uint64_t)idx * HEAP_CHUNK, c, 0, len, PTE_AP_UNPRIV | PTE_SH_IS | PTE_AF | PTE_NG | PTE_XN)) {
+ 		c->release();
+-		vm->gpu->chargeMemory(-(int64_t)HEAP_CHUNK);
++		vm->gpu->chargeMemory(vm, -(int64_t)HEAP_CHUNK);
+ 		return false;
+ 	}
+ 	chunks[idx] = c;
+@@ -739,6 +748,12 @@ VivaGPUAccelerator::start(IOService *provider)
+ 		return false;
+ 	}
+ 	fMode = mode;
++	int64_t mib = GPU_MEMORY_LIMIT >> 20;
++	PE_parse_boot_argn("vivagpumemtotal", &mib, sizeof(mib));
++	fMemLimit = mib << 20;
++	mib = GPU_PROCESS_LIMIT >> 20;
++	PE_parse_boot_argn("vivagpumem", &mib, sizeof(mib));
++	fProcLimit = mib << 20;
+ 	fProbeMode = 1;
+ 	PE_parse_boot_argn("vivagpuprobe", &fProbeMode, sizeof(fProbeMode));
+ 	fProbeLock = IOLockAlloc();
+@@ -884,16 +899,76 @@ VivaGPUAccelerator::newUserClient(task_t owningTask, void *securityID, UInt32 ty
+ 	return kIOReturnSuccess;
+ }
+ 
++/* Gated. */
++void
++VivaGPUAccelerator::vmLink(VivaGPUVM *vm)
++{
++	vm->nextVM = fVMs;
++	fVMs = vm;
++}
++
++/*
++ * Gated. Limits: all GPU memory (vivagpumemtotal, MiB, default 2048) and per process, summed over its connections
++ * (vivagpumem, MiB, default 1024). Refusals end as kIOReturnNoMemory for CREATE_BO, a failed map, or a heap that
++ * cannot grow (the chain fails), never a panic.
++ */
+ bool
+-VivaGPUAccelerator::chargeMemory(int64_t bytes)
++VivaGPUAccelerator::chargeMemory(VivaGPUVM *vm, int64_t bytes)
+ {
+-	if (bytes > 0 && fMemory + bytes > GPU_MEMORY_LIMIT) {
+-		return false;
++	if (bytes > 0) {
++		int64_t proc = 0;
++		for (VivaGPUVM *v = fVMs; v != NULL; v = v->nextVM) {
++			if (v->pid == vm->pid) {
++				proc += v->bytes;
++			}
++		}
++		if (fMemory + bytes > fMemLimit || proc + bytes > fProcLimit) {
++			if (fMemRefused++ < 16) {
++				IOLog("VIVA GPU: %s[%d] out of GPU memory: +%lld KiB refused (process %lld/%lld MiB, all %lld/%lld "
++				    "MiB)\n", vm->proc, vm->pid, bytes >> 10, proc >> 20, fProcLimit >> 20, fMemory >> 20,
++				    fMemLimit >> 20);
++			}
++			return false;
++		}
+ 	}
+ 	fMemory += bytes;
++	vm->bytes += bytes;
++	if (fMemory > fMemPeak) {
++		fMemPeak = fMemory;
++	}
+ 	return true;
+ }
+ 
++/* GPU memory per process (connections of one pid summed). */
++void
++VivaGPUAccelerator::memoryDump(char **out, char *end)
++{
++	say(out, end, "memory: %lld KiB (peak %lld KiB, limit %lld MiB, %lld MiB per process), %llu refusals\n",
++	    fMemory >> 10, fMemPeak >> 10, fMemLimit >> 20, fProcLimit >> 20, fMemRefused);
++	for (VivaGPUVM *v = fVMs; v != NULL; v = v->nextVM) {
++		bool seen = false;
++		for (VivaGPUVM *w = fVMs; w != v; w = w->nextVM) {
++			seen = seen || w->pid == v->pid;
++		}
++		if (seen) {
++			continue;
++		}
++		int64_t bytes = 0, imported = 0;
++		uint32_t conns = 0, bos = 0, faults = 0;
++		for (VivaGPUVM *w = v; w != NULL; w = w->nextVM) {
++			if (w->pid == v->pid) {
++				bytes += w->bytes;
++				imported += w->imported;
++				bos += w->bos;
++				faults += w->faults;
++				conns++;
++			}
++		}
++		say(out, end, "  %s[%d]: %lld KiB in %u BOs, %lld KiB imported, %u connection%s, %u MMU faults\n", v->proc,
++		    v->pid, bytes >> 10, bos, imported >> 10, conns, conns == 1 ? "" : "s", faults);
++	}
++}
++
+ /* ---- unknown user clients and property reads (K1: what IOGPU/QuartzCore/Metal ask for) ---- */
+ 
+ #define PROBE_LOG_MAX   48      /* log lines per client; "gpu probe" keeps counting */
+@@ -1723,6 +1798,12 @@ VivaGPUAccelerator::vmDestroyed(VivaGPUVM *vm)
+ 		if (fSelfVM == vm) {
+ 			fSelfVM = NULL;
+ 		}
++		for (VivaGPUVM **pp = &fVMs; *pp != NULL; pp = &(*pp)->nextVM) {
++			if (*pp == vm) {
++				*pp = vm->nextVM;
++				break;
++			}
++		}
+ 		return kIOReturnSuccess;
+ 	});
+ }
+@@ -2219,11 +2300,17 @@ VivaGPUAccelerator::selftest(bool fault, char **out, char *end)
+ 	}
+ 	bo->vm = fSelfVM;
+ 	fSelfVM->retain();
++	fSelfVM->bos++;
+ 	bo->kind = kVivaBONormal;
+ 	bo->memory = mem;
+ 	bo->cacheMaint = true;  /* written and read through the kernel's cacheable mapping */
+ 	bo->size = bo->vaSize = page_size;
+-	chargeMemory(page_size);
++	if (!chargeMemory(fSelfVM, page_size)) {
++		bo->vaSize = 0;
++		bo->release();
++		say(out, end, "selftest: over the GPU memory limit\n");
++		return;
++	}
+ 	bo->va = fSelfVM->allocVA(page_size, page_size);
+ 	if (bo->va == 0 || !fSelfVM->map(bo->va, mem, 0, page_size, PTE_AP_UNPRIV | PTE_SH_IS | PTE_AF | PTE_NG)) {
+ 		say(out, end, "selftest: cannot map\n");
+@@ -2333,12 +2420,13 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
+ 				}
+ 			}
+ 		} else {
+-			say(o, end, "gpu: %s, mode %d%s, id 0x%08x, memory %lld KiB\n", fPowered ? "on" : "off", fMode,
+-			    fPublished ? ", published" : "", fGpuId, fMemory >> 10);
++			say(o, end, "gpu: %s, mode %d%s, id 0x%08x\n", fPowered ? "on" : "off", fMode,
++			    fPublished ? ", published" : "", fGpuId);
+ 			say(o, end, "jobs %llu (running %d/%d, queued %d/%d), job faults %llu, MMU faults %llu (%llu without "
+ 			    "reset%s), heap grows %llu, GPU faults %llu, timeouts %llu, resets %llu\n", fJobs, fRunning[0] != NULL,
+ 			    fRunning[1] != NULL, fQueue[0] != NULL, fQueue[1] != NULL, fJobFaults, fMmuFaults, fFaultsNoReset,
+ 			    fWatchFragment ? ", watching fragment jobs" : "", fHeapGrows, fGpuFaults, fTimeouts, fResets);
++			memoryDump(o, end);
+ 			say(o, end, "usage: gpu [status|mfg|on|off|regs|selftest [fault]|probe|publish]\n");
+ 		}
+ 		return kIOReturnSuccess;
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+index 0bfb4ce..0e8a07e 100644
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -78,6 +78,13 @@ public:
+ 	uint64_t  lastUse;              /* LRU stamp for address-space eviction */
+ 	uint32_t  faults;
+ 	bool      asFaulted;            /* its AS was disabled by a fault: reprogram before the next job */
++	/* accounting ("gpu status", limits per process) */
++	int        pid;
++	char       proc[20];
++	int64_t    bytes;               /* GPU memory charged: BOs, heap chunks, page tables */
++	int64_t    imported;            /* IOSurface / user memory mapped (not charged) */
++	uint32_t   bos;
++	VivaGPUVM *nextVM;              /* the accelerator's list of live VMs */
+ 
+ private:
+ 	uint64_t *tableFor(uint64_t va, bool create);
+@@ -161,7 +168,9 @@ public:
+ 	VivaGPUBO *findHeapBO(VivaGPUVM *vm, uint64_t va);
+ 	void heapAdd(VivaGPUBO *bo);
+ 	void heapRemove(VivaGPUBO *bo);
+-	bool chargeMemory(int64_t bytes);       /* GPU memory accounting (false = over the limit) */
++	/* GPU memory accounting: false = over the per-process or global limit (nothing charged). */
++	bool chargeMemory(VivaGPUVM *vm, int64_t bytes);
++	void vmLink(VivaGPUVM *vm);
+ 
+ private:
+ 	/* MFG power (MediaTek) */
+@@ -230,6 +239,10 @@ private:
+ 	VivaGPUBO **fHeapList;              /* heap BOs (not retained), for GPU faults */
+ 	uint32_t    fHeapCount, fHeapCap;
+ 	int64_t     fMemory;                /* bytes of GPU memory allocated */
++	int64_t     fMemPeak, fMemLimit, fProcLimit;    /* boot-args vivagpumemtotal / vivagpumem (MiB) */
++	uint64_t    fMemRefused;
++	VivaGPUVM  *fVMs;                   /* live VMs (gated) */
++	void memoryDump(char **out, char *end);
+ 	VivaGPUVM  *fSelfVM;
+ 
+ 	/* counters */
+diff --git a/iokit/Kernel/arm/VivaGPUUserClient.cpp b/iokit/Kernel/arm/VivaGPUUserClient.cpp
+index c8e983b..7323500 100644
+--- a/iokit/Kernel/arm/VivaGPUUserClient.cpp
++++ b/iokit/Kernel/arm/VivaGPUUserClient.cpp
+@@ -454,6 +454,7 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
+ 		}
+ 		b->vm = fVM;
+ 		fVM->retain();
++		fVM->bos++;
+ 		b->flags = flags;
+ 		b->size = b->vaSize = size;
+ 		if (heap) {
+@@ -466,7 +467,7 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
+ 			}
+ 		} else {
+ 			b->kind = kVivaBONormal;
+-			if (!fGPU->chargeMemory((int64_t)size)) {
++			if (!fGPU->chargeMemory(fVM, (int64_t)size)) {
+ 				b->vaSize = 0;          /* nothing charged: free() must not refund */
+ 				b->release();
+ 				return kIOReturnNoMemory;
+@@ -474,7 +475,7 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
+ 			IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 			    kIODirectionInOut | kIOMemoryKernelUserShared, size, page_size);
+ 			if (mem == NULL) {
+-				fGPU->chargeMemory(-(int64_t)size);
++				fGPU->chargeMemory(fVM, -(int64_t)size);
+ 				b->vaSize = 0;
+ 				b->release();
+ 				return kIOReturnNoMemory;
+@@ -655,6 +656,7 @@ VivaGPUUserClient::importSurface(struct vgpu_import_iosurface *a)
+ 		}
+ 		b->vm = fVM;
+ 		fVM->retain();
++		fVM->bos++;
+ 		b->kind = kVivaBOSurface;
+ 		b->surface = s;
+ 		s->retain();
+@@ -663,6 +665,7 @@ VivaGPUUserClient::importSurface(struct vgpu_import_iosurface *a)
+ 		b->prepared = b->memory->prepare() == kIOReturnSuccess;
+ 		b->memOffset = mapStart;
+ 		b->size = b->vaSize = mapSize;
++		fVM->imported += (int64_t)mapSize;
+ 		b->cacheMaint = s->mapCache != kIOMapWriteCombineCache && s->mapCache != kIOMapInhibitCache;
+ 		b->va = fVM->allocVA(mapSize, mapSize >= HEAP_ALIGN ? HEAP_ALIGN : page_size);
+ 		b->gpuOffset = planeOff - mapStart;
+@@ -715,11 +718,13 @@ VivaGPUUserClient::importUser(struct vgpu_import_userptr *a)
+ 		}
+ 		b->vm = fVM;
+ 		fVM->retain();
++		fVM->bos++;
+ 		b->kind = kVivaBOUser;
+ 		b->memory = md;
+ 		md->retain();
+ 		b->prepared = true;
+ 		b->size = b->vaSize = a->size;
++		fVM->imported += (int64_t)a->size;
+ 		b->cacheMaint = true;
+ 		b->va = fVM->allocVA(a->size, a->size >= HEAP_ALIGN ? HEAP_ALIGN : page_size);
+ 		uint32_t h = 0;

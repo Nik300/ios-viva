@@ -207,6 +207,48 @@ reg = Mali, mfgcfg, SPM, topckgen, apmixed, infracfg_ao; SPI 274-276 GPU/MMU/JOB
   Next: userspace on the phone (`gpu/ios/build.sh` needs Xcode: test_vgpu with `gpu publish`, then the Metal bundle).
 - Not yet: DVFS, runtime power gating, IOSurface cache flush cost (whole surface per job), performance counters.
 
+Patches 0101-0109 (2026-11-03, written against CI run 41572312019's build tree, compile-checked with
+`tools/xnu-cc.py`, NOT built or tested yet): the userspace requests in `~/Developer/ios-viva/gpu/docs/RICHIESTE-KERNEL.md`.
+Build with `VIVA_EXTRA="cpus=6 vivausb=3 vivagpu=2"` (user request: vivagpu=2 from now on).
+- 0101 (K1) unknown user-client types on VivaGPUAccelerator get a `VivaGPUProbeClient` (boot-arg `vivagpuprobe=0`
+  refuses them as before): every selector/trap/memory type/notification logged (48 lines per client) and answered
+  kIOReturnUnsupported; userspace property reads of the accelerator logged once per (process, key) with
+  found/MISSING (hooks in IOUserClient.cpp). `gpu probe` lists both tables.
+- 0102 (K5) a bus fault (0x48) on a chain whose AS we just disabled for an MMU fault no longer resets the GPU; any
+  other bus fault still does (TTRX_3076). Until a fragment chain completes again, JS0 chains time out after 500 ms.
+  `gpu selftest fault` now also says "no reset".
+- 0103 (K8) GPU memory per process (connections of one pid summed): `vivagpumem` (MiB, default 1024) per process,
+  `vivagpumemtotal` (default 2048); over the limit CREATE_BO/heap growth/page tables fail with kIOReturnNoMemory.
+  `gpu status` lists processes (KiB, BOs, imported KiB, connections, MMU faults) and peak/refusals.
+- 0104 (K3) boot-arg `vivagpucache`: 1 (default) normal BOs get cache maintenance only once userspace maps them
+  (clientMemoryForType); IOSurface BOs are lazy: cleaned before a job only after a CPU write lock
+  (IOSurfaceLock/Unlock traps set `cpuDirty`), and after a job only marked `gpuDirty` (dropped at the next
+  IOSurfaceLock or before AppleCLCD copies them). **Contract: CPU access to an IOSurface the GPU uses must be inside
+  IOSurfaceLock/Unlock** (or the BO mapped through VivaGPUUserClient, which makes it eager). 0 = old behaviour.
+  `gpu status`: average submit time, maintenance time and KiB per submit/completion. The low-RAM aperture fix is
+  NOT done (needs a diagnosis on the phone: why kernel pages come from below 0xc0000000).
+- 0105 (K2) AppleCLCD converts 'w30r', 'w40a'/'w40m' (XR10, (v-384)/510, clamped) and 'l10r' to BGRA8 while copying;
+  every layer's format change is logged (`SWEET FB: layer N format ...`). tools/mkadt.py --viva also sets /product
+  artwork-display-gamut = "sRGB" (was the iPhone X's "P3"); MobileGestalt may keep a cached value.
+- 0106 (K6) IOSurface values: sel 9 SetValue ([value,key] or [dict] merge), 10 copy (descriptor out {len, gen, binary
+  dict}), 11 RemoveValue (empty key = all), 27 bulk attachments into state+0x30; generation (g+2)|1 at state+0x20,
+  serialized size (>= 1) at state+0x28. ABI confirmed from 20H392 IOSurface.framework disassembly.
+- 0107 (K4) vendor OPP table (gpufreq_v1/mt6781 segment 0; this phone's devinfo[69] bits 29:28 = 0): boot-arg
+  `vivagpufreq=MHz` (default 300, max 950), `vivagpumv` margin on VGPU (default 50, capped at 0.9 V), VSRAM >=
+  VGPU + 0.1 V; rails stepped 50 mV at a time; MFGPLL CON1 computed (300 MHz = 0x831713b1 as before). Runtime:
+  `gpu freq [MHz]`.
+- 0108 (K7) link: `push SIZE MODE FNV PATH` + raw data (file written to PATH.vivapush, renamed if FNV-1a matches,
+  parents created), `pull PATH` ('F' frames), `run ARGS..` / `vivad ps|kill ID|tests` through /dev/vivalink to the
+  userspace daemon `tools/vivad` (built by CI into the xnu-kernel artifact), its output as 'O' frames. Host:
+  `tools/viva-link.py push|pull|run`. Install once: pull /System/Library/xpc/launchd.plist,
+  `tools/viva-launchd-add.py` it, push it and vivad (/usr/libexec/vivad 755), reboot. vivad runs
+  /private/var/root/viva-tests/autorun/* at boot.
+- 0109 (K9) direct scanout, off by default (`vivascanout=1` or `disp scanout on`): display-sized BGRA surfaces are
+  allocated contiguous below 4 GiB; a swap with one full-screen such surface rewrites only ADDR/PITCH of LK's OVL
+  layer (found by its address), else LK's values are restored and the CPU copy runs. No vblank sync yet (tearing
+  possible). `disp regs` is a read-only dump of OVL0/OVL0_2L/larb ports: run it first (larb port bit 0 set would
+  mean the M4U translates: then scanout cannot work with physical addresses).
+
 Workflow notes:
 - Kernel patches are made against a local xnu-8796.141.3 tree with all
   `xnu/patches/*.patch` applied in order (`git apply`; 0031/0041 need the CI's HFS

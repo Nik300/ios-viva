@@ -1,0 +1,113 @@
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index c5e8400..d7dd372 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -181,6 +181,7 @@
+ 
+ #define JOB_TIMEOUT_MS          3000
+ #define JOB_STOP_GRACE_MS       500
++#define JOB_TIMEOUT_AFTER_FAULT_MS 500  /* fragment chains after a fault without reset (TTRX_3076 watch) */
+ #define TIMER_MS                250
+ #define HEAP_CHUNK              (2ull << 20)
+ #define GPU_MEMORY_LIMIT        (2048ll << 20)
+@@ -1923,6 +1924,7 @@ void
+ VivaGPUAccelerator::resetGPU(const char *why)
+ {
+ 	fResets++;
++	fWatchFragment = false;
+ 	IOLog("VIVA GPU: reset (%s)\n", why);
+ 	wr(JOB_INT_MASK, 0);
+ 	wr(MMU_INT_MASK, 0);
+@@ -2033,15 +2035,30 @@ VivaGPUAccelerator::jobInterrupt(OSObject *owner, IOInterruptEventSource *src __
+ 			uint32_t js = JS_BASE(slot);
+ 			uint32_t status = self->rd(js + JS_STATUS);
+ 			self->wr(js + JS_COMMAND_NEXT, JS_CMD_NOP);
++			/*
++			 * A bus fault right after we disabled the job's address space (MMU fault) is the expected way
++			 * that chain dies: no reset, the AS is reprogrammed for the VM's next job. TTRX_3076 (fragment
++			 * jobs hanging after a bus fault) is then left to the job timeout, shortened until a fragment
++			 * chain completes again. Any other bus fault still resets.
++			 */
++			bool asKilled = slot < 2 && self->fRunning[slot] != NULL && self->fRunning[slot]->vm->asFaulted;
+ 			if (slot < 2) {
+ 				self->completeJob(slot, kIOReturnIOError, status);
+ 			}
+ 			if ((status & 0xff) == 0x48) {
+-				self->wr(JOB_INT_CLEAR, stat & (done | fail));
+-				self->resetGPU("job bus fault (TTRX_3076: later fragment jobs may hang)");
+-				return;
++				if (asKilled) {
++					self->fFaultsNoReset++;
++					self->fWatchFragment = true;
++				} else {
++					self->wr(JOB_INT_CLEAR, stat & (done | fail));
++					self->resetGPU("job bus fault (TTRX_3076: later fragment jobs may hang)");
++					return;
++				}
+ 			}
+ 		} else if (slot < 2) {
++			if (slot == 0) {
++				self->fWatchFragment = false;
++			}
+ 			self->completeJob(slot, kIOReturnSuccess, 0x01);
+ 		}
+ 		self->wr(JOB_INT_CLEAR, stat & (done | fail));
+@@ -2076,7 +2093,8 @@ VivaGPUAccelerator::jobTimer(OSObject *owner, IOTimerEventSource *src __unused)
+ 			}
+ 			return;
+ 		}
+-		if (self->fStopDeadline[slot] == 0 && now - job->startMs > JOB_TIMEOUT_MS) {
++		uint64_t limit = (slot == 0 && self->fWatchFragment) ? JOB_TIMEOUT_AFTER_FAULT_MS : JOB_TIMEOUT_MS;
++		if (self->fStopDeadline[slot] == 0 && now - job->startMs > limit) {
+ 			self->fTimeouts++;
+ 			IOLog("VIVA GPU: job on slot %u timed out after %llu ms (chain 0x%llx head 0x%08x%08x), hard stop\n",
+ 			    slot, now - job->startMs, job->jc, self->rd(JS_BASE(slot) + JS_HEAD_HI),
+@@ -2227,7 +2245,7 @@ VivaGPUAccelerator::selftest(bool fault, char **out, char *end)
+ 
+ 	VivaGPUFence *fence = VivaGPUFence::create(false);
+ 	OSArray *bos = OSArray::withObjects((const OSObject **)&bo, 1);
+-	uint64_t t0 = nowMs(), mmu0 = fMmuFaults;
++	uint64_t t0 = nowMs(), mmu0 = fMmuFaults, resets0 = fResets;
+ 	IOReturn ret = (fence && bos) ? submit(fSelfVM, bo->va, 0, NULL, bos, fence) : kIOReturnNoMemory;
+ 	if (ret == kIOReturnSuccess) {
+ 		uint64_t deadline;
+@@ -2240,8 +2258,9 @@ VivaGPUAccelerator::selftest(bool fault, char **out, char *end)
+ 	    fence && fence->signalled ? "signalled" : "pending", fence ? fence->error : 0, exc & 0xff,
+ 	    jsStatusName(exc & 0xff), got, fault ? 0 : value, fMmuFaults - mmu0);
+ 	if (fault) {
+-		say(out, end, "selftest fault: %s\n", (fence && fence->signalled && fence->error != kIOReturnSuccess &&
+-		    fMmuFaults > mmu0) ? "PASS (fault caught, GPU still alive: run gpu selftest)" : "FAIL");
++		say(out, end, "selftest fault: %s, %s\n", (fence && fence->signalled && fence->error != kIOReturnSuccess &&
++		    fMmuFaults > mmu0) ? "PASS (fault caught, GPU still alive: run gpu selftest)" : "FAIL",
++		    fResets == resets0 ? "no reset" : "GPU was reset");
+ 	} else {
+ 		say(out, end, "selftest: %s\n", got == value ? "PASS" : "FAIL");
+ 	}
+@@ -2316,10 +2335,10 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
+ 		} else {
+ 			say(o, end, "gpu: %s, mode %d%s, id 0x%08x, memory %lld KiB\n", fPowered ? "on" : "off", fMode,
+ 			    fPublished ? ", published" : "", fGpuId, fMemory >> 10);
+-			say(o, end, "jobs %llu (running %d/%d, queued %d/%d), job faults %llu, MMU faults %llu, heap grows "
+-			    "%llu, GPU faults %llu, timeouts %llu, resets %llu\n", fJobs, fRunning[0] != NULL,
+-			    fRunning[1] != NULL, fQueue[0] != NULL, fQueue[1] != NULL, fJobFaults, fMmuFaults, fHeapGrows,
+-			    fGpuFaults, fTimeouts, fResets);
++			say(o, end, "jobs %llu (running %d/%d, queued %d/%d), job faults %llu, MMU faults %llu (%llu without "
++			    "reset%s), heap grows %llu, GPU faults %llu, timeouts %llu, resets %llu\n", fJobs, fRunning[0] != NULL,
++			    fRunning[1] != NULL, fQueue[0] != NULL, fQueue[1] != NULL, fJobFaults, fMmuFaults, fFaultsNoReset,
++			    fWatchFragment ? ", watching fragment jobs" : "", fHeapGrows, fGpuFaults, fTimeouts, fResets);
+ 			say(o, end, "usage: gpu [status|mfg|on|off|regs|selftest [fault]|probe|publish]\n");
+ 		}
+ 		return kIOReturnSuccess;
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+index 70d017a..0bfb4ce 100644
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -234,6 +234,8 @@ private:
+ 
+ 	/* counters */
+ 	uint64_t fJobs, fJobFaults, fMmuFaults, fGpuFaults, fResets, fTimeouts, fHeapGrows;
++	uint64_t fFaultsNoReset;            /* chains killed by an MMU fault without a GPU reset */
++	bool     fWatchFragment;            /* since then no fragment chain completed: short timeout on JS0 */
+ 
+ 	/* unknown user clients and property reads, for "gpu probe" (fProbeLock) */
+ 	IOLock *fProbeLock;

@@ -1,0 +1,400 @@
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index d481fa0..834bbac 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -13,8 +13,9 @@
+  *   MTCMOS    SPM MFG0..MFG3 (PWR_CON 0x308 + 4n, status bit 2 + n), MFG1
+  *             with the infracfg_ao bus protection;
+  *   mfgcfg    BG3D clock gate, async/global/Q-channel setup, timestamp.
+- * One fixed operating point for now (300 MHz, VGPU 0.65 V, VSRAM 0.85 V:
+- * OPP 48 of the table plus 50 mV), no DVFS.
++ * One operating point, chosen by boot-arg vivagpufreq (MHz, default 300;
++ * vendor table up to 950) or "gpu freq MHz" on the USB link, VGPU raised by
++ * vivagpumv (default 50 mV, capped at 0.9 V); no DVFS yet.
+  *
+  * Mali (job-manager Valhall), written from the register map of the
+  * architecture; behaviour as Panfrost expects it from Linux:
+@@ -46,6 +47,9 @@
+ #ifndef MIN
+ #define MIN(a, b) ((a) < (b) ? (a) : (b))
+ #endif
++#ifndef MAX
++#define MAX(a, b) ((a) > (b) ? (a) : (b))
++#endif
+ 
+ /* ---- Mali registers ---- */
+ 
+@@ -199,9 +203,6 @@
+ #define PMIC_VSRAM_DA_VOSEL     0x1be2  /* [14:8] */
+ #define PMIC_VSRAM_DA_EN        0x1be4  /* bit 0 */
+ #define UV(sel)                 (500000u + 6250u * (sel))
+-#define VGPU_SEL                0x18    /* 0.65 V */
+-#define VSRAM_SEL               0x38    /* 0.85 V */
+-#define MFGPLL_CON1_VALUE       0x831713b1u     /* 300 MHz: posdiv /8, PCW 2400 MHz / 26 MHz << 14 */
+ 
+ /* SPM 0x10006000 */
+ #define SPM_POWERON_CONFIG_EN   0x000
+@@ -259,6 +260,7 @@
+ enum { kMapMali, kMapMfgcfg, kMapSpm, kMapTopck, kMapApmixed, kMapInfra };
+ 
+ static VivaGPUAccelerator *gVivaGPU;
++static uint32_t oppForMHz(uint32_t mhz);
+ 
+ static inline uint32_t rd32(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
+ static inline void wr32(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; }
+@@ -749,6 +751,12 @@ VivaGPUAccelerator::start(IOService *provider)
+ 		return false;
+ 	}
+ 	fMode = mode;
++	uint32_t mhz = 300;
++	PE_parse_boot_argn("vivagpufreq", &mhz, sizeof(mhz));
++	fOpp = fClockOpp = oppForMHz(mhz);
++	fMarginMv = 50;
++	PE_parse_boot_argn("vivagpumv", &fMarginMv, sizeof(fMarginMv));
++	fMarginMv = MIN(MAX(fMarginMv, 0), 100);
+ 	fCacheMode = 1;
+ 	PE_parse_boot_argn("vivagpucache", &fCacheMode, sizeof(fCacheMode));
+ 	int64_t mib = GPU_MEMORY_LIMIT >> 20;
+@@ -1295,9 +1303,69 @@ VivaGPUAccelerator::regulatorSet(uint32_t enAddr, uint32_t voselAddr, uint32_t s
+ 	return fPwrap->writeRegulator(enAddr, 0x1, 1) == kIOReturnSuccess;
+ }
+ 
+-/* MFGPLL at 300 MHz, mfg_sel parked on mainpll_d5 while it changes (gpufreq's frequency switch). */
++/*
++ * Operating points: gpufreq_v1/mt6781 g_opp_table_segment_0 (frequency, VGPU and VSRAM_GPU in 10 uV). The
++ * segment is efuse 0x11cb05cc[29:28] (devinfo index 69): 0 on this phone (LK's atag,devinfo); segment 1 only
++ * adds 50 mV, which the default margin (vivagpumv) covers below ~560 MHz anyway.
++ */
++static const struct { uint32_t khz, vgpu, vsram; } gVivaOpp[] = {
++	{ 950000, 90000, 100000 }, { 940000, 89375, 99375 }, { 930000, 88750, 98750 }, { 920000, 88125, 98125 },
++	{ 910000, 87500, 97500 }, { 900000, 86875, 96875 }, { 890000, 86250, 96250 }, { 880000, 85625, 95625 },
++	{ 870000, 85000, 95000 }, { 860000, 84375, 94375 }, { 850000, 83750, 93750 }, { 840000, 83125, 93125 },
++	{ 830000, 82500, 92500 }, { 820000, 81875, 91875 }, { 810000, 81250, 91250 }, { 800000, 80625, 90625 },
++	{ 790000, 80000, 90000 }, { 775000, 79375, 89375 }, { 761000, 78750, 88750 }, { 746000, 78125, 88125 },
++	{ 732000, 77500, 87500 }, { 718000, 76875, 86875 }, { 703000, 76250, 86250 }, { 689000, 75625, 85625 },
++	{ 675000, 75000, 85000 }, { 660000, 74375, 85000 }, { 646000, 73750, 85000 }, { 631000, 73125, 85000 },
++	{ 617000, 72500, 85000 }, { 603000, 71875, 85000 }, { 588000, 71250, 85000 }, { 574000, 70625, 85000 },
++	{ 560000, 70000, 85000 }, { 543000, 69375, 85000 }, { 527000, 68750, 85000 }, { 511000, 68125, 85000 },
++	{ 495000, 67500, 85000 }, { 478000, 66875, 85000 }, { 462000, 66250, 85000 }, { 446000, 65625, 85000 },
++	{ 430000, 65000, 85000 }, { 413000, 64375, 85000 }, { 397000, 63750, 85000 }, { 381000, 63125, 85000 },
++	{ 365000, 62500, 85000 }, { 348000, 61875, 85000 }, { 332000, 61250, 85000 }, { 316000, 60625, 85000 },
++	{ 300000, 60000, 85000 },
++};
++#define OPP_COUNT       (sizeof(gVivaOpp) / sizeof(gVivaOpp[0]))
++#define SEL_OF(uv)      (((uv) - 500000u + 6249u) / 6250u)      /* round up */
++#define VGPU_SEL_MAX    0x40    /* 0.9 V: VivaPwrap's ceiling, = the top OPP */
++#define VSRAM_SEL_MAX   0x50    /* 1.0 V */
++#define VSRAM_SEL_MIN   0x38    /* 0.85 V */
++#define BUCK_DIFF_MIN   16      /* VSRAM - VGPU in steps: 100 mV .. 250 mV (gpufreq BUCK_DIFF_*) */
++#define BUCK_DIFF_MAX   40
++
++/* Highest OPP at or below `mhz` (the lowest one if none). */
++static uint32_t
++oppForMHz(uint32_t mhz)
++{
++	for (uint32_t i = 0; i < OPP_COUNT; i++) {
++		if (gVivaOpp[i].khz <= mhz * 1000) {
++			return i;
++		}
++	}
++	return OPP_COUNT - 1;
++}
++
++/* Rail settings of an OPP: VGPU + margin (vivagpumv), VSRAM >= VGPU + 0.1 V, within the PMIC ceilings. */
+ void
+-VivaGPUAccelerator::mfgClock(char **out, char *end)
++VivaGPUAccelerator::oppSels(uint32_t opp, uint32_t *vg, uint32_t *vs)
++{
++	uint32_t g = SEL_OF(gVivaOpp[opp].vgpu * 10 + (uint32_t)fMarginMv * 1000), v = SEL_OF(gVivaOpp[opp].vsram * 10);
++	g = MIN(g, (uint32_t)VGPU_SEL_MAX);
++	v = MIN(MAX(MAX(v, g + BUCK_DIFF_MIN), (uint32_t)VSRAM_SEL_MIN), (uint32_t)VSRAM_SEL_MAX);
++	*vg = g;
++	*vs = v;
++}
++
++/* MFGPLL CON1 for a frequency (gpufreq: posdiv /8 below 375 MHz else /4, DDS from 26 MHz, PCW_CHG). */
++static uint32_t
++mfgpllCon1(uint32_t khz)
++{
++	uint32_t posdiv = khz < 375000 ? 3 : 2;
++	uint32_t dds = (uint32_t)(((((uint64_t)(khz / 100) << posdiv) << 14) / 26 + 5) / 10);
++	return 0x80000000u | posdiv << 24 | dds;
++}
++
++/* MFGPLL to the OPP's frequency, mfg_sel parked on mainpll_d5 while it changes (gpufreq's frequency switch). */
++void
++VivaGPUAccelerator::mfgClock(uint32_t opp, char **out, char *end)
+ {
+ 	uint32_t cfg = rd32(fTopck, CK_CFG_0);
+ 	if (rd32(fApmixed, PLL_MFG_CON0) & 1) {
+@@ -1312,7 +1380,7 @@ VivaGPUAccelerator::mfgClock(char **out, char *end)
+ 	}
+ 	clr32(fApmixed, PLL_MFG_PWR_CON0, 1u << 1);
+ 	IODelay(1);
+-	wr32(fApmixed, PLL_MFG_CON1, MFGPLL_CON1_VALUE);
++	wr32(fApmixed, PLL_MFG_CON1, mfgpllCon1(gVivaOpp[opp].khz));
+ 	set32(fApmixed, PLL_MFG_CON0, 1u << 0);
+ 	IODelay(20);
+ 	if (cfg & CK_MFG_PDN) {
+@@ -1322,61 +1390,144 @@ VivaGPUAccelerator::mfgClock(char **out, char *end)
+ 	wr32(fTopck, CK_CFG_0_SET, CK_MFG_MFGPLL << CK_MFG_SEL_SHIFT);
+ 	wr32(fTopck, CK_CFG_UPDATE, CK_CFG_UPDATE_MFG);
+ 	IODelay(20);
+-	say(out, end, "clock: mfgpll con0 0x%08x con1 0x%08x pwr 0x%08x, clk_cfg_0 0x%08x (was 0x%08x)\n",
+-	    rd32(fApmixed, PLL_MFG_CON0), rd32(fApmixed, PLL_MFG_CON1), rd32(fApmixed, PLL_MFG_PWR_CON0),
+-	    rd32(fTopck, CK_CFG_0), cfg);
++	fClockOpp = opp;
++	say(out, end, "clock: %u MHz, mfgpll con0 0x%08x con1 0x%08x pwr 0x%08x, clk_cfg_0 0x%08x (was 0x%08x)\n",
++	    gVivaOpp[opp].khz / 1000, rd32(fApmixed, PLL_MFG_CON0), rd32(fApmixed, PLL_MFG_CON1),
++	    rd32(fApmixed, PLL_MFG_PWR_CON0), rd32(fTopck, CK_CFG_0), cfg);
++}
++
++/* Current rail state from the PMIC's DA (actual) registers. */
++void
++VivaGPUAccelerator::railsRead(uint32_t *vgEn, uint32_t *vg, uint32_t *vsEn, uint32_t *vs)
++{
++	*vgEn = *vg = *vsEn = *vs = 0;
++	fPwrap->readPMIC(PMIC_VGPU_DA_EN, vgEn);
++	fPwrap->readPMIC(PMIC_VGPU_DA_VOSEL, vg);
++	fPwrap->readPMIC(PMIC_VSRAM_DA_EN, vsEn);
++	fPwrap->readPMIC(PMIC_VSRAM_DA_VOSEL, vs);
++	*vgEn &= 1;
++	*vsEn &= 1;
++	*vg &= 0x7f;
++	*vs = (*vs >> 8) & 0x7f;
++}
++
++/*
++ * Rails to (tvg, tvs) in steps of at most 50 mV, keeping VSRAM - VGPU within 100..250 mV where the start allows
++ * it (gpufreq steps through intermediate OPPs for the same reason): raising moves VSRAM first, lowering VGPU
++ * first. A rail that is off is first enabled straight at its target, VSRAM before VGPU.
++ */
++bool
++VivaGPUAccelerator::railsTo(uint32_t tvg, uint32_t tvs)
++{
++	uint32_t vgEn, vg, vsEn, vs;
++	railsRead(&vgEn, &vg, &vsEn, &vs);
++	bool ok = true;
++	if (!vsEn) {
++		ok = regulatorSet(PMIC_VSRAM_EN, PMIC_VSRAM_VOSEL, tvs);
++		IODelay(300);           /* 240 us enable ramp + settle */
++		vs = tvs;
++	}
++	if (ok && !vgEn) {
++		ok = regulatorSet(PMIC_VGPU_EN, PMIC_VGPU_VOSEL, tvg);
++		IODelay(300);           /* 200 us enable ramp + settle */
++		vg = tvg;
++	}
++	for (int guard = 0; ok && guard < 64 && (vg != tvg || vs != tvs); guard++) {
++		if (vg < tvg) {
++			uint32_t nvg = MIN(tvg, vg + 8);
++			if (vs < nvg + BUCK_DIFF_MIN) {
++				uint32_t nvs = MIN(MIN(MAX(tvs, nvg + BUCK_DIFF_MIN), vg + BUCK_DIFF_MAX), (uint32_t)VSRAM_SEL_MAX);
++				ok = fPwrap->writeRegulator(PMIC_VSRAM_VOSEL, 0x7f, nvs) == kIOReturnSuccess;
++				vs = nvs;
++				IODelay(100);
++				if (vs < nvg + BUCK_DIFF_MIN) {
++					nvg = vs > BUCK_DIFF_MIN ? MAX(vs - BUCK_DIFF_MIN, vg) : vg;
++				}
++			}
++			ok = ok && fPwrap->writeRegulator(PMIC_VGPU_VOSEL, 0x7f, nvg) == kIOReturnSuccess;
++			vg = nvg;
++		} else if (vg > tvg) {
++			uint32_t nvg = vg - MIN(vg - tvg, 8u);
++			ok = fPwrap->writeRegulator(PMIC_VGPU_VOSEL, 0x7f, nvg) == kIOReturnSuccess;
++			vg = nvg;
++			uint32_t nvs = MAX(MAX(tvs, nvg + BUCK_DIFF_MIN), (uint32_t)VSRAM_SEL_MIN);
++			if (ok && nvs < vs) {
++				IODelay(100);
++				ok = fPwrap->writeRegulator(PMIC_VSRAM_VOSEL, 0x7f, nvs) == kIOReturnSuccess;
++				vs = nvs;
++			}
++		} else {
++			ok = fPwrap->writeRegulator(PMIC_VSRAM_VOSEL, 0x7f, tvs) == kIOReturnSuccess;
++			vs = tvs;
++		}
++		IODelay(100);           /* 8 steps x 2 us + 52 us (gpufreq settle time), rounded up */
++	}
++	return ok && vg == tvg && vs == tvs;
++}
++
++/*
++ * Gated: switch the running GPU to another OPP (raising: voltage then clock; lowering: clock then voltage).
++ * Jobs keep running; while the PLL relocks the GPU runs from mainpll_d5 (218 MHz).
++ */
++IOReturn
++VivaGPUAccelerator::setOpp(uint32_t opp, char **out, char *end)
++{
++	if (opp >= OPP_COUNT) {
++		return kIOReturnBadArgument;
++	}
++	fOpp = opp;
++	if (!fPowered) {
++		say(out, end, "OPP %u MHz from the next power on\n", gVivaOpp[opp].khz / 1000);
++		return kIOReturnSuccess;
++	}
++	uint32_t tvg, tvs, vgEn, vg, vsEn, vs;
++	oppSels(opp, &tvg, &tvs);
++	bool up = gVivaOpp[opp].khz > gVivaOpp[fClockOpp].khz;
++	if (!up) {
++		mfgClock(opp, out, end);
++	}
++	bool ok = railsTo(tvg, tvs);
++	if (up) {
++		if (ok) {
++			mfgClock(opp, out, end);
++		} else {
++			say(out, end, "rails did not reach the OPP: clock left at %u MHz\n", gVivaOpp[fClockOpp].khz / 1000);
++		}
++	}
++	railsRead(&vgEn, &vg, &vsEn, &vs);
++	say(out, end, "OPP %u MHz: vgpu %u uV, vsram_gpu %u uV%s\n", gVivaOpp[fClockOpp].khz / 1000, UV(vg), UV(vs),
++	    ok ? "" : " (PMIC write refused or failed)");
++	return ok ? kIOReturnSuccess : kIOReturnError;
+ }
+ 
+ bool
+ VivaGPUAccelerator::mfgOn(char **out, char *end)
+ {
+-	uint32_t vgEn = 0, vgSel = 0, vsEn = 0, vsSel = 0;
+-	fPwrap->readPMIC(PMIC_VGPU_DA_EN, &vgEn);
+-	fPwrap->readPMIC(PMIC_VGPU_DA_VOSEL, &vgSel);
+-	fPwrap->readPMIC(PMIC_VSRAM_DA_EN, &vsEn);
+-	fPwrap->readPMIC(PMIC_VSRAM_DA_VOSEL, &vsSel);
+-	vgEn &= 1;
+-	vsEn &= 1;
+-	vgSel &= 0x7f;
+-	vsSel = (vsSel >> 8) & 0x7f;
++	uint32_t vgEn, vgSel, vsEn, vsSel, tvg, tvs;
++	railsRead(&vgEn, &vgSel, &vsEn, &vsSel);
+ 	say(out, end, "rails before: vgpu %s %u uV, vsram_gpu %s %u uV\n", vgEn ? "on" : "off", UV(vgSel),
+ 	    vsEn ? "on" : "off", UV(vsSel));
+ 
+ 	/*
+-	 * Lowering (the preloader left the rails higher): clock down first, then VGPU, then VSRAM.
+-	 * Raising: VSRAM, VGPU, then the clock. VSRAM >= VGPU + 0.1 V throughout.
++	 * OPP fOpp (vivagpufreq). Lowering (the preloader leaves 0.9 V / 1.0 V at its own frequency): clock down
++	 * first, then the rails. Raising: rails, then the clock.
+ 	 */
+-	bool ok, lowering = vgEn && vgSel > VGPU_SEL;
++	oppSels(fOpp, &tvg, &tvs);
++	bool lowering = vgEn && vgSel > tvg;
+ 	if (lowering) {
+-		mfgClock(out, end);
++		mfgClock(fOpp, out, end);
+ 	}
+-	if (lowering) {
+-		ok = regulatorSet(PMIC_VGPU_EN, PMIC_VGPU_VOSEL, VGPU_SEL);
+-		IODelay(300);
+-		ok = ok && regulatorSet(PMIC_VSRAM_EN, PMIC_VSRAM_VOSEL, VSRAM_SEL);
+-		IODelay(300);
+-	} else {
+-		ok = regulatorSet(PMIC_VSRAM_EN, PMIC_VSRAM_VOSEL, VSRAM_SEL);
+-		IODelay(300);       /* 240 us enable ramp + settle */
+-		ok = ok && regulatorSet(PMIC_VGPU_EN, PMIC_VGPU_VOSEL, VGPU_SEL);
+-		IODelay(300);       /* 200 us enable ramp + settle */
+-	}
+-	fPwrap->readPMIC(PMIC_VGPU_DA_EN, &vgEn);
+-	fPwrap->readPMIC(PMIC_VGPU_DA_VOSEL, &vgSel);
+-	fPwrap->readPMIC(PMIC_VSRAM_DA_EN, &vsEn);
+-	fPwrap->readPMIC(PMIC_VSRAM_DA_VOSEL, &vsSel);
+-	vgEn &= 1;
+-	vsEn &= 1;
+-	vgSel &= 0x7f;
+-	vsSel = (vsSel >> 8) & 0x7f;
+-	say(out, end, "rails: vgpu %s %u uV, vsram_gpu %s %u uV%s\n", vgEn ? "on" : "off", UV(vgSel),
+-	    vsEn ? "on" : "off", UV(vsSel), ok ? "" : " (PMIC write refused or failed)");
++	bool ok = railsTo(tvg, tvs);
++	railsRead(&vgEn, &vgSel, &vsEn, &vsSel);
++	say(out, end, "rails: vgpu %s %u uV, vsram_gpu %s %u uV (OPP %u MHz, margin %d mV)%s\n", vgEn ? "on" : "off",
++	    UV(vgSel), vsEn ? "on" : "off", UV(vsSel), gVivaOpp[fOpp].khz / 1000, fMarginMv,
++	    ok ? "" : " (PMIC write refused or failed)");
+ 	if (!ok || !vgEn || !vsEn) {
+ 		return false;
+ 	}
+ 
+ 	if (!lowering) {
+-		mfgClock(out, end);     /* raising: voltage first, then the clock */
++		mfgClock(fOpp, out, end);       /* raising: voltage first, then the clock */
+ 	}
+ 
+ 	/* power domains MFG0 -> MFG3 */
+@@ -2409,7 +2560,7 @@ VivaGPUAccelerator::selftest(bool fault, char **out, char *end)
+ 	bo->release();
+ }
+ 
+-/* ---- USB link: "gpu [status|mfg|on|off|regs|selftest [fault]|probe|publish]" ---- */
++/* ---- USB link: "gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish]" ---- */
+ 
+ void
+ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
+@@ -2430,6 +2581,23 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
+ 			powerOff(o, end);
+ 		} else if (strncmp(args, "selftest", 8) == 0) {
+ 			selftest(strncmp(args, "selftest fault", 14) == 0, o, end);
++		} else if (strncmp(args, "freq", 4) == 0) {
++			const char *a = args + 4;
++			while (*a == ' ') {
++				a++;
++			}
++			if (*a >= '0' && *a <= '9') {
++				setOpp(oppForMHz((uint32_t)strtoul(a, NULL, 10)), o, end);
++			} else {
++				uint32_t tvg, tvs;
++				oppSels(fOpp, &tvg, &tvs);
++				say(o, end, "OPP %u MHz (clock %u MHz), vgpu %u uV vsram_gpu %u uV, margin %d mV; table (MHz):",
++				    gVivaOpp[fOpp].khz / 1000, gVivaOpp[fClockOpp].khz / 1000, UV(tvg), UV(tvs), fMarginMv);
++				for (uint32_t i = 0; i < OPP_COUNT; i++) {
++					say(o, end, " %u", gVivaOpp[i].khz / 1000);
++				}
++				say(o, end, "\n");
++			}
+ 		} else if (strncmp(args, "probe", 5) == 0) {
+ 			probeDump(o, end);
+ 		} else if (strncmp(args, "publish", 7) == 0) {
+@@ -2470,15 +2638,15 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
+ 				}
+ 			}
+ 		} else {
+-			say(o, end, "gpu: %s, mode %d%s, id 0x%08x\n", fPowered ? "on" : "off", fMode,
+-			    fPublished ? ", published" : "", fGpuId);
++			say(o, end, "gpu: %s, mode %d%s, id 0x%08x, OPP %u MHz\n", fPowered ? "on" : "off", fMode,
++			    fPublished ? ", published" : "", fGpuId, gVivaOpp[fPowered ? fClockOpp : fOpp].khz / 1000);
+ 			say(o, end, "jobs %llu (running %d/%d, queued %d/%d), job faults %llu, MMU faults %llu (%llu without "
+ 			    "reset%s), heap grows %llu, GPU faults %llu, timeouts %llu, resets %llu\n", fJobs, fRunning[0] != NULL,
+ 			    fRunning[1] != NULL, fQueue[0] != NULL, fQueue[1] != NULL, fJobFaults, fMmuFaults, fFaultsNoReset,
+ 			    fWatchFragment ? ", watching fragment jobs" : "", fHeapGrows, fGpuFaults, fTimeouts, fResets);
+ 			memoryDump(o, end);
+ 			cacheStats(o, end);
+-			say(o, end, "usage: gpu [status|mfg|on|off|regs|selftest [fault]|probe|publish]\n");
++			say(o, end, "usage: gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish]\n");
+ 		}
+ 		return kIOReturnSuccess;
+ 	});
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+index fead536..517a0dc 100644
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -182,7 +182,11 @@ private:
+ 	bool regulatorSet(uint32_t enAddr, uint32_t voselAddr, uint32_t sel);
+ 	bool mtcmosOn(uint32_t idx, char **out, char *end);
+ 	bool mtcmosOff(uint32_t idx, char **out, char *end);
+-	void mfgClock(char **out, char *end);
++	void mfgClock(uint32_t opp, char **out, char *end);
++	void oppSels(uint32_t opp, uint32_t *vgpuSel, uint32_t *vsramSel);
++	void railsRead(uint32_t *vgEn, uint32_t *vg, uint32_t *vsEn, uint32_t *vs);
++	bool railsTo(uint32_t vgpuSel, uint32_t vsramSel);
++	IOReturn setOpp(uint32_t opp, char **out, char *end);
+ 	void protRelease(int from = 3);
+ 	/* Mali */
+ 	bool maliInit(char **out, char *end);
+@@ -221,6 +225,9 @@ private:
+ 	vm_offset_t             fMali, fMfgcfg, fSpm, fTopck, fApmixed, fInfra;
+ 	VivaPwrap              *fPwrap;
+ 	int                     fMode;          /* vivagpu boot-arg */
++	uint32_t                fOpp;           /* OPP index (gVivaOpp) for the next power on / "gpu freq" */
++	uint32_t                fClockOpp;      /* OPP the MFGPLL runs at */
++	int                     fMarginMv;      /* vivagpumv: added to the table's VGPU */
+ 	bool                    fPowered, fPublished, fAcpDone, fTimerArmed;
+ 	char                    fFenceEvent;
+ 
