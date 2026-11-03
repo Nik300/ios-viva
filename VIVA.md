@@ -259,6 +259,28 @@ scheduler does not prefer the A76s (AMP/P-E clusters = `__ARM_AMP__`, a much lar
 `SWEET CPU: cpu=6 PSCI CPU_ON rc=N` (firmware refused) or `NOT alive after 5s` (entry/MMU/GIC); fall back
 with `VIVA_EXTRA="cpus=6 vivausb=3 vivagpu=2"`.
 
+Patches 0111-0113 (2026-11-03, GPU rendering in pieces + quiet screen; NOT tested on the phone yet):
+- Symptom (link-gpu8.log, 0109-quiet): SpringBoard/backboardd frames with whole tiles black or holding old pixels.
+  Each one is a fragment chain killed by a GPU MMU read fault (status 0x48 after `MMU fault ... translation fault,
+  read access`): the tiles after the fault are never written. Faulting addresses were unmapped VAs (0x16603900,
+  0x3e1f3980, ...) and plain garbage (0xffffe61e3800, outside Panfrost's 4 GiB range): job descriptors with stale
+  pointers.
+- Cause: after every job the kernel dropped the CPU lines of each CPU-mapped BO with `dc ivac`. Mesa keeps writing
+  other parts of the same pool BOs (descriptors for the next draws) while a job runs; `ivac` throws those dirty
+  lines away, so the GPU later reads whatever was in DRAM. **0111**: clean + invalidate (`dc civac`) everywhere,
+  plain invalidate removed from the driver; SYNC_BO maps its types explicitly. MMU fault lines now say what the
+  address is: `inside live VA [..) PTE ..` (kernel mapping bug), `in VA [..) freed N ms ago` (userspace used a
+  closed BO), `outside the VA range (bad pointer)` or `not allocated`, plus the process. `vivagpucache=2`
+  (diagnosis): every CPU-maintained BO of the connection is cleaned with every job, listed in bo_handles or not.
+- **The "physical aperture" diagnosis of 0100 was wrong.** XNU RAM is 0xc0000000-0x1be000000 as configured;
+  `illegal PA 0x6860c000` was 0x16860c000 cut to 32 bits by `pmap_sync_page_attributes_phys` (`pp << PAGE_SHIFT`
+  on a 32-bit ppnum_t; Apple's coherent-IO SoCs never reach it). **0112** uses ptoa(). Write-combined / uncached
+  mappings (any driver) should work now; the GPU BOs stay cacheable with kernel maintenance for the moment.
+- **0113** quiet screen: the on-screen text is the `fbcon` pseudo-serial (serial=3), which also gets every
+  kprintf directly, so `sweetfb_noconsole=1` (mute from AppleCLCD's first present = the boot Apple) left text
+  coming. fbcon now honours the mute too (a panic still draws). viva-mkboot.sh adds `sweetfb_noconsole=1` by
+  default; link `console on|off` toggles it live; the link log is unaffected.
+
 Workflow notes:
 - Kernel patches are made against a local xnu-8796.141.3 tree with all
   `xnu/patches/*.patch` applied in order (`git apply`; 0031/0041 need the CI's HFS

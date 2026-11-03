@@ -1,0 +1,193 @@
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index 2ae1790..649164e 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -308,9 +308,9 @@ nowMs(void)
+ }
+ 
+ /*
+- * CPU cache maintenance (to PoC) by kernel virtual address. Always through a kernel mapping of the buffer:
+- * on this port the physical aperture (phystokv) only covers RAM from 0xc0000000, and kernel allocations
+- * come from below it too.
++ * CPU cache maintenance (to PoC) by kernel virtual address, always through a kernel mapping of the buffer.
++ * (The "illegal PA 0x6860c000" panics that led here were 0x16860c000 truncated to 32 bits by XNU's
++ * pmap_sync_page_attributes_phys, fixed in 0112; kernel mappings stay the simpler path anyway.)
+  */
+ static void
+ cacheVA(const void *p, uint64_t len, int op)
+@@ -319,8 +319,6 @@ cacheVA(const void *p, uint64_t len, int op)
+ 	for (uintptr_t line = (uintptr_t)p & ~(uintptr_t)63; line < end; line += 64) {
+ 		if (op == kVivaCacheFlush) {
+ 			__asm__ volatile ("dc civac, %0" : : "r"(line) : "memory");
+-		} else if (op == kVivaCacheInvalidate) {
+-			__asm__ volatile ("dc ivac, %0" : : "r"(line) : "memory");
+ 		} else {
+ 			__asm__ volatile ("dc cvac, %0" : : "r"(line) : "memory");
+ 		}
+@@ -626,6 +624,10 @@ VivaGPUVM::freeVA(uint64_t va)
+ {
+ 	for (uint32_t i = 0; i < fRangeCount; i++) {
+ 		if (fRanges[i].start == va) {
++			Freed *f = &fFreed[fFreedNext++ % kFreedMax];
++			f->start = fRanges[i].start;
++			f->end = fRanges[i].end;
++			f->ms = nowMs();
+ 			bcopy(&fRanges[i + 1], &fRanges[i], (fRangeCount - i - 1) * sizeof(Range));
+ 			fRangeCount--;
+ 			return;
+@@ -633,6 +635,32 @@ VivaGPUVM::freeVA(uint64_t va)
+ 	}
+ }
+ 
++void
++VivaGPUVM::describe(uint64_t addr, char *buf, size_t len)
++{
++	for (uint32_t i = 0; i < fRangeCount; i++) {
++		if (addr >= fRanges[i].start && addr < fRanges[i].end) {
++			uint64_t *l3 = tableFor(addr, false);
++			snprintf(buf, len, "inside live VA [0x%llx, 0x%llx), PTE 0x%llx", fRanges[i].start, fRanges[i].end,
++			    l3 != NULL ? l3[(uint32_t)(addr >> 12) & 511] : 0);
++			return;
++		}
++	}
++	uint64_t now = nowMs();
++	for (uint32_t n = 0; n < kFreedMax && n < fFreedNext; n++) {
++		const Freed *f = &fFreed[(fFreedNext - 1 - n) % kFreedMax];
++		if (addr >= f->start && addr < f->end) {
++			snprintf(buf, len, "in VA [0x%llx, 0x%llx) freed %llu ms ago", f->start, f->end, now - f->ms);
++			return;
++		}
++	}
++	if (addr < VGPU_VA_START || addr >= VGPU_VA_END) {
++		snprintf(buf, len, "outside the VA range (bad pointer)");
++	} else {
++		snprintf(buf, len, "not allocated (none of the last %u frees)", MIN(fFreedNext, (uint32_t)kFreedMax));
++	}
++}
++
+ /* ---- buffer objects ---- */
+ 
+ OSDefineMetaClassAndStructors(VivaGPUBO, OSObject);
+@@ -2159,7 +2187,8 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status)
+ 	for (unsigned int i = 0; job->bos != NULL && i < job->bos->getCount(); i++) {
+ 		VivaGPUBO *bo = (VivaGPUBO *)job->bos->getObject(i);
+ 		if (bo->cacheMaint) {
+-			bytes += bo->cacheOp(0, 0, kVivaCacheInvalidate);       /* drop CPU lines: the CPU sees what the GPU wrote */
++			/* drop stale CPU lines so the CPU sees what the GPU wrote; civac keeps lines the CPU dirtied meanwhile */
++			bytes += bo->cacheOp(0, 0, kVivaCacheFlush);
+ 		} else if (bo->lazySurface) {
+ 			sweet_surface_device_wrote(bo->surface);                /* dropped at the next IOSurfaceLock */
+ 		}
+@@ -2281,10 +2310,15 @@ VivaGPUAccelerator::mmuInterrupt(OSObject *owner, IOInterruptEventSource *src __
+ 				vm->faults++;
+ 			}
+ 			if (self->fMmuFaults <= 32) {
+-				IOLog("VIVA GPU: MMU %s on AS%u at 0x%llx: status 0x%08x (%s, %s access, source 0x%04x)\n",
++				char what[96] = "no VM";
++				if (vm != NULL) {
++					vm->describe(addr, what, sizeof(what));
++				}
++				IOLog("VIVA GPU: MMU %s on AS%u at 0x%llx: status 0x%08x (%s, %s access, source 0x%04x), %s%s%s\n",
+ 				    (bits & (1u << as)) ? "fault" : "bus error", as, addr, fs, jsStatusName(fs & 0xff),
+ 				    ((fs >> 8) & 3) == 1 ? "execute" : ((fs >> 8) & 3) == 2 ? "read" :
+-				    ((fs >> 8) & 3) == 3 ? "write" : "atomic", fs >> 16);
++				    ((fs >> 8) & 3) == 3 ? "write" : "atomic", fs >> 16, what, vm != NULL ? ", " : "",
++				    vm != NULL ? vm->proc : "");
+ 			}
+ 			/*
+ 			 * Kill the address space: the job on it fails. The slot stays owned by the VM (not handed to
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+index 517a0dc..ce5dd59 100644
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -35,8 +35,12 @@
+ 
+ class VivaPwrap;
+ 
+-/* CPU cache maintenance (to PoC): before the GPU reads (clean/flush), after it wrote (invalidate). */
+-enum { kVivaCacheClean, kVivaCacheFlush, kVivaCacheInvalidate };
++/*
++ * CPU cache maintenance (to PoC): clean (dc cvac) or flush = clean + invalidate (dc civac), before the GPU reads
++ * and after it wrote. No plain invalidate (dc ivac): userspace keeps writing other parts of a BO while a job that
++ * uses it runs, and dropping those dirty lines loses its writes (stale job descriptors: GPU faults, missing tiles).
++ */
++enum { kVivaCacheClean, kVivaCacheFlush };
+ void cacheBuffer(IOBufferMemoryDescriptor *md, uint64_t offset, uint64_t len, int op);
+ class VivaGPUAccelerator;
+ class SweetSurface;
+@@ -70,6 +74,8 @@ public:
+ 	void unmap(uint64_t va, uint64_t size);
+ 	/* Leaf attributes for ordinary GPU memory (read/write, GPU-cacheable), executable or not. */
+ 	static uint64_t leafAttrs(bool exec);
++	/* MMU fault report: what `addr` is (live BO and its PTE, VA freed lately, outside the range). Gated. */
++	void describe(uint64_t addr, char *buf, size_t len);
+ 
+ 	VivaGPUAccelerator *gpu;
+ 	uint64_t  rootPA;               /* level 0 table */
+@@ -100,6 +106,10 @@ private:
+ 	struct Range { uint64_t start, end; };
+ 	Range    *fRanges;              /* allocated VA, sorted */
+ 	uint32_t  fRangeCount, fRangeCap;
++	struct Freed { uint64_t start, end, ms; };
++	enum { kFreedMax = 64 };
++	Freed     fFreed[kFreedMax];    /* last VA ranges freed (ring), for describe() */
++	uint32_t  fFreedNext;
+ };
+ 
+ enum VivaGPUBOKind { kVivaBONormal, kVivaBOHeap, kVivaBOSurface, kVivaBOUser };
+@@ -256,7 +266,10 @@ private:
+ 
+ 	/* counters */
+ 	uint64_t fJobs, fJobFaults, fMmuFaults, fGpuFaults, fResets, fTimeouts, fHeapGrows;
+-	/* CPU cache maintenance (vivagpucache: 0 every BO around every job, 1 only CPU-mapped BOs + lazy surfaces) */
++	/*
++	 * CPU cache maintenance (vivagpucache: 0 every BO around every job, 1 only CPU-mapped BOs + lazy surfaces,
++	 * 2 like 1 but every such BO of the connection with every job, listed in bo_handles or not: diagnosis)
++	 */
+ 	int      fCacheMode;
+ 	uint64_t fSubmits, fSubmitNs, fSubmitCacheNs, fSubmitCacheBytes, fDoneCacheNs, fDoneCacheBytes;
+ 	void cacheStats(char **out, char *end);
+diff --git a/iokit/Kernel/arm/VivaGPUUserClient.cpp b/iokit/Kernel/arm/VivaGPUUserClient.cpp
+index 14f7984..b14602e 100644
+--- a/iokit/Kernel/arm/VivaGPUUserClient.cpp
++++ b/iokit/Kernel/arm/VivaGPUUserClient.cpp
+@@ -482,9 +482,9 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
+ 			}
+ 			b->memory = mem;
+ 			/*
+-			 * Cacheable everywhere: no write-combined BOs on this port (changing a page's cache mode panics
+-			 * for RAM below 0xc0000000, outside XNU's physical aperture). The kernel keeps CPU and GPU
+-			 * coherent: zeros pushed out now, then a flush before and an invalidate after every job.
++			 * Cacheable everywhere (write-combined BOs used to panic: pmap_sync_page_attributes_phys
++			 * truncated physical addresses above 4 GiB, fixed in 0112). The kernel keeps CPU and GPU
++			 * coherent: zeros pushed out now, then a clean + invalidate before and after every job.
+ 			 */
+ 			b->cacheable = true;
+ 			b->cacheMaint = fGPU->cacheMode() == 0;        /* else from the first user mapping (boMapped) */
+@@ -552,6 +552,16 @@ VivaGPUUserClient::submit(struct vgpu_submit *a)
+ 					bos->setObject(b);
+ 				}
+ 			}
++			/*
++			 * vivagpucache=2 (diagnosis): every CPU-maintained BO of the connection goes with the job, listed or
++			 * not, so a BO userspace forgot in bo_handles still gets its CPU writes cleaned before the job.
++			 */
++			for (uint32_t h = 1; r == kIOReturnSuccess && fGPU->cacheMode() == 2 && h < fBOCap; h++) {
++				VivaGPUBO *b = fBOs[h];
++				if (b != NULL && (b->cacheMaint || b->lazySurface) && bos->getNextIndexOfObject(b, 0) == (unsigned int)-1) {
++					bos->setObject(b);
++				}
++			}
+ 			if (r == kIOReturnSuccess) {
+ 				r = fGPU->submit(fVM, a->jc, a->requirements, deps, bos, fence);
+ 			}
+@@ -768,7 +778,8 @@ VivaGPUUserClient::syncBO(struct vgpu_sync_bo *a)
+ 				return kIOReturnBadArgument;
+ 			}
+ 			if (b->cacheable) {
+-				b->cacheOp(ops[i].offset, ops[i].size, ops[i].type == VGPU_SYNC_CPU_CACHE_FLUSH_INVALIDATE);
++				b->cacheOp(ops[i].offset, ops[i].size,
++				    ops[i].type == VGPU_SYNC_CPU_CACHE_FLUSH_INVALIDATE ? kVivaCacheFlush : kVivaCacheClean);
+ 			}
+ 		}
+ 		return kIOReturnSuccess;
