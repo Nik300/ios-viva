@@ -306,7 +306,7 @@ Patches 0114-0115 (2026-11-03, NOT tested on the phone yet; details and verifica
 - 0116 on the phone (2026-11-03): no more black tiles / mixed frames in `vctl burst`. Left (gpu/docs/RICHIESTE-KERNEL.md):
   K0d copy tearing (1-2 of 8 frames split between two whole frames), K0e ~0.28 ms per job independent of the clock.
 
-Patch 0117 (2026-11-03, NOT tested on the phone yet):
+Patch 0117 (2026-11-03, CI run 41707729706, image `out/xnu-ufs-rw-0117.img`, NOT tested on the phone yet):
 - **K0e fast kick**: the job IRQ is an IOFilterInterruptEventSource. After every kick the queue head of each slot
   whose unfinished deps are all jobs on the hardware is *armed* (AS bound, `vm->running` reserved, JS_CONFIG ready);
   the filter (primary interrupt context, `fFastLock` spinlock) clears the done bits, starts armed jobs whose awaited
