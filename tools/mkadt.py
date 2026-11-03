@@ -91,7 +91,7 @@ def node(name, props=(), children=()):
 
 
 # Linux IRQ_TYPE_* in the second interrupt cell (SweetGIC.cpp)
-IRQ_EDGE_RISING, IRQ_LEVEL_HIGH = 1, 4
+IRQ_EDGE_RISING, IRQ_EDGE_FALLING, IRQ_LEVEL_HIGH = 1, 2, 4
 # HID consumer-page usages (IOHIDUsageTables.h)
 HID_CSMR_POWER, HID_CSMR_VOLUME_UP, HID_CSMR_VOLUME_DOWN = 0x30, 0xe9, 0xea
 
@@ -145,6 +145,42 @@ def viva_devices(ph, phandle, gic_ph):
             ('compatible', cstr('mediatek,mt6366-keys')),
             ('keymap', u32(0, HID_CSMR_POWER, 1, HID_CSMR_VOLUME_UP)),
         ])])]),
+        # GPIO (gpio@10005000): iokit/Kernel/arm/VivaIO.cpp. Only these pins can be driven:
+        # the GT9896's reset (17), dvdd (73) and avdd (166) switches (live DT goodix,*-gpio).
+        node('gpio', [
+            ph(),
+            ('compatible', cstr('mediatek,mt6781-gpio')),
+            ('reg', io(0x10005000, 0x1000)),
+            ('output-pins', u32(17, 73, 166)),
+        ]),
+        # I2C0 (i2c0@11007000, SPI 105 level): VivaIO.cpp, MediaTek I2C v2 in FIFO mode.
+        # Source clock: CK_CFG_6 i2c_sel = 3 = univpll_d5_d2 = 2496 MHz / 2 / 5 / 2 (univ2pll
+        # PCW measured 2026-11-03), divided by clock-div 5. SCL0/SDA0 pin mux is left as LK set it.
+        node('i2c0', [
+            ph(),
+            ('compatible', cstr('mediatek,mt6781-i2c')),
+            ('reg', io(0x11007000, 0x1000)),
+            ('interrupt-parent', u32(gic_ph)),
+            ('interrupts', spi(0x69, IRQ_LEVEL_HIGH)),
+            ('clock-frequency', u32(400000)),
+            ('source-clock', u32(124800000)),
+            ('clock-div', u32(5)),
+            ('ext-time-config', u32(0x1801)),
+        ], [
+            # Goodix GT9896 touch (gt9896@5d): hid/VivaGT9896.cpp; interrupt EINT 13 falling edge.
+            node('touch', [
+                ph(),
+                ('compatible', cstr('goodix,gt9896')),
+                ('i2c-address', u32(0x5d)),
+                ('interrupt-parent', u32(eint_ph)),
+                ('interrupts', u32(13, IRQ_EDGE_FALLING)),
+                ('avdd-gpio', u32(166)),
+                ('dvdd-gpio', u32(73)),
+                ('reset-gpio', u32(17)),
+                ('max-x', u32(8640)),
+                ('max-y', u32(19200)),
+            ]),
+        ]),
     ]
 
 

@@ -1,0 +1,882 @@
+diff --git a/iokit/Kernel/arm/VivaIO.cpp b/iokit/Kernel/arm/VivaIO.cpp
+new file mode 100644
+index 0000000..8c8fddc
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaIO.cpp
+@@ -0,0 +1,364 @@
++/*
++ * viva (MT6781): GPIO and I2C bus drivers (see VivaIO.h).
++ *
++ * GPIO (0x10005000, Xiaomi viva-r-oss pinctrl-mt6781.c /
++ * pinctrl-mtk-common-v2.c): DIR 0x000, DOUT 0x100, DIN 0x200, + 0x10 per
++ * 32 pins, race-free SET at +4 and CLR at +8. Pin modes are left as LK set
++ * them (the touch pins are already GPIO).
++ *
++ * I2C v2 (i2c-mtk.c, i2c_common: ver 2, set_ltiming, cnt_constraint,
++ * set_dt_div, ext_time_config 0x1801): source clock from the ADT
++ * ("source-clock", Hz, before "clock-div"), timings computed like
++ * mtk_i2c_calculate_speed/i2c_set_speed (45 % duty above 100 kHz), FIFO
++ * transfers of up to 8 bytes, completion on the controller's interrupt.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include "VivaIO.h"
++
++/* ---- GPIO ---- */
++
++#define GPIO_DIR        0x000
++#define GPIO_DOUT       0x100
++#define GPIO_DIN        0x200
++#define GPIO_SET        0x4
++#define GPIO_CLR        0x8
++#define GPIO_PINS       203
++
++OSDefineMetaClassAndStructors(VivaGPIO, IOService);
++
++static VivaGPIO *gVivaGPIO;
++
++bool
++VivaGPIO::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	fMap = provider->mapDeviceMemoryWithIndex(0);
++	if (fMap == NULL) {
++		return false;
++	}
++	fRegs = (vm_offset_t)fMap->getVirtualAddress();
++	fOutputs = OSDynamicCast(OSData, provider->getProperty("output-pins"));
++	if (fOutputs != NULL) {
++		fOutputs->retain();
++	}
++	IOLog("VIVA GPIO: %u output pins allowed\n", fOutputs ? fOutputs->getLength() / 4 : 0);
++	gVivaGPIO = this;
++	registerService();
++	return true;
++}
++
++VivaGPIO *
++VivaGPIO::wait(void)
++{
++	for (int i = 0; i < 100 && gVivaGPIO == NULL; i++) {
++		IOSleep(50);
++	}
++	return gVivaGPIO;
++}
++
++bool
++VivaGPIO::outputAllowed(uint32_t pin)
++{
++	if (fOutputs == NULL) {
++		return false;
++	}
++	const uint32_t *pins = (const uint32_t *)fOutputs->getBytesNoCopy();
++	for (unsigned int i = 0; i < fOutputs->getLength() / 4; i++) {
++		if (pins[i] == pin) {
++			return true;
++		}
++	}
++	return false;
++}
++
++IOReturn
++VivaGPIO::setOutput(uint32_t pin, bool high)
++{
++	if (pin >= GPIO_PINS || !outputAllowed(pin)) {
++		IOLog("VIVA GPIO: refused output on pin %u\n", pin);
++		return kIOReturnNotPermitted;
++	}
++	uint32_t bank = 0x10 * (pin / 32), bit = 1u << (pin % 32);
++	wr32(GPIO_DOUT + bank + (high ? GPIO_SET : GPIO_CLR), bit);   /* level first, then drive */
++	wr32(GPIO_DIR + bank + GPIO_SET, bit);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++VivaGPIO::getInput(uint32_t pin, bool *high)
++{
++	if (pin >= GPIO_PINS || high == NULL) {
++		return kIOReturnBadArgument;
++	}
++	*high = (rd32(GPIO_DIN + 0x10 * (pin / 32)) >> (pin % 32)) & 1;
++	return kIOReturnSuccess;
++}
++
++/* ---- I2C ---- */
++
++#define I2C_DATA_PORT           0x00
++#define I2C_SLAVE_ADDR          0x04
++#define I2C_INTR_MASK           0x08
++#define I2C_INTR_STAT           0x0c
++#define I2C_CONTROL             0x10
++#define I2C_TRANSFER_LEN        0x14
++#define I2C_TRANSAC_LEN         0x18
++#define I2C_DELAY_LEN           0x1c
++#define I2C_TIMING              0x20
++#define I2C_START               0x24
++#define I2C_EXT_CONF            0x28
++#define I2C_LTIMING             0x2c
++#define I2C_HS                  0x30
++#define I2C_IO_CONFIG           0x34
++#define I2C_FIFO_ADDR_CLR       0x38
++#define I2C_MCU_INTR            0x40
++#define I2C_TRANSFER_LEN_AUX    0x44
++#define I2C_CLOCK_DIV           0x48
++#define I2C_HW_TIMEOUT          0x4c
++#define I2C_SOFTRESET           0x50
++
++#define INTR_BUS_ERR            (1u << 8)
++#define INTR_TIMEOUT            (1u << 5)
++#define INTR_ARB_LOST           (1u << 3)
++#define INTR_HS_NACKERR         (1u << 2)
++#define INTR_ACKERR             (1u << 1)
++#define INTR_TRANSAC_COMP       (1u << 0)
++#define INTR_ALL                0x1ff
++#define INTR_ERRORS             (INTR_BUS_ERR | INTR_TIMEOUT | INTR_HS_NACKERR | INTR_ACKERR | INTR_ARB_LOST)
++
++#define CONTROL_RS              (1u << 1)
++#define CONTROL_CLK_EXT_EN      (1u << 3)
++#define CONTROL_DIR_CHANGE      (1u << 4)
++#define CONTROL_ACKERR_DET_EN   (1u << 5)
++
++#define TIMING_TIMEOUT_EN       0x0001
++#define IO_CONFIG_OPEN_DRAIN    0x0003
++#define DELAY_LEN               0x000a
++#define MAX_STEP_CNT_DIV        64
++#define MAX_SAMPLE_CNT_DIV      8
++#define MAX_SCL_LOW_TIME_MS     2
++
++OSDefineMetaClassAndStructors(VivaI2C, IOService);
++
++static uint32_t
++dtU32(IOService *provider, const char *key, uint32_t dflt)
++{
++	OSData *d = OSDynamicCast(OSData, provider->getProperty(key));
++	return (d != NULL && d->getLength() >= 4) ? *(const uint32_t *)d->getBytesNoCopy() : dflt;
++}
++
++IOWorkLoop *
++VivaI2C::getWorkLoop(void) const
++{
++	return fWorkLoop;
++}
++
++/* i2c-mtk.c mtk_i2c_calculate_speed, ST/FS range, cnt_constraint set. */
++bool
++VivaI2C::calcSpeed(uint32_t srcHz, uint32_t speedHz, uint32_t *step, uint32_t *sample)
++{
++	uint32_t khz = speedHz / 1000, hclk = srcHz / 1000;
++	uint32_t min_div = ((hclk >> 1) + khz - 1) / khz;
++	uint32_t best = MAX_SAMPLE_CNT_DIV * MAX_STEP_CNT_DIV, sdiv = MAX_SAMPLE_CNT_DIV, stdiv = MAX_STEP_CNT_DIV;
++
++	for (uint32_t s = 1; s <= MAX_SAMPLE_CNT_DIV; s++) {
++		uint32_t st = (min_div + s - 1) / s;
++		if (st > MAX_STEP_CNT_DIV) {
++			continue;
++		}
++		if (st * s < best) {
++			best = st * s;
++			sdiv = s;
++			stdiv = st;
++			if (best == min_div) {
++				break;
++			}
++		}
++	}
++	if (hclk / (2 * sdiv * stdiv) > khz) {
++		return false;
++	}
++	if (--sdiv) {
++		stdiv--;
++	}
++	*step = stdiv;
++	*sample = sdiv;
++	return true;
++}
++
++bool
++VivaI2C::start(IOService *provider)
++{
++	fWorkLoop = IOWorkLoop::workLoop();
++	if (fWorkLoop == NULL || !IOService::start(provider)) {
++		return false;
++	}
++	fMap = provider->mapDeviceMemoryWithIndex(0);
++	if (fMap == NULL) {
++		IOLog("VIVA I2C: cannot map registers\n");
++		return false;
++	}
++	fRegs = (vm_offset_t)fMap->getVirtualAddress();
++	fClockDiv = dtU32(provider, "clock-div", 1);
++	fSrcHz = dtU32(provider, "source-clock", 0) / (fClockDiv ? fClockDiv : 1);
++	fSpeedHz = dtU32(provider, "clock-frequency", 400000);
++	fExtConf = (uint16_t)dtU32(provider, "ext-time-config", 0x1801);
++
++	/* 45 % duty above 100 kHz (i2c_set_speed with set_ltiming), high and low phases */
++	uint32_t duty = fSpeedHz > 100000 ? 45 : 50, step, sample, lstep, lsample;
++	if (fSrcHz == 0 || fSpeedHz > 400000 || fClockDiv > 8 ||
++	    !calcSpeed(fSrcHz, fSpeedHz * 50 / duty, &step, &sample) ||
++	    !calcSpeed(fSrcHz, fSpeedHz * 50 / (100 - duty), &lstep, &lsample)) {
++		IOLog("VIVA I2C: unsupported clocks (source %u Hz, speed %u Hz, div %u)\n", fSrcHz, fSpeedHz, fClockDiv);
++		return false;
++	}
++	fTiming = (uint16_t)(((sample & 7) << 8) | (step & 0x3f));
++	fLTiming = (uint16_t)(((lsample & 7) << 6) | (lstep & 0x3f));
++	uint32_t tv1 = fSrcHz / 1000 * MAX_SCL_LOW_TIME_MS, tv2 = ((fLTiming & 0x3f) + 1) * (((fLTiming & 0x1c0) >> 6) + 1);
++	fHWTimeout = (uint16_t)((tv1 + tv2 - 1) / tv2);
++
++	fGate = IOCommandGate::commandGate(this);
++	fInterrupt = IOInterruptEventSource::interruptEventSource(this, &VivaI2C::interruptOccurred, provider, 0);
++	if (fGate == NULL || fInterrupt == NULL || fWorkLoop->addEventSource(fGate) != kIOReturnSuccess ||
++	    fWorkLoop->addEventSource(fInterrupt) != kIOReturnSuccess) {
++		IOLog("VIVA I2C: no gate/interrupt\n");
++		return false;
++	}
++	initHW();
++	fInterrupt->enable();
++	IOLog("VIVA I2C: %s, source %u Hz, %u Hz: timing 0x%04x ltiming 0x%04x hw_timeout 0x%04x\n",
++	    provider->getName(), fSrcHz, fSpeedHz, fTiming, fLTiming, fHWTimeout);
++	registerService();
++	VivaDTNub::publishChildren(this, provider);
++	return true;
++}
++
++void
++VivaI2C::free(void)
++{
++	if (fWorkLoop != NULL) {
++		if (fInterrupt != NULL) {
++			fInterrupt->disable();
++			fWorkLoop->removeEventSource(fInterrupt);
++		}
++		if (fGate != NULL) {
++			fWorkLoop->removeEventSource(fGate);
++		}
++	}
++	OSSafeReleaseNULL(fInterrupt);
++	OSSafeReleaseNULL(fGate);
++	OSSafeReleaseNULL(fMap);
++	OSSafeReleaseNULL(fWorkLoop);
++	IOService::free();
++}
++
++/* mt_i2c_init_hw: interrupts off and cleared, soft reset, static configuration. */
++void
++VivaI2C::initHW(void)
++{
++	wr16(I2C_INTR_MASK, 0);
++	wr16(I2C_INTR_STAT, rd16(I2C_INTR_STAT));
++	wr16(I2C_SOFTRESET, 1);
++	wr16(I2C_IO_CONFIG, IO_CONFIG_OPEN_DRAIN);
++	wr16(I2C_TIMING, fTiming | TIMING_TIMEOUT_EN);
++	wr16(I2C_LTIMING, fLTiming);
++	wr16(I2C_HS, 0);
++}
++
++/* Work loop: the controller's interrupt. */
++void
++VivaI2C::interruptOccurred(OSObject *owner, IOInterruptEventSource *src __unused, int count __unused)
++{
++	VivaI2C *self = OSDynamicCast(VivaI2C, owner);
++	if (self == NULL) {
++		return;
++	}
++	uint16_t stat = self->rd16(I2C_INTR_STAT);
++	self->wr16(I2C_INTR_STAT, stat);
++	if (stat == 0) {
++		return;
++	}
++	self->fIrqStat |= stat;
++	self->fDone = true;
++	self->fGate->commandWakeup(&self->fDone);
++}
++
++IOReturn
++VivaI2C::transfer(uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen)
++{
++	if (addr > 0x7f || wlen == 0 || wlen > kFIFOSize || rlen > kFIFOSize || (rlen && rbuf == NULL)) {
++		return kIOReturnBadArgument;
++	}
++	return fGate->runActionBlock(^IOReturn {
++		return transferGated(addr, wbuf, wlen, rbuf, rlen);
++	});
++}
++
++/* i2c-mtk.c mt_i2c_do_transfer, FIFO path (op WR or WRRD). */
++IOReturn
++VivaI2C::transferGated(uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen)
++{
++	bool wrrd = rlen != 0;
++
++	wr16(I2C_HW_TIMEOUT, fHWTimeout);
++	wr16(I2C_CLOCK_DIV, (uint16_t)(((fClockDiv - 1) << 8) | (fClockDiv - 1)));
++	uint16_t control = CONTROL_ACKERR_DET_EN | CONTROL_CLK_EXT_EN;
++	if (wrrd) {
++		control |= CONTROL_DIR_CHANGE | CONTROL_RS;
++	}
++	wr16(I2C_CONTROL, control);
++	wr16(I2C_EXT_CONF, fSpeedHz <= 100000 ? 0x8001 : fExtConf);
++	wr16(I2C_DELAY_LEN, DELAY_LEN);
++	wr16(I2C_IO_CONFIG, IO_CONFIG_OPEN_DRAIN);
++	wr16(I2C_TIMING, fTiming | TIMING_TIMEOUT_EN);
++	wr16(I2C_LTIMING, fLTiming);
++	wr16(I2C_HS, 0);
++	wr16(I2C_SLAVE_ADDR, (uint16_t)(addr << 1));
++	wr16(I2C_INTR_STAT, INTR_ALL);
++	wr16(I2C_FIFO_ADDR_CLR, 1);
++	wr16(I2C_INTR_MASK, INTR_ERRORS | INTR_TRANSAC_COMP);
++	wr16(I2C_TRANSFER_LEN, (uint16_t)wlen);
++	if (wrrd) {
++		wr16(I2C_TRANSFER_LEN_AUX, (uint16_t)rlen);
++		wr16(I2C_TRANSAC_LEN, 2);
++	} else {
++		wr16(I2C_TRANSAC_LEN, 1);
++	}
++	for (uint32_t i = 0; i < wlen; i++) {
++		*(volatile uint8_t *)(fRegs + I2C_DATA_PORT) = wbuf[i];
++	}
++	wr16(I2C_MCU_INTR, 1);
++	fIrqStat = 0;
++	fDone = false;
++	OSMemoryBarrier();
++	wr16(I2C_START, 1);
++
++	AbsoluteTime deadline;
++	clock_interval_to_deadline(100, kMillisecondScale, &deadline);
++	while (!fDone) {
++		if (fGate->commandSleep(&fDone, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
++			break;
++		}
++	}
++	uint16_t stat = fIrqStat;
++	if (!fDone || (stat & INTR_ERRORS)) {
++		fErrors++;
++		if (fErrors <= 8) {
++			IOLog("VIVA I2C: addr 0x%02x %s (stat 0x%04x start 0x%04x)\n", addr,
++			    fDone ? "error" : "timeout", stat, rd16(I2C_START));
++		}
++		wr16(I2C_FIFO_ADDR_CLR, 1);
++		initHW();
++		return fDone ? kIOReturnIOError : kIOReturnTimeout;
++	}
++	for (uint32_t i = 0; i < rlen; i++) {
++		rbuf[i] = *(volatile uint8_t *)(fRegs + I2C_DATA_PORT);
++	}
++	return kIOReturnSuccess;
++}
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/VivaIO.h b/iokit/Kernel/arm/VivaIO.h
+new file mode 100644
+index 0000000..da9b777
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaIO.h
+@@ -0,0 +1,78 @@
++/*
++ * viva (MT6781): GPIO and I2C bus drivers.
++ *
++ * VivaGPIO  (/arm-io/gpio, "mediatek,mt6781-gpio"): pin input/output for
++ *           drivers; only the pins listed in the node's "output-pins" can be
++ *           driven, everything else is refused.
++ * VivaI2C   (/arm-io/i2c0, "mediatek,mt6781-i2c"): MediaTek I2C v2
++ *           controller in FIFO mode (8 bytes per direction and transfer),
++ *           interrupt driven; publishes its device-tree children as
++ *           VivaDTNub nubs (property "i2c-address").
++ */
++#ifndef _IOKIT_ARM_VIVAIO_H
++#define _IOKIT_ARM_VIVAIO_H
++
++#include <IOKit/IOService.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOCommandGate.h>
++#include <IOKit/IOInterruptEventSource.h>
++
++#include "VivaPMIC.h"   /* VivaDTNub */
++
++class VivaGPIO : public IOService {
++	OSDeclareDefaultStructors(VivaGPIO);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setOutput(uint32_t pin, bool high);
++	IOReturn getInput(uint32_t pin, bool *high);
++	/* The started instance, waiting for it if needed (NULL after timeout). */
++	static VivaGPIO *wait(void);
++
++private:
++	bool outputAllowed(uint32_t pin);
++	inline uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(fRegs + off); }
++	inline void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(fRegs + off) = v; }
++
++	IOMemoryMap *fMap;
++	vm_offset_t  fRegs;
++	OSData      *fOutputs;
++};
++
++class VivaI2C : public IOService {
++	OSDeclareDefaultStructors(VivaI2C);
++public:
++	enum { kFIFOSize = 8 };
++
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOWorkLoop *getWorkLoop(void) const APPLE_KEXT_OVERRIDE;
++
++	/*
++	 * One transaction to 7-bit `addr`: write `wlen` bytes, then (if rlen)
++	 * a repeated start and read `rlen` bytes. wlen, rlen <= kFIFOSize.
++	 * Sleeps: not from interrupt context.
++	 */
++	IOReturn transfer(uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen);
++
++private:
++	static void interruptOccurred(OSObject *owner, IOInterruptEventSource *src, int count);
++	IOReturn transferGated(uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen);
++	void initHW(void);
++	bool calcSpeed(uint32_t srcHz, uint32_t speedHz, uint32_t *step, uint32_t *sample);
++	inline uint16_t rd16(uint32_t off) { return *(volatile uint16_t *)(fRegs + off); }
++	inline void wr16(uint32_t off, uint16_t v) { *(volatile uint16_t *)(fRegs + off) = v; }
++
++	IOMemoryMap            *fMap;
++	vm_offset_t             fRegs;
++	IOWorkLoop             *fWorkLoop;
++	IOCommandGate          *fGate;
++	IOInterruptEventSource *fInterrupt;
++	uint32_t                fSrcHz, fSpeedHz, fClockDiv;
++	uint16_t                fTiming, fLTiming, fHWTimeout, fExtConf;
++	volatile uint16_t       fIrqStat;
++	bool                    fDone;
++	uint32_t                fErrors;
++};
++
++#endif /* _IOKIT_ARM_VIVAIO_H */
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..a5bae06 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -28,6 +28,7 @@
+ #include "IOHIDKeys.h"
+ #include "IOHIDPrivateKeys.h"
+ #include "IOHIDUsageTables.h"
++#include "SweetHIDTouch.h"
+ 
+ extern "C" uint64_t mach_absolute_time(void);
+ 
+@@ -342,37 +343,6 @@ private:
+ };
+ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+ 
+-/*
+- * Touch screen: digitizer collection events with finger children,
+- * coordinates normalized to 0..1 like IOHIDEventDriver produces for
+- * absolute digitizers.
+- */
+-#define SWEET_TOUCH_FINGERS 10
+-/*
+- * Contacts that start this close to a panel edge (pixels, ~3 mm) carry
+- * kIOHIDDigitizerEventFromEdgeTip for their whole life, as Apple's touch
+- * firmware reports them. UIKit derives UITouch's edge type from that bit
+- * (_UIEventHIDTouchEdgeTypeForHIDEvent); without it there is no home or
+- * app-switcher gesture.
+- */
+-#define SWEET_TOUCH_EDGE_PX 48
+-class SweetHIDTouch : public IOHIDEventService {
+-	OSDeclareDefaultStructors(SweetHIDTouch);
+-public:
+-	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+-	void touch(int finger, bool down, int x, int y);
+-protected:
+-	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Digitizer; }
+-	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
+-	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
+-private:
+-	IOLock *fLock;
+-	int fLogicalW, fLogicalH, fOffX, fOffY;
+-	bool fDown[SWEET_TOUCH_FINGERS];
+-	bool fEdge[SWEET_TOUCH_FINGERS];
+-	IOFixed fX[SWEET_TOUCH_FINGERS];
+-	IOFixed fY[SWEET_TOUCH_FINGERS];
+-};
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
+ static SweetHIDButtons *gSweetButtons;
+@@ -428,6 +398,12 @@ SweetHIDButtons::testFired(OSObject *owner, IOTimerEventSource *sender)
+ bool
+ SweetHIDTouch::start(IOService *provider)
+ {
++	/* The IOResources instance stands in for a touch backend; sweettouch=0 means there is none. */
++	uint32_t backend = 1;
++	PE_parse_boot_argn("sweettouch", &backend, sizeof(backend));
++	if (getMetaClass() == SweetHIDTouch::metaClass && backend == 0) {
++		return false;
++	}
+ 	fLock = IOLockAlloc();
+ 	if (!fLock || !IOHIDEventService::start(provider)) {
+ 		return false;
+diff --git a/iokit/Kernel/arm/hid/SweetHIDTouch.h b/iokit/Kernel/arm/hid/SweetHIDTouch.h
+new file mode 100644
+index 0000000..38ef2b0
+--- /dev/null
++++ b/iokit/Kernel/arm/hid/SweetHIDTouch.h
+@@ -0,0 +1,44 @@
++/*
++ * SWEET: the built-in touch screen HID service (SweetHID.cpp). Board
++ * drivers that own a touch controller subclass it and call touch() with
++ * panel pixel coordinates (viva: hid/VivaGT9896.cpp).
++ */
++#ifndef _IOKIT_ARM_HID_SWEETHIDTOUCH_H
++#define _IOKIT_ARM_HID_SWEETHIDTOUCH_H
++
++#include "IOHIDEventService.h"
++#include "IOHIDUsageTables.h"
++
++/*
++ * Touch screen: digitizer collection events with finger children,
++ * coordinates normalized to 0..1 like IOHIDEventDriver produces for
++ * absolute digitizers.
++ */
++#define SWEET_TOUCH_FINGERS 10
++/*
++ * Contacts that start this close to a panel edge (pixels, ~3 mm) carry
++ * kIOHIDDigitizerEventFromEdgeTip for their whole life, as Apple's touch
++ * firmware reports them. UIKit derives UITouch's edge type from that bit
++ * (_UIEventHIDTouchEdgeTypeForHIDEvent); without it there is no home or
++ * app-switcher gesture.
++ */
++#define SWEET_TOUCH_EDGE_PX 48
++class SweetHIDTouch : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDTouch);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void touch(int finger, bool down, int x, int y);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Digitizer; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
++protected:
++	IOLock *fLock;
++	int fLogicalW, fLogicalH, fOffX, fOffY;
++	bool fDown[SWEET_TOUCH_FINGERS];
++	bool fEdge[SWEET_TOUCH_FINGERS];
++	IOFixed fX[SWEET_TOUCH_FINGERS];
++	IOFixed fY[SWEET_TOUCH_FINGERS];
++};
++
++#endif /* _IOKIT_ARM_HID_SWEETHIDTOUCH_H */
+diff --git a/iokit/Kernel/arm/hid/VivaGT9896.cpp b/iokit/Kernel/arm/hid/VivaGT9896.cpp
+new file mode 100644
+index 0000000..352d01c
+--- /dev/null
++++ b/iokit/Kernel/arm/hid/VivaGT9896.cpp
+@@ -0,0 +1,266 @@
++/*
++ * viva (MT6781): Goodix GT9896 touch controller, the built-in touch screen.
++ * Matches /arm-io/i2c0/touch ("goodix,gt9896"), a child of VivaI2C
++ * (../VivaIO.cpp); it is a SweetHIDTouch, so contacts reach backboardd as
++ * the same digitizer collection events (fingers, edge tips) as on sweet.
++ *
++ * Protocol and power sequence from Xiaomi's driver for this phone
++ * (viva-r-oss drivers/input/touchscreen/goodix_gtx8, GT9896 = "Normandy"):
++ *  - power: avdd GPIO high, 100 us, dvdd GPIO high (load switches); reset
++ *    GPIO low 2 ms, high, 110 ms, then the IC answers on I2C
++ *  - registers have 16-bit big-endian addresses; version at 0x8240
++ *  - interrupt (EINT 13, falling edge) -> event head at 0x824E:
++ *    byte 0 bit 7 touch event, bit 6 request; byte 1 low nibble = contacts;
++ *    then 8 bytes per contact (id, x LE16, y LE16, w, ...) and 2 more bytes;
++ *    the byte sum of the first 4 + 8 * n bytes is 0; write 0 to 0x824E
++ *    when done
++ *  - coordinates 0..panel-max (8640 x 19200 = 8x the 1080 x 2400 panel)
++ * Reads go in 8-byte pieces (VivaI2C FIFO transfers).
++ *
++ * ADT: i2c-address, avdd-gpio, dvdd-gpio, reset-gpio, max-x, max-y; the
++ * interrupt is interrupts/interrupt-parent (VivaEINT).
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOInterruptEventSource.h>
++
++#include "SweetHIDTouch.h"
++#include "../VivaIO.h"
++
++#define GT_REG_VERSION          0x8240
++#define GT_REG_COORDS           0x824e
++#define GT_REG_TEST             0x4100
++#define GT_EVENT_TOUCH          0x80
++#define GT_EVENT_REQUEST        0x40
++#define GT_BYTES_PER_COORD      8
++#define GT_HEAD_LEN             2
++#define GT_MAX_TOUCH            10
++#define PANEL_W                 1080
++#define PANEL_H                 2400
++
++class VivaGT9896 : public SweetHIDTouch {
++	OSDeclareDefaultStructors(VivaGT9896);
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOWorkLoop *getWorkLoop(void) const APPLE_KEXT_OVERRIDE;
++
++protected:
++	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString("GT9896"); }
++	virtual UInt32 getVendorID() APPLE_KEXT_OVERRIDE { return 0x27c6; }        /* Goodix */
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 0x9896; }
++
++private:
++	static void interruptOccurred(OSObject *owner, IOInterruptEventSource *src, int count);
++	IOReturn readReg(uint16_t reg, uint8_t *buf, uint32_t len);
++	IOReturn writeReg(uint16_t reg, const uint8_t *buf, uint32_t len);
++	bool powerOn(void);
++	void handleEvent(void);
++
++	VivaI2C                *fBus;
++	VivaGPIO               *fGPIO;
++	IOWorkLoop             *fWorkLoop;
++	IOInterruptEventSource *fInterrupt;
++	uint8_t                 fAddr;
++	uint32_t                fAvdd, fDvdd, fReset, fMaxX, fMaxY;
++	uint32_t                fPrevMap;
++	uint32_t                fEvents, fBadSums;
++};
++
++OSDefineMetaClassAndStructors(VivaGT9896, SweetHIDTouch);
++
++static uint32_t
++dtU32(IOService *provider, const char *key, uint32_t dflt)
++{
++	OSData *d = OSDynamicCast(OSData, provider->getProperty(key));
++	return (d != NULL && d->getLength() >= 4) ? *(const uint32_t *)d->getBytesNoCopy() : dflt;
++}
++
++IOWorkLoop *
++VivaGT9896::getWorkLoop(void) const
++{
++	return fWorkLoop;
++}
++
++IOReturn
++VivaGT9896::readReg(uint16_t reg, uint8_t *buf, uint32_t len)
++{
++	while (len > 0) {
++		uint32_t n = len < (uint32_t)VivaI2C::kFIFOSize ? len : (uint32_t)VivaI2C::kFIFOSize;
++		uint8_t a[2] = { (uint8_t)(reg >> 8), (uint8_t)reg };
++		IOReturn ret = fBus->transfer(fAddr, a, 2, buf, n);
++		if (ret != kIOReturnSuccess) {
++			return ret;
++		}
++		reg += n;
++		buf += n;
++		len -= n;
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++VivaGT9896::writeReg(uint16_t reg, const uint8_t *buf, uint32_t len)
++{
++	uint8_t w[VivaI2C::kFIFOSize] = { (uint8_t)(reg >> 8), (uint8_t)reg };
++	if (len > VivaI2C::kFIFOSize - 2) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(w + 2, buf, len);
++	return fBus->transfer(fAddr, w, 2 + len, NULL, 0);
++}
++
++/* goodix_ts_power_on + goodix_ts_dev_confirm */
++bool
++VivaGT9896::powerOn(void)
++{
++	fGPIO->setOutput(fReset, false);
++	fGPIO->setOutput(fAvdd, true);
++	IODelay(100);
++	fGPIO->setOutput(fDvdd, true);
++	IOSleep(10);
++	for (int retry = 0; retry < 3; retry++) {
++		fGPIO->setOutput(fReset, false);
++		IODelay(2000);
++		fGPIO->setOutput(fReset, true);
++		IOSleep(110);
++		uint8_t test = 0;
++		if (readReg(GT_REG_TEST, &test, 1) == kIOReturnSuccess) {
++			IOSleep(95);
++			return true;
++		}
++	}
++	return false;
++}
++
++bool
++VivaGT9896::start(IOService *provider)
++{
++	fBus = OSDynamicCast(VivaI2C, provider->getProvider());
++	fGPIO = VivaGPIO::wait();
++	fWorkLoop = IOWorkLoop::workLoop();
++	fAddr = (uint8_t)dtU32(provider, "i2c-address", 0x5d);
++	fAvdd = dtU32(provider, "avdd-gpio", 166);
++	fDvdd = dtU32(provider, "dvdd-gpio", 73);
++	fReset = dtU32(provider, "reset-gpio", 17);
++	fMaxX = dtU32(provider, "max-x", 8640);
++	fMaxY = dtU32(provider, "max-y", 19200);
++	if (fBus == NULL || fGPIO == NULL || fWorkLoop == NULL) {
++		IOLog("VIVA TOUCH: missing I2C bus, GPIO or work loop\n");
++		return false;
++	}
++	if (!powerOn()) {
++		IOLog("VIVA TOUCH: GT9896 at 0x%02x does not answer after reset\n", fAddr);
++		return false;
++	}
++	uint8_t ver[16] = { 0 };
++	readReg(GT_REG_VERSION, ver, sizeof(ver));
++	IOLog("VIVA TOUCH: version %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x"
++	    " ('%c%c%c%c')\n", ver[0], ver[1], ver[2], ver[3], ver[4], ver[5], ver[6], ver[7], ver[8], ver[9],
++	    ver[10], ver[11], ver[12], ver[13], ver[14], ver[15],
++	    ver[0] >= 0x20 && ver[0] < 0x7f ? ver[0] : '.', ver[1] >= 0x20 && ver[1] < 0x7f ? ver[1] : '.',
++	    ver[2] >= 0x20 && ver[2] < 0x7f ? ver[2] : '.', ver[3] >= 0x20 && ver[3] < 0x7f ? ver[3] : '.');
++	uint8_t zero = 0;
++	writeReg(GT_REG_COORDS, &zero, 1);
++
++	/* HID service (SweetHIDTouch publishes the digitizer properties) */
++	if (!SweetHIDTouch::start(provider)) {
++		return false;
++	}
++	fInterrupt = IOInterruptEventSource::interruptEventSource(this, &VivaGT9896::interruptOccurred, provider, 0);
++	if (fInterrupt == NULL || fWorkLoop->addEventSource(fInterrupt) != kIOReturnSuccess) {
++		IOLog("VIVA TOUCH: no interrupt\n");
++		return false;
++	}
++	fInterrupt->enable();
++	IOLog("VIVA TOUCH: GT9896 at 0x%02x on, %ux%u\n", fAddr, fMaxX, fMaxY);
++	return true;
++}
++
++void
++VivaGT9896::free(void)
++{
++	if (fInterrupt != NULL) {
++		fInterrupt->disable();
++		if (fWorkLoop != NULL) {
++			fWorkLoop->removeEventSource(fInterrupt);
++		}
++	}
++	OSSafeReleaseNULL(fInterrupt);
++	SweetHIDTouch::free();
++	OSSafeReleaseNULL(fWorkLoop);
++}
++
++void
++VivaGT9896::interruptOccurred(OSObject *owner, IOInterruptEventSource *src __unused, int count __unused)
++{
++	VivaGT9896 *self = OSDynamicCast(VivaGT9896, owner);
++	if (self != NULL) {
++		self->handleEvent();
++	}
++}
++
++/* Work loop: goodix_event_handler + goodix_touch_handler_nor. */
++void
++VivaGT9896::handleEvent(void)
++{
++	uint8_t buf[GT_HEAD_LEN + GT_BYTES_PER_COORD * GT_MAX_TOUCH + 2];
++	uint32_t pre = GT_HEAD_LEN + GT_BYTES_PER_COORD + 2;
++	uint8_t zero = 0;
++
++	if (readReg(GT_REG_COORDS, buf, pre) != kIOReturnSuccess) {
++		return;
++	}
++	if (!(buf[0] & GT_EVENT_TOUCH)) {
++		if (buf[0] & GT_EVENT_REQUEST) {
++			IOLog("VIVA TOUCH: request event 0x%02x 0x%02x\n", buf[0], buf[1]);
++		}
++		writeReg(GT_REG_COORDS, &zero, 1);
++		return;
++	}
++	uint32_t n = buf[1] & 0x0f;
++	if (n > GT_MAX_TOUCH) {
++		writeReg(GT_REG_COORDS, &zero, 1);
++		return;
++	}
++	if (n > 1 && readReg(GT_REG_COORDS + pre, buf + pre, (n - 1) * GT_BYTES_PER_COORD) != kIOReturnSuccess) {
++		return;
++	}
++	writeReg(GT_REG_COORDS, &zero, 1);
++
++	uint8_t sum = 0;
++	for (uint32_t i = 0; i < n * GT_BYTES_PER_COORD + 4; i++) {
++		sum += buf[i];
++	}
++	if (sum != 0) {
++		if (++fBadSums <= 8) {
++			IOLog("VIVA TOUCH: checksum 0x%02x (n %u)\n", sum, n);
++		}
++		return;
++	}
++	if (n >= 1 && buf[(n - 1) * GT_BYTES_PER_COORD + 2] >= 0x80) {
++		return;         /* pen report: not a finger */
++	}
++
++	fEvents++;
++	uint32_t map = 0;
++	const uint8_t *c = buf + GT_HEAD_LEN;
++	for (uint32_t i = 0; i < n; i++, c += GT_BYTES_PER_COORD) {
++		uint32_t id = c[0];
++		if (id >= GT_MAX_TOUCH || id >= SWEET_TOUCH_FINGERS) {
++			break;
++		}
++		uint32_t x = (uint32_t)c[1] | (uint32_t)c[2] << 8;
++		uint32_t y = (uint32_t)c[3] | (uint32_t)c[4] << 8;
++		map |= 1u << id;
++		touch((int)id, true, (int)(x * PANEL_W / fMaxX), (int)(y * PANEL_H / fMaxY));
++	}
++	for (uint32_t id = 0; id < SWEET_TOUCH_FINGERS; id++) {
++		if ((fPrevMap & (1u << id)) && !(map & (1u << id))) {
++			touch((int)id, false, 0, 0);
++		}
++	}
++	fPrevMap = map;
++}
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 610eb7a..4f065dc 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -98,6 +98,21 @@ const char * gIOKernelConfigTables =
+     "     'IONameMatch'     = 'mediatek,mt6366-keys';"
+     "   },"
+     "   {"
++    "     'IOClass'         = VivaGPIO;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'mediatek,mt6781-gpio';"
++    "   },"
++    "   {"
++    "     'IOClass'         = VivaI2C;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'mediatek,mt6781-i2c';"
++    "   },"
++    "   {"
++    "     'IOClass'         = VivaGT9896;"
++    "     'IOProviderClass' = VivaDTNub;"
++    "     'IONameMatch'     = 'goodix,gt9896';"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetHIDButtons;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDButtons;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 09d9840..55f00b1 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -19,10 +19,12 @@ iokit/Kernel/arm/SweetGIC.cpp                                    optional iokitc
+ iokit/Kernel/arm/VivaPwrap.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/VivaEINT.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/VivaPMIC.cpp                                    optional iokitcpp
++iokit/Kernel/arm/VivaIO.cpp                                      optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/VivaKeypad.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/VivaPMICKeys.cpp                            optional iokitcpp
++iokit/Kernel/arm/hid/VivaGT9896.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
