@@ -249,7 +249,7 @@ Build with `VIVA_EXTRA="cpus=6 vivausb=3 vivagpu=2"` (user request: vivagpu=2 fr
   possible). `disp regs` is a read-only dump of OVL0/OVL0_2L/larb ports: run it first (larb port bit 0 set would
   mean the M4U translates: then scanout cannot work with physical addresses).
 
-Patch 0110 "big cores" (2026-11-03, NOT tested on the phone yet): `cpus=8` brings up the two A76s too (the
+Patch 0110 "big cores" (2026-11-03, CI run 41584638951, image `out/xnu-ufs-rw-0110.img`, NOT tested on the phone yet): `cpus=8` brings up the two A76s too (the
 kernel already allowed 8 since sweet's 0078; mkadt emits cpu6/cpu7 = MPIDR 0x600/0x700, GICR found by
 affinity, set/way ops read CCSIDR per core). 0110 adds the Cortex-A76 erratum 1286807 / A55 2441007
 workaround (sync_tlb_flush: DSB, dummy `tlbi vale1is, xzr`, DSB, like Linux REPEAT_TLBI) and logs each core's
