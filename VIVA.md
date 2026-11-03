@@ -132,6 +132,15 @@ Touch: Goodix GT9896 on i2c0@11007000 addr 0x5d, irq GPIO 13 (falling), reset GP
 Patch 0095 (CI run 41548885484, image `out/xnu-ufs-rw-pwrap.img`, untested): VivaPwrap, read-only WACS2
 (no write path); USB link `pmic ADDR [N]`; keypad keymap <0 0xea>.
 
+0095 result (2026-11-03): pwrap reads work (LK leaves WACS2 initialized), PMIC hwcid 0x6610 = MT6366,
+TOPSTATUS 0x0e idle, 0x0c power held, 0x06 volume up held. LK leaves PSC interrupts enabled (con 0x0065)
+with chrdet (bit 5) pending while USB is plugged.
+
+Patch 0096 (CI run 41551405221, image `out/xnu-ufs-rw-keys.img`, untested): VivaEINT (IOInterruptController
+under SweetGIC, SPI 186), VivaPwrap as a bus (VivaDTNub children) with writePMIC() limited to interrupt
+enable SET/CLR + status registers, VivaPMIC (all PMIC interrupts off at start, EINT 144 on its work loop),
+VivaPMICKeys (power, volume up). ADT: /arm-io/eint, /arm-io/pwrap/pmic/keys.
+
 Workflow notes:
 - Kernel patches are made against a local xnu-8796.141.3 tree with all
   `xnu/patches/*.patch` applied in order (`git apply`; 0031/0041 need the CI's HFS
