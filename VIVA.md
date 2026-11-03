@@ -298,6 +298,10 @@ Patches 0114-0115 (2026-11-03, NOT tested on the phone yet; details and verifica
   default 950; else down to the OPP that would be 70% busy, not within 200 ms of a step up, never below
   `vivagpufreq`; `vivagpudvfs=0` off, link `gpu dvfs [on|off]`); panel refresh adaptive by default (copies within
   `sweetfb_duty`=25% of one CPU; `sweetfb_hz=N` = fixed as before), copy time in `disp`.
+- 0114/0115 on the phone (2026-11-03): boot and animate fine, then panic in backboardd after a while:
+  `__memmove_chk object size check failed ... (1132 < 3396)` = AppleCLCD::swap() shifting the full swap queue with
+  one memmove from fQueue[0] (fortify sees one record). **0116** (CI run 41699672332, image
+  `out/xnu-ufs-rw-0116.img`, = 0114+0115+fix) shifts one record at a time.
 - If the GPU's first CREATE_BO panics in pmap (WC path, 0112 not enough): boot with `vivagpuwc=0`.
 
 Workflow notes:
