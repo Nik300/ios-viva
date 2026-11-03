@@ -1,0 +1,22 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0bc1872..3ebbb85 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -462,9 +462,14 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	if (fQueueCount == SWEET_FB_QUEUE) {
+-		/* the oldest swap was never shown: drop it */
+-		memmove(fQueue[0], fQueue[1], (SWEET_FB_QUEUE - 1) * SWEET_FB_SWAP_REC_SIZE);
+-		memmove(&fQueueSeq[0], &fQueueSeq[1], (SWEET_FB_QUEUE - 1) * sizeof(fQueueSeq[0]));
++		/*
++		 * The oldest swap was never shown: drop it. One record at a time: a single memmove from fQueue[0]
++		 * spans several rows, which the fortified memmove rejects (object size of fQueue[0] = one record).
++		 */
++		for (uint32_t i = 1; i < SWEET_FB_QUEUE; i++) {
++			memcpy(fQueue[i - 1], fQueue[i], SWEET_FB_SWAP_REC_SIZE);
++			fQueueSeq[i - 1] = fQueueSeq[i];
++		}
+ 		fQueueCount--;
+ 	}
+ 	memcpy(fQueue[fQueueCount], rec, SWEET_FB_SWAP_REC_SIZE);
