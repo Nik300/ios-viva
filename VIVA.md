@@ -152,6 +152,11 @@ over 4 + 8n bytes == 0, then write 0 to 0x824E; version at 0x8240; reset = GPIO1
 I2C0 0x11007000 (SPI 105 level), clock: infra1 CG bit 29 (on at boot) + imp_iic_wrap 0x11017e00 bit 0.
 `tools/viva-touch-probe.py` reads gates and pin states (peek only).
 
+Patch 0097 (CI run 41554971700, image `out/xnu-ufs-rw-touch.img`, untested): VivaGPIO (output-pins
+whitelist 17/73/166), VivaI2C (I2C0 v2 FIFO, 400 kHz from 124.8 MHz / 5; probe 2026-11-03: gates on,
+SCL0/SDA0 already mode 1, timing registers 0 = LK never used I2C0), VivaGT9896 (touch was unpowered:
+avdd/dvdd/reset outputs at 0), dispatching through SweetHIDTouch.
+
 Workflow notes:
 - Kernel patches are made against a local xnu-8796.141.3 tree with all
   `xnu/patches/*.patch` applied in order (`git apply`; 0031/0041 need the CI's HFS
