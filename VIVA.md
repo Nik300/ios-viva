@@ -328,6 +328,26 @@ Patch 0117 (2026-11-03, CI run 41707729706, image `out/xnu-ufs-rw-0117.img`, NOT
   = old copy; `disp` shows state, frame period, switches/missed/unsure; `disp regs` shows INTEN/INTSTA/ADDCON_DBG.
   If `disp` says "no frame-end status from the OVL", the double buffer is off and nothing else changed.
 
+Patch 0118 (2026-11-03, K0g, NOT tested on the phone yet; analysis in `~/Developer/ios-viva/gpu/docs/ANALISI-KERNEL-RENDERING.md`,
+"Seconda analisi"):
+- After 0117 (userspace measurements, gpu/docs/FINDINGS): GPU busy ~1%, job on the hardware ~24 us, frame 18 ms, the
+  time is in the SUBMIT (~60 us each, ~100 per frame) and WAIT_BO ioctls. Kernel-side cause found in the code: every job
+  completion, every submit with an out_sync and every syncobj change woke **every** waiter of every process
+  (`commandWakeup(&fFenceEvent)`), each woken thread retook the gate to find nothing, and submits queued behind them.
+- **Targeted wakeups**: a wait for one fence (WAIT_BO, one-handle or WAIT_ALL syncobj waits, IOSurfaceLock /
+  viva_gpu_surface_wait, selftest) sleeps on the fence (`sleepOn`, `VivaGPUFence::waiters`); the shared event only
+  for ANY waits on several syncobjs or a syncobj without a fence, and woken only when such waiters exist. Replacing
+  a syncobj's fence wakes the old fence's waiters, so they re-check as before (same semantics).
+- **Trap fast path**: `IOConnectTrap2(conn, VGPU_TRAP_CALL=0, selector, &args)` = the struct method without the Mach
+  message (copyin/copyout of the structure). UAPI minor 1. Userspace must adopt it (libdrm-xnu/vgpu).
+- **Call counters**: link `gpu calls [reset]`: per selector calls (trap/method), avg/max time in the kernel, avg/max
+  wait for the gate; sleeps, spurious wakeups, fence/generic wakeups. `gpu clocks`: ARMPLL_LL (A55) / BL (A76) / BB,
+  CCIPLL, MFGPLL from apmixedsys (read only): nothing in this port sets CPU frequencies, they stay where LK left them.
+- **Early present** (`sweetfb_early=1` default, link `disp early on|off`): a queued swap is tried when it arrives and
+  whenever a GPU job that used IOSurfaces completes (`sweet_fb_gpu_done` -> AppleCLCD timer on its work loop), not
+  only at the vsync tick: the copy goes off screen right away and is switched at the next frame end (one frame of
+  latency less). `disp` shows tries / frames shown early.
+
 Workflow notes:
 - Kernel patches are made against a local xnu-8796.141.3 tree with all
   `xnu/patches/*.patch` applied in order (`git apply`; 0031/0041 need the CI's HFS
