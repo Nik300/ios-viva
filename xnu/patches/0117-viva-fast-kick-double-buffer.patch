@@ -1,0 +1,1431 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index f987266..9b08acb 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -998,11 +998,11 @@ vl_command(void)
+ 			}
+ 		}
+ 	} else if (IS("gpu")) {
+-		static char gpu_reply[3072];
++		static char gpu_reply[4000];  /* vl.reply holds 4096 */
+ 		viva_gpu_link(rest, gpu_reply, sizeof(gpu_reply));
+ 		vl_reply("%s", gpu_reply);
+ 	} else if (IS("disp")) {
+-		static char disp_reply[3072];
++		static char disp_reply[4000];
+ 		viva_disp_link(rest, disp_reply, sizeof(disp_reply));
+ 		vl_reply("%s", disp_reply);
+ 	} else if (IS("push")) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3ebbb85..9ffb1be 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -36,9 +36,23 @@
+  * allocates display-sized surfaces that way when scanout is on), only that
+  * layer's address and pitch are changed to point at the surface (the
+  * centered 1080x2400 window of the 1125x2436 surface): no CPU copy. Anything
+- * else falls back to the copy with LK's address and pitch restored. The OVL
+- * shadow registers are bypassed on MT6781, so the switch is not tied to
+- * vblank yet (a frame may tear).
++ * else falls back to the copy. The OVL shadow registers are bypassed on
++ * MT6781: a layer register write takes effect at once, so it is made at a
++ * frame end (below).
++ *
++ * viva double buffer (K0d, boot-arg sweetfb_flip, 1 default): the copy goes
++ * to the panel buffer the layer is not reading, LK's buffer (fPhys) or the
++ * next one in LK's memory (LK reserves three), and the layer is switched to
++ * it at the next frame end. The frame end is the OVL's frame-complete status
++ * bit (INTSTA bit 1, polled; the OVL interrupt itself stays unused). The
++ * vsync timer is phase-locked to it: each tick fires fLead before the
++ * predicted frame end and, when a switch is pending, polls the bit until it
++ * rises (the switch happens with interrupts off right then, only if the bit
++ * was seen within a few microseconds of rising). Without a usable frame end,
++ * with the kernel console on screen, a swap of the default surface or a
++ * frame that does not cover the whole panel, the copy goes to the buffer on
++ * screen as before (a frame may tear). A panic points the layer back at
++ * LK's buffer, where the console draws (sweet_fb_panic_hook).
+  *
+  * GPU-drawn frames (K0c): backboardd hands a surface to SwapEnd right after
+  * committing its command buffer, without waiting for the GPU (on Apple the
+@@ -59,6 +73,7 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" void (*sweet_fb_panic_hook)(void);   /* pexpert/arm/pe_serial.c */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -71,6 +86,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <machine/machine_routines.h>
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -171,17 +187,50 @@ public:
+ 	uint32_t      fLkAddr, fLkPitch, fLkPitchMsb;
+ 	char          fScanLayer[16];
+ 	bool          fScanOn;        /* allowed */
+-	bool          fScanActive;    /* the layer points at fScanSurface */
+-	SweetSurface *fScanSurface;
+ 	uint64_t      fScanFrames, fScanFallbacks;
+ 	const char   *fScanWhy;       /* last reason for falling back */
+ 
++	/* what LK's layer reads (fScanLock): now, and from the next frame end */
++	struct Target {
++		uint32_t      addr, pitch, pitchMsb;
++		int           buf;            /* panel buffer 0/1, -1 = an IOSurface (scanout) */
++		SweetSurface *surface;        /* retained while the layer may read it */
++	};
++	Target        fShown, fNext;
++	bool          fNextValid;
++	/* K0d double buffer and frame end (see the top) */
++	uintptr_t     fBufKVA[2];     /* 0 = LK's buffer (fPixels), 1 = the next one in LK's memory */
++	uint64_t      fBufPA[2];
++	IOMemoryMap  *fBuf1Map;
++	bool          fFlipAllowed;   /* sweetfb_flip */
++	bool          fFlipTried, fFlipReady;
++	const char   *fFlipWhy;       /* why there are no flips */
++	int           fVblankOvl;     /* OVL whose frame-complete bit is polled */
++	bool          fVblankInten;   /* its FME_CPL interrupt enable had to be set for the bit to latch */
++	uint64_t      fPeriod, fLastVblank, fLead, fSlack;    /* absolute time */
++	uint32_t      fTickFrames;    /* panel frames per vsync tick (about 60 Hz) */
++	uint32_t      fMisses;        /* consecutive pending switches without a frame end */
++	bool          fResync;        /* the phase is unsure: poll up to a whole frame at the next switch */
++	uint64_t      fFlips, fFlipMissed, fFlipUnsure, fFlipEarly, fInPlace, fPolls, fPollAbs;
++
+ 	bool dispMap(void);
+ 	bool findLKLayer(char **out, char *end);
++	bool layerReads(uint64_t lo, uint64_t hi);
+ 	bool scanout(const uint8_t *rec);
+ 	bool layersIdle(const uint8_t *rec, uint64_t *jobs);
+ 	void scanoutStop(void);
+ 	void dispCommand(const char *args, char *out, size_t len);
++	Target bufTarget(int buf);
++	void layerWrite(const Target &t);
++	void layerApply(const Target &t);
++	void show(const Target &t);
++	void dropNext(void);
++	bool flipSetup(char **out, char *end);
++	bool vblankCalibrate(char **out, char *end);
++	uint64_t vblankPoll(uint64_t budget, const Target *t, bool *applied);
++	void vblankSeen(uint64_t at);
++	void vblankTick(void);
++	void rearm(IOTimerEventSource *timer);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -273,6 +322,20 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_gpuwait", &fGpuWaitMax, sizeof(fGpuWaitMax));
+ 	fScanOvl = -1;
+ 	fScanLock = IOLockAlloc();
++	if (fScanLock == NULL) {
++		return false;
++	}
++	fShown.buf = 0;
++	fBufKVA[0] = fPixels;
++	fBufPA[0] = fPhys;
++	fVblankOvl = -1;
++	int flip = 1;
++	PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
++	fFlipAllowed = flip != 0;
++	uint32_t us = 1000;
++	PE_parse_boot_argn("sweetfb_lead", &us, sizeof(us));        /* tick this long before the frame end */
++	nanoseconds_to_absolutetime((uint64_t)MIN(MAX(us, 200u), 4000u) * 1000, &fLead);
++	nanoseconds_to_absolutetime(20 * 1000, &fSlack);
+ 	uint32_t scan = 0;
+ 	if (PE_parse_boot_argn("vivascanout", &scan, sizeof(scan)) && scan != 0) {
+ 		/* display-sized surfaces from now on contiguous; LK's layer is looked up at the first swap */
+@@ -296,6 +359,7 @@ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
++	fb->vblankTick();               /* first: a pending layer switch happens at this frame end */
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	uint64_t values[6] = {
+@@ -318,14 +382,22 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ 		IOLockUnlock(fb->fLock);
+ 		if (step <= 6) {
++			/* the buffer on screen (a scanned-out surface: LK's buffer at once) */
++			IOLockLock(fb->fScanLock);
++			fb->dropNext();
++			if (fb->fShown.buf < 0) {
++				fb->layerApply(fb->bufTarget(0));
++			}
++			uintptr_t px = fb->fBufKVA[fb->fShown.buf];
++			IOLockUnlock(fb->fScanLock);
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				volatile uint32_t *row = (volatile uint32_t *)(px + (uint64_t)y * fb->fRowBytes);
+ 				for (uint32_t x = 0; x < fb->fWidth; x++) {
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		fb->rearm(sender);
+ 		return;
+ 	}
+ 	/* scanout or a frame held back for the GPU: every vsync */
+@@ -375,7 +447,24 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (recs != NULL) {
+ 		IOFreeData(recs, SWEET_FB_QUEUE * SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	fb->rearm(sender);
++}
++
++/* Next vsync tick: fLead before a predicted frame end, about 60 Hz (without frame ends: every 16.7 ms). */
++void
++AppleCLCD::rearm(IOTimerEventSource *timer)
++{
++	if (!fFlipReady) {
++		timer->setTimeoutUS(SWEET_FB_VSYNC_US);
++		return;
++	}
++	uint64_t now = mach_absolute_time(), step = fPeriod * fTickFrames, next = fLastVblank + step;
++	uint64_t min = 0;
++	nanoseconds_to_absolutetime(300 * 1000, &min);
++	if (next < now + fLead + min) {
++		next += ((now + fLead + min - next) / step + 1) * step;
++	}
++	timer->wakeAtTime(next - fLead);
+ }
+ 
+ void
+@@ -575,9 +664,12 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
+ 	uint64_t jobsAfter = 0;
+ 
+ 	IOLockLock(fScanLock);
+-	bool scanned = fScanOn && scanout(rec);
+-	IOLockUnlock(fScanLock);
+-	if (scanned) {
++	if (fFlipAllowed && !fFlipTried) {
++		fFlipTried = true;              /* once: findLKLayer and the frame-end calibration (< 0.1 s) */
++		flipSetup(NULL, NULL);
++	}
++	if (fScanOn && scanout(rec)) {
++		IOLockUnlock(fScanLock);
+ 		fGpuTicks = 0;
+ 		return true;
+ 	}
+@@ -592,6 +684,15 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
+ 	}
+ 	uint64_t t0 = mach_absolute_time();
+ 
++	/* each enabled layer clipped to the panel first: which buffer to draw in depends on what the frame covers */
++	struct Blit {
++		SweetSurface *s;
++		uintptr_t     src;
++		int32_t       sx, sy, dx, dy, w, h;
++		uint32_t      bpe;
++	} blit[SWEET_FB_LAYERS];
++	uint32_t nblit = 0;
++	bool full = false, usesDefault = false;
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -612,11 +713,11 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+ 		if (s == NULL || s == fSurface) {
++			usesDefault |= s != NULL;       /* drawn straight into LK's buffer */
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+ 		uintptr_t src = s->kernelAddress();
+-		sweet_surface_before_cpu_access(s);     /* the GPU may have drawn it: no stale CPU lines */
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+@@ -662,17 +763,46 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
+ 		uint32_t fmt = s->pixelFormat;
+ 		bool convert = fmt == SWEET_FB_FORMAT_W30R || fmt == SWEET_FB_FORMAT_L10R ||
+ 		    ((fmt == SWEET_FB_FORMAT_W40A || fmt == SWEET_FB_FORMAT_W40M) && bpe == 8);
+-		if (src != 0 && convert) {
+-			for (int32_t y = 0; y < h; y++) {
+-				sweet_fb_convert_row((uint32_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const uint8_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * bpe),
+-				    w, fmt);
+-			}
+-		} else if (src != 0 && bpe == 4) {
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++		if (src != 0 && !convert && bpe != 4) {
++			src = 0;
++		}
++		if (src != 0 && dx == 0 && dy == 0 && w == (int32_t)fWidth && h == (int32_t)fHeight) {
++			full = true;
++		}
++		blit[nblit++] = { s, src, sx, sy, dx, dy, w, h, bpe };
++	}
++
++	/*
++	 * K0d: into the buffer not on screen when the frame covers the whole panel (switched at the next frame end),
++	 * else into the one on screen (LK's when the console or the default surface must be seen).
++	 */
++	int shownBuf = fShown.buf;
++	int buf;
++	if (!sweet_console_muted || usesDefault) {
++		buf = 0;
++	} else if (fFlipReady && full) {
++		buf = shownBuf == 0 ? 1 : 0;
++	} else {
++		buf = shownBuf >= 0 ? shownBuf : 0;
++	}
++	uintptr_t dst = fBufKVA[buf];
++	for (uint32_t i = 0; i < nblit; i++) {
++		Blit *bl = &blit[i];
++		SweetSurface *s = bl->s;
++		if (bl->src != 0) {
++			sweet_surface_before_cpu_access(s);     /* the GPU may have drawn it: no stale CPU lines */
++			uint32_t fmt = s->pixelFormat;
++			bool convert = fmt == SWEET_FB_FORMAT_W30R || fmt == SWEET_FB_FORMAT_L10R ||
++			    ((fmt == SWEET_FB_FORMAT_W40A || fmt == SWEET_FB_FORMAT_W40M) && bl->bpe == 8);
++			for (int32_t y = 0; y < bl->h; y++) {
++				uint32_t *to = (uint32_t *)(dst + (uint64_t)(bl->dy + y) * fRowBytes + (uint64_t)bl->dx * 4);
++				const uint8_t *from = (const uint8_t *)(bl->src + s->offset + (uint64_t)(bl->sy + y) * s->bytesPerRow +
++				    (uint64_t)bl->sx * bl->bpe);
++				if (convert) {
++					sweet_fb_convert_row(to, from, bl->w, fmt);
++				} else {
++					memcpy(to, from, (size_t)bl->w * 4);
++				}
+ 			}
+ 		}
+ 		s->release();
+@@ -685,10 +815,18 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
+ 	fCopyNs += ns;
+ 	/* a GPU job used a surface while it was copied (CoreAnimation reuses it): the copy may be mixed, redo it */
+ 	if (!force && (!layersIdle(rec, &jobsAfter) || jobsAfter != jobs)) {
++		IOLockUnlock(fScanLock);
+ 		fGpuTicks++;
+ 		fGpuRecopies++;
+ 		return false;
+ 	}
++	if (buf == shownBuf) {
++		dropNext();                     /* drawn in place: an older pending switch would go back in time */
++		fInPlace++;
++	} else {
++		show(bufTarget(buf));
++	}
++	IOLockUnlock(fScanLock);
+ 	fGpuTicks = 0;
+ 	return true;
+ }
+@@ -715,6 +853,10 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
+ #define OVL_EL_PITCH(k)         (0x344 + 0x20 * (k))
+ #define OVL_EL_ADDR(k)          (0xfb0 + 4 * (k))
+ #define LARB_NON_SEC_CON(p)     (0x380 + 4 * (p))       /* bit 0: port translated by the M4U (inferred) */
++#define OVL_INTEN               0x004
++#define OVL_INTSTA              0x008   /* write 0 to a bit to clear it */
++#define OVL_INT_FME_CPL         (1u << 1)       /* frame complete */
++#define OVL_ADDCON_DBG          0x244   /* [12:0] x, [28:16] y of the pixel being blended */
+ 
+ 
+ static inline uint32_t
+@@ -747,6 +889,19 @@ disp_say(char **p, char *end, const char *fmt, ...)
+ 	}
+ }
+ 
++/* A panic draws into LK's buffer: show it (any context; registers only). */
++static void
++sweet_fb_panic_show(void)
++{
++	AppleCLCD *fb = gSweetFB;
++	if (fb != NULL && fb->fScanOvl >= 0) {
++		vm_offset_t base = fb->fDisp[fb->fScanOvl];
++		disp_wr(base, fb->fScanPitchMsbReg, fb->fLkPitchMsb);
++		disp_wr(base, fb->fScanPitchReg, fb->fLkPitch);
++		disp_wr(base, fb->fScanAddrReg, fb->fLkAddr);
++	}
++}
++
+ bool
+ AppleCLCD::dispMap(void)
+ {
+@@ -812,6 +967,7 @@ AppleCLCD::findLKLayer(char **out, char *end)
+ 	fLkAddr = disp_rd(b, fScanAddrReg);
+ 	fLkPitch = disp_rd(b, fScanPitchReg);
+ 	fLkPitchMsb = disp_rd(b, fScanPitchMsbReg);
++	sweet_fb_panic_hook = sweet_fb_panic_show;      /* from now on the layer may read something else */
+ 	/* OVL0 reads through SMI larb0 ports 1-2, OVL0_2L through larb1 ports 0-1 */
+ 	vm_offset_t larb = fDisp[fScanOvl ? 3 : 2];
+ 	uint32_t p0 = disp_rd(larb, LARB_NON_SEC_CON(fScanOvl ? 0 : 1)), p1 = disp_rd(larb, LARB_NON_SEC_CON(fScanOvl ? 1 : 2));
+@@ -862,44 +1018,338 @@ AppleCLCD::scanout(const uint8_t *rec)
+ 			fScanWhy = why;
+ 		}
+ 		OSSafeReleaseNULL(s);
+-		scanoutStop();
++		if (!fFlipReady) {
++			scanoutStop();          /* LK's buffer at once; with flips the copy's buffer follows at a frame end */
++		}
+ 		fScanFallbacks++;
+ 		return false;
+ 	}
+ 	sweet_surface_before_device_read(s);    /* CPU-drawn pixels out of the caches */
+-	uint32_t addr = (uint32_t)(pa + s->offset + (uint64_t)fOffY * s->bytesPerRow + (uint64_t)fOffX * 4);
+-	vm_offset_t base = fDisp[fScanOvl];
+-	disp_wr(base, fScanPitchMsbReg, (fLkPitchMsb & ~0xfu) | ((s->bytesPerRow >> 16) & 0xf));
+-	disp_wr(base, fScanPitchReg, (fLkPitch & ~0xffffu) | (s->bytesPerRow & 0xffff));
+-	disp_wr(base, fScanAddrReg, addr);
+-	if (!fScanActive || fScanWhy != NULL) {
+-		IOLog("SWEET FB: scanout: %s reads surface %u at 0x%08x (pitch %u)\n", fScanLayer, s->id, addr,
+-		    s->bytesPerRow);
++	Target t;
++	t.addr = (uint32_t)(pa + s->offset + (uint64_t)fOffY * s->bytesPerRow + (uint64_t)fOffX * 4);
++	t.pitchMsb = (fLkPitchMsb & ~0xfu) | ((s->bytesPerRow >> 16) & 0xf);
++	t.pitch = (fLkPitch & ~0xffffu) | (s->bytesPerRow & 0xffff);
++	t.buf = -1;
++	t.surface = s;                          /* keeps the memory alive while the OVL reads it */
++	if (fShown.buf >= 0 || fScanWhy != NULL) {
++		IOLog("SWEET FB: scanout: %s reads surface %u at 0x%08x (pitch %u)%s\n", fScanLayer, s->id, t.addr,
++		    s->bytesPerRow, fFlipReady ? " from the next frame end" : "");
+ 		fScanWhy = NULL;
+ 	}
+-	fScanActive = true;
+-	SweetSurface *old = fScanSurface;
+-	fScanSurface = s;                       /* keeps the memory alive while the OVL reads it */
+-	OSSafeReleaseNULL(old);
++	show(t);
+ 	fScanFrames++;
+ 	return true;
+ }
+ 
+-/* Back to LK's buffer (the CPU copy). */
++/* Back to LK's buffer (the CPU copy), at once. */
+ void
+ AppleCLCD::scanoutStop(void)
+ {
+-	if (fScanActive && fScanOvl >= 0) {
+-		vm_offset_t base = fDisp[fScanOvl];
+-		disp_wr(base, fScanAddrReg, fLkAddr);
+-		disp_wr(base, fScanPitchMsbReg, fLkPitchMsb);
+-		disp_wr(base, fScanPitchReg, fLkPitch);
+-	}
+-	fScanActive = false;
+-	OSSafeReleaseNULL(fScanSurface);
++	dropNext();
++	if (fShown.buf < 0) {
++		layerApply(bufTarget(0));
++	}
++}
++
++/* ---- K0d: layer switches at the panel's frame end ---- */
++
++AppleCLCD::Target
++AppleCLCD::bufTarget(int buf)
++{
++	Target t;
++	t.addr = (uint32_t)fBufPA[buf];
++	t.pitch = fLkPitch;
++	t.pitchMsb = fLkPitchMsb;
++	t.buf = buf;
++	t.surface = NULL;
++	return t;
++}
++
++void
++AppleCLCD::layerWrite(const Target &t)
++{
++	if (fScanOvl < 0) {
++		return;                 /* LK's layer unknown: only its own buffer is ever shown */
++	}
++	vm_offset_t base = fDisp[fScanOvl];
++	disp_wr(base, fScanPitchMsbReg, t.pitchMsb);
++	disp_wr(base, fScanPitchReg, t.pitch);
++	disp_wr(base, fScanAddrReg, t.addr);
++}
++
++/* fScanLock: t is on the layer from now on (written already when written is true); takes t's surface reference. */
++void
++AppleCLCD::layerApply(const Target &t)
++{
++	layerWrite(t);
++	SweetSurface *old = fShown.surface;
++	fShown = t;
++	OSSafeReleaseNULL(old);
++}
++
++/* fScanLock: show t from the next frame end (with flips) or at once; takes t's surface reference. */
++void
++AppleCLCD::show(const Target &t)
++{
++	if (!fFlipReady) {
++		layerApply(t);
++		return;
++	}
++	dropNext();
++	fNext = t;
++	fNextValid = true;
+ }
+ 
+-/* USB link "disp [regs|scanout on|off]". */
++void
++AppleCLCD::dropNext(void)
++{
++	if (fNextValid) {
++		OSSafeReleaseNULL(fNext.surface);
++		fNextValid = false;
++	}
++}
++
++/* Any enabled OVL layer (except LK's) reading [lo, hi). */
++bool
++AppleCLCD::layerReads(uint64_t lo, uint64_t hi)
++{
++	for (int o = 0; o < 2; o++) {
++		vm_offset_t b = fDisp[o];
++		if (!(disp_rd(b, OVL_EN) & 1)) {
++			continue;
++		}
++		for (int n = 0; n < (o ? 2 : 4); n++) {
++			uint32_t addr = disp_rd(b, OVL_L_ADDR(n));
++			if ((disp_rd(b, OVL_SRC_CON) & (1u << n)) && addr >= lo && addr < hi &&
++			    !(o == fScanOvl && OVL_L_ADDR(n) == fScanAddrReg)) {
++				return true;
++			}
++		}
++		for (int k = 0; o == 0 && k < 3; k++) {
++			uint32_t addr = disp_rd(b, OVL_EL_ADDR(k));
++			if ((disp_rd(b, OVL_DATAPATH_EXT_CON) & (1u << k)) && addr >= lo && addr < hi &&
++			    !(o == fScanOvl && OVL_EL_ADDR(k) == fScanAddrReg)) {
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
++/*
++ * fScanLock. Double buffering: LK's layer must read LK's buffer (fPhys), LK's next buffer must be read by no other
++ * layer, and the OVL must report frame ends. Otherwise fFlipWhy says why and everything stays as before.
++ */
++bool
++AppleCLCD::flipSetup(char **out, char *end)
++{
++	fFlipReady = false;
++	dropNext();
++	uint64_t size = (uint64_t)fRowBytes * fHeight, pa1 = fPhys + size;
++	const char *why = NULL;
++	if (fScanOvl < 0 && !findLKLayer(out, end)) {
++		why = "LK's layer not found";
++	} else if (fLkAddr != fPhys) {
++		why = "LK's layer does not read the boot framebuffer";
++	} else if (pa1 + size > (1ull << 32)) {
++		why = "LK's next buffer above 4 GiB";
++	} else if (layerReads(pa1, pa1 + size)) {
++		why = "another OVL layer reads LK's next buffer";
++	} else {
++		if (fBuf1Map == NULL) {
++			IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa1, size, kIODirectionInOut);
++			fBuf1Map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++			OSSafeReleaseNULL(md);
++		}
++		if (fBuf1Map == NULL) {
++			why = "LK's next buffer not mappable";
++		} else {
++			fBufKVA[1] = (uintptr_t)fBuf1Map->getVirtualAddress();
++			fBufPA[1] = pa1;
++			if (!vblankCalibrate(out, end)) {
++				why = "no frame-end status from the OVL";
++			}
++		}
++	}
++	fFlipWhy = why;
++	if (why != NULL) {
++		IOLog("SWEET FB: double buffer off (%s): copies go to the buffer on screen\n", why);
++		disp_say(out, end, "double buffer off: %s\n", why);
++		return false;
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(fPeriod, &ns);
++	IOLog("SWEET FB: double buffer: 0x%llx / 0x%llx, frame end from %s INTSTA%s, panel frame %llu us, vsync every %u "
++	    "frame(s)\n", fBufPA[0], fBufPA[1], fVblankOvl ? "OVL0_2L" : "OVL0", fVblankInten ? " (INTEN set)" : "",
++	    ns / 1000, fTickFrames);
++	disp_say(out, end, "double buffer on: 0x%llx / 0x%llx, frame %llu us\n", fBufPA[0], fBufPA[1], ns / 1000);
++	fMisses = 0;
++	fResync = false;
++	fFlipReady = true;
++	return true;
++}
++
++/*
++ * fScanLock. Three frame ends in a row on LK's OVL (or the other one, which runs in the same pipe), first with the
++ * status bit as LK left the interrupt enables, then with FME_CPL enabled (the OVL's GIC line has no handler: the GIC
++ * driver masks it if it ever fires). Busy for at most ~0.25 s, once.
++ */
++bool
++AppleCLCD::vblankCalibrate(char **out, char *end)
++{
++	uint64_t limit, lo, hi;
++	nanoseconds_to_absolutetime(40 * 1000 * 1000, &limit);
++	nanoseconds_to_absolutetime(4 * 1000 * 1000, &lo);
++	nanoseconds_to_absolutetime(40 * 1000 * 1000, &hi);
++	for (int k = 0; k < 2; k++) {
++		int o = k == 0 ? fScanOvl : 1 - fScanOvl;
++		vm_offset_t b = fDisp[o];
++		if (!(disp_rd(b, OVL_EN) & 1)) {
++			continue;
++		}
++		for (int inten = 0; inten < 2; inten++) {
++			uint32_t was = disp_rd(b, OVL_INTEN);
++			if (inten) {
++				if (was & OVL_INT_FME_CPL) {
++					break;
++				}
++				disp_wr(b, OVL_INTEN, was | OVL_INT_FME_CPL);
++			}
++			fVblankOvl = o;
++			uint64_t t[3] = { 0, 0, 0 };
++			bool applied;
++			for (int i = 0; i < 3; i++) {
++				t[i] = vblankPoll(limit, NULL, &applied);
++				if (t[i] == 0) {
++					break;
++				}
++			}
++			uint64_t p1 = t[1] - t[0], p2 = t[2] - t[1];
++			if (t[2] != 0 && p1 >= lo && p1 <= hi && (p1 > p2 ? p1 - p2 : p2 - p1) <= p1 / 10) {
++				fVblankInten = inten != 0;
++				fPeriod = (t[2] - t[0]) / 2;
++				fLastVblank = t[2];
++				uint64_t tick;
++				nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000, &tick);
++				fTickFrames = (uint32_t)MAX((tick + fPeriod / 2) / fPeriod, 1ull);
++				return true;
++			}
++			disp_say(out, end, "%s INTSTA (INTEN %s): frame ends at +0 / +%llu / +%llu ticks: not usable\n",
++			    o ? "OVL0_2L" : "OVL0", inten ? "set" : "as LK left it", t[1] ? p1 : 0, t[2] ? p2 : 0);
++			if (inten) {
++				disp_wr(b, OVL_INTEN, was);
++			}
++		}
++	}
++	fVblankOvl = -1;
++	return false;
++}
++
++/*
++ * fScanLock. Busy-poll fVblankOvl's frame-complete bit for at most `budget` (absolute time), the bit cleared first
++ * (older frame ends are of no use). Returns when it rose, 0 = not within the budget. With t, the layer registers
++ * are written right then, interrupts off from reading the bit to the last write, unless the previous read was more
++ * than fSlack earlier (the poll was held up: the frame end may be long past, too late to switch safely).
++ */
++uint64_t
++AppleCLCD::vblankPoll(uint64_t budget, const Target *t, bool *applied)
++{
++	vm_offset_t b = fDisp[fVblankOvl];
++	*applied = false;
++	disp_wr(b, OVL_INTSTA, disp_rd(b, OVL_INTSTA) & ~OVL_INT_FME_CPL);
++	uint64_t t0 = mach_absolute_time(), prev = t0, now = t0, edge = 0;
++	while (now - t0 < budget) {
++		boolean_t was = ml_set_interrupts_enabled(FALSE);
++		uint32_t s = disp_rd(b, OVL_INTSTA);
++		now = mach_absolute_time();
++		if (s & OVL_INT_FME_CPL) {
++			if (t != NULL && now - prev <= fSlack) {
++				layerWrite(*t);
++				*applied = true;
++			}
++			ml_set_interrupts_enabled(was);
++			disp_wr(b, OVL_INTSTA, disp_rd(b, OVL_INTSTA) & ~OVL_INT_FME_CPL);
++			edge = now;
++			break;
++		}
++		ml_set_interrupts_enabled(was);
++		prev = now;
++	}
++	fPolls++;
++	fPollAbs += now - t0;
++	return edge;
++}
++
++/* A frame end seen at `at`: the phase, and the period refined (panel clocks drift a little from the calibration). */
++void
++AppleCLCD::vblankSeen(uint64_t at)
++{
++	if (fLastVblank != 0 && at > fLastVblank) {
++		uint64_t n = (at - fLastVblank + fPeriod / 2) / fPeriod;
++		if (n >= 1 && n <= 600) {
++			fPeriod = (fPeriod * 7 + (at - fLastVblank) / n) / 8;
++		}
++	}
++	fLastVblank = at;
++}
++
++/*
++ * Vsync tick (timer, before anything else): a pending switch happens at the predicted frame end, which is about
++ * fLead away. Too far (the timer was late, or early): next tick. After a miss the next try polls up to a whole
++ * frame to find the phase again; after 8 misses in a row double buffering stops.
++ */
++void
++AppleCLCD::vblankTick(void)
++{
++	IOLockLock(fScanLock);
++	if (!fFlipReady || !fNextValid) {
++		IOLockUnlock(fScanLock);
++		return;
++	}
++	uint64_t now = mach_absolute_time(), margin;
++	nanoseconds_to_absolutetime(500 * 1000, &margin);
++	uint64_t next = fLastVblank + fPeriod;
++	if (next < now) {
++		next += ((now - next) / fPeriod + 1) * fPeriod;
++	}
++	uint64_t budget;
++	if (fResync) {
++		budget = fPeriod + fPeriod / 4;
++	} else if (next - now <= fLead + margin) {
++		budget = next - now + margin;
++	} else {
++		fFlipEarly++;           /* not near a frame end now: the next tick is */
++		IOLockUnlock(fScanLock);
++		return;
++	}
++	bool applied = false;
++	uint64_t at = vblankPoll(budget, &fNext, &applied);
++	if (at != 0) {
++		vblankSeen(at);
++		fResync = false;
++		fMisses = 0;
++	}
++	if (applied) {
++		layerApply(fNext);      /* written at the frame end already: bookkeeping */
++		fNextValid = false;
++		fFlips++;
++	} else if (at != 0) {
++		fFlipUnsure++;          /* held up while polling: switch at the next frame end */
++	} else {
++		fFlipMissed++;
++		fResync = true;
++		if (++fMisses >= 8) {
++			fFlipReady = false;
++			fFlipWhy = "frame ends stopped";
++			IOLog("SWEET FB: double buffer off: no frame end in 8 tries\n");
++			layerApply(fNext);
++			fNextValid = false;
++		}
++	}
++	IOLockUnlock(fScanLock);
++}
++
++/* USB link "disp [regs|scanout on|off|flip on|off]". */
+ void
+ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
+ {
+@@ -915,8 +1365,10 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
+ 		} else {
+ 			for (int o = 0; o < 2; o++) {
+ 				vm_offset_t b = fDisp[o];
+-				disp_say(&p, end, "%s: en 0x%08x roi 0x%08x src_con 0x%08x ext 0x%08x\n", o ? "OVL0_2L" : "OVL0",
+-				    disp_rd(b, OVL_EN), disp_rd(b, OVL_ROI_SIZE), disp_rd(b, OVL_SRC_CON), disp_rd(b, OVL_DATAPATH_EXT_CON));
++				disp_say(&p, end, "%s: en 0x%08x roi 0x%08x src_con 0x%08x ext 0x%08x inten 0x%08x intsta 0x%08x "
++				    "addcon_dbg 0x%08x\n", o ? "OVL0_2L" : "OVL0", disp_rd(b, OVL_EN), disp_rd(b, OVL_ROI_SIZE),
++				    disp_rd(b, OVL_SRC_CON), disp_rd(b, OVL_DATAPATH_EXT_CON), disp_rd(b, OVL_INTEN), disp_rd(b, OVL_INTSTA),
++				    disp_rd(b, OVL_ADDCON_DBG));
+ 				for (int n = 0; n < (o ? 2 : 4); n++) {
+ 					disp_say(&p, end, "  L%d con 0x%08x size 0x%08x off 0x%08x pitch 0x%08x/0x%x addr 0x%08x\n", n,
+ 					    disp_rd(b, OVL_L_CON(n)), disp_rd(b, OVL_L_SRC_SIZE(n)), disp_rd(b, OVL_L_OFFSET(n)),
+@@ -951,16 +1403,40 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
+ 		scanoutStop();
+ 		fDirty = true;
+ 		disp_say(&p, end, "scanout off: LK's buffer and the CPU copy again\n");
++	} else if (strncmp(args, "flip on", 7) == 0) {
++		fFlipAllowed = fFlipTried = true;
++		if (fFlipReady || flipSetup(&p, end)) {
++			fDirty = true;
++			disp_say(&p, end, "double buffer on\n");
++		}
++	} else if (strncmp(args, "flip off", 8) == 0) {
++		fFlipAllowed = false;
++		fFlipReady = false;
++		fFlipWhy = "disp flip off";
++		dropNext();
++		if (fShown.buf == 1) {
++			layerApply(bufTarget(0));       /* redrawn at the next tick */
++		}
++		fDirty = true;
++		disp_say(&p, end, "double buffer off: copies go to LK's buffer on screen\n");
+ 	} else {
+ 		disp_say(&p, end, "display %ux%u (shown as %ux%u), scanout %s%s, layer %s, %llu frames scanned out, "
+ 		    "%llu copied%s%s\n", fWidth, fHeight, fLogicalW, fLogicalH, fScanOn ? "on" : "off",
+-		    fScanActive ? " (active)" : "", fScanOvl >= 0 ? fScanLayer : "?", fScanFrames, fScanFallbacks,
++		    fShown.buf < 0 ? " (active)" : "", fScanOvl >= 0 ? fScanLayer : "?", fScanFrames, fScanFallbacks,
+ 		    fScanWhy ? ", last reason: " : "", fScanWhy ? fScanWhy : "");
+ 		disp_say(&p, end, "copies: %llu, avg %llu us, refresh %s%u\n", fCopies, fCopies ? fCopyNs / fCopies / 1000 : 0,
+ 		    fFlushTicks ? "every N vsyncs, N = " : "adaptive, CPU duty % = ", fFlushTicks ? fFlushTicks : fDuty);
+ 		disp_say(&p, end, "GPU sync (K0c): %llu vsyncs waited for the GPU, %llu copies redone, %llu frames shown anyway "
+ 		    "(sweetfb_gpuwait=%u)\n", fGpuWaits, fGpuRecopies, fGpuForced, fGpuWaitMax);
+-		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off]\n");
++		uint64_t pns = 0, polls = fPolls ? fPolls : 1, pollNs;
++		absolutetime_to_nanoseconds(fPeriod, &pns);
++		absolutetime_to_nanoseconds(fPollAbs / polls, &pollNs);
++		disp_say(&p, end, "double buffer (K0d) %s%s%s: on screen %s%d, frame %llu us, %llu switches at a frame end, %llu "
++		    "in place, %llu missed, %llu unsure, %llu deferred; poll avg %llu us\n", fFlipReady ? "on" : "off",
++		    fFlipWhy ? ": " : "", fFlipWhy ? fFlipWhy : "", fShown.buf < 0 ? "surface" : "buffer ",
++		    fShown.buf < 0 ? 0 : fShown.buf, pns / 1000, fFlips, fInPlace, fFlipMissed, fFlipUnsure, fFlipEarly,
++		    pollNs / 1000);
++		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off|flip on|flip off]\n");
+ 	}
+ 	IOLockUnlock(fScanLock);
+ }
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index 9951000..bdd683b 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -23,7 +23,9 @@
+  *   4 KiB, four per XNU page), bound to a hardware AS on demand (LRU);
+  *   slot 0 fragment, slot 1 vertex/tiler/compute, one chain per slot on
+  *   the hardware, FIFO per slot, a chain starts when its input fences have
+- *   signalled; GPU caches cleaned and invalidated around every chain;
++ *   signalled (a queue head waiting only for chains on the hardware is
++ *   started by the job interrupt's filter, K0e); GPU caches cleaned and
++ *   invalidated around every chain;
+  *   tiler heaps grow by 2 MiB on translation faults; any other fault fails
+  *   the chain and disables its address space (never a panic); a chain that
+  *   runs longer than 3 s is hard-stopped, a slot that ignores the stop
+@@ -396,6 +398,7 @@ VivaGPUFence::create(bool isSignalled)
+ 	if (f != NULL) {
+ 		f->signalled = isSignalled;
+ 		f->error = kIOReturnSuccess;
++		f->signalAt = 0;
+ 	}
+ 	return f;
+ }
+@@ -412,6 +415,7 @@ struct VivaGPUJob {
+ 	VivaGPUFence *fence;
+ 	uint64_t      startMs;
+ 	uint32_t      flushId;  /* GPU_LATEST_FLUSH at submit (flush reduction) */
++	uint64_t      submitAt, startAt;        /* mach_absolute_time (latency accounting) */
+ };
+ 
+ /* ---- address spaces ---- */
+@@ -849,6 +853,9 @@ VivaGPUAccelerator::start(IOService *provider)
+ 	flag = 1;
+ 	PE_parse_boot_argn("vivagpudvfs", &flag, sizeof(flag));
+ 	fDvfs = flag != 0;
++	flag = 1;
++	PE_parse_boot_argn("vivagpufastkick", &flag, sizeof(flag));
++	fFastKick = flag != 0;
+ 	uint32_t maxMhz = 950;
+ 	PE_parse_boot_argn("vivagpufreqmax", &maxMhz, sizeof(maxMhz));
+ 	fDvfsFast = oppForMHz(maxMhz);
+@@ -864,8 +871,9 @@ VivaGPUAccelerator::start(IOService *provider)
+ 	fProbeMode = 1;
+ 	PE_parse_boot_argn("vivagpuprobe", &fProbeMode, sizeof(fProbeMode));
+ 	fProbeLock = IOLockAlloc();
++	fFastLock = IOSimpleLockAlloc();
+ 	fWorkLoop = IOWorkLoop::workLoop();
+-	if (fWorkLoop == NULL || fProbeLock == NULL || !IOAcceleratorES::start(provider)) {
++	if (fWorkLoop == NULL || fProbeLock == NULL || fFastLock == NULL || !IOAcceleratorES::start(provider)) {
+ 		return false;
+ 	}
+ 	for (int i = 0; i < 6; i++) {
+@@ -898,7 +906,13 @@ VivaGPUAccelerator::start(IOService *provider)
+ 		return false;
+ 	}
+ 	for (int i = 0; i < 3; i++) {
+-		fIrq[i] = IOInterruptEventSource::interruptEventSource(this, actions[i], provider, i);
++		/* the job interrupt has a filter: K0e fast kick and the interrupt timestamps */
++		if (i == 2) {
++			fIrq[i] = IOFilterInterruptEventSource::filterInterruptEventSource(this, actions[i],
++			    &VivaGPUAccelerator::jobFilter, provider, i);
++		} else {
++			fIrq[i] = IOInterruptEventSource::interruptEventSource(this, actions[i], provider, i);
++		}
+ 		if (fIrq[i] == NULL || fWorkLoop->addEventSource(fIrq[i]) != kIOReturnSuccess) {
+ 			IOLog("VIVA GPU: no interrupt %d\n", i);
+ 			return false;
+@@ -957,6 +971,10 @@ VivaGPUAccelerator::free(void)
+ 	if (fHeapList != NULL) {
+ 		IODelete(fHeapList, VivaGPUBO *, fHeapCap);
+ 	}
++	if (fFastLock != NULL) {
++		IOSimpleLockFree(fFastLock);
++		fFastLock = NULL;
++	}
+ 	if (fProbeLock != NULL) {
+ 		IOLockFree(fProbeLock);
+ 	}
+@@ -1876,6 +1894,7 @@ VivaGPUAccelerator::powerOn(char **out, char *end)
+ 	}
+ 	IOLog("VIVA GPU: id 0x%08x cores 0x%llx l2 on\n", fGpuId, fShaderPresent);
+ 	fPowered = true;
++	fastLive(true);
+ 	for (int i = 0; i < 3; i++) {
+ 		fIrq[i]->enable();
+ 	}
+@@ -1889,6 +1908,8 @@ VivaGPUAccelerator::powerOff(char **out, char *end)
+ 		mfgOff(out, end);
+ 		return;
+ 	}
++	fastSync();
++	fastLive(false);        /* the filter no longer touches the registers */
+ 	for (int i = 0; i < 3; i++) {
+ 		fIrq[i]->disable();
+ 	}
+@@ -2175,6 +2196,7 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
+ 	}
+ 	job->fence = fence;
+ 	fence->retain();
++	job->submitAt = mach_absolute_time();
+ 	uint32_t slot = (requirements & VGPU_JD_REQ_FS) ? 0 : 1;
+ 	if (fQueueTail[slot] != NULL) {
+ 		fQueueTail[slot]->next = job;
+@@ -2182,6 +2204,7 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
+ 		fQueue[slot] = job;
+ 	}
+ 	fQueueTail[slot] = job;
++	stateUpdate(job->submitAt);
+ 	kick();
+ 	uint64_t ns;
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+@@ -2287,6 +2310,7 @@ VivaGPUAccelerator::kick(void)
+ 	if (!fPowered) {
+ 		return;
+ 	}
++	fastSync();
+ 	for (uint32_t slot = 0; slot < 2; slot++) {
+ 		VivaGPUJob *job = fQueue[slot];
+ 		if (fRunning[slot] != NULL || job == NULL) {
+@@ -2309,26 +2333,25 @@ VivaGPUAccelerator::kick(void)
+ 		job->next = NULL;
+ 		startJob(slot, job);
+ 	}
++	fastArm();
+ }
+ 
++uint32_t
++VivaGPUAccelerator::jsConfig(VivaGPUJob *job)
++{
++	return (uint32_t)job->vm->asSlot | JS_CFG_THREAD_PRI(8) | JS_CFG_START_FLUSH_CLEAN_INV | JS_CFG_END_FLUSH_CLEAN_INV;
++}
++
++/* The job slot registers that start `job` on the idle `slot`: gated, or from the job interrupt filter. */
+ void
+-VivaGPUAccelerator::startJob(uint32_t slot, VivaGPUJob *job)
++VivaGPUAccelerator::jsWrite(uint32_t slot, VivaGPUJob *job, uint32_t config)
+ {
+ 	uint32_t js = JS_BASE(slot);
+-	if (fRunning[0] == NULL && fRunning[1] == NULL) {
+-		fBusyStart = mach_absolute_time();      /* GPU busy from now (DVFS load) */
+-	}
+-	fRunning[slot] = job;
+-	fStopDeadline[slot] = 0;
+-	job->vm->running++;
+-	job->startMs = nowMs();
+-	fJobs++;
+ 	wr(js + JS_HEAD_NEXT_LO, (uint32_t)job->jc);
+ 	wr(js + JS_HEAD_NEXT_HI, (uint32_t)(job->jc >> 32));
+ 	wr(js + JS_AFFINITY_NEXT_LO, (uint32_t)fShaderPresent);
+ 	wr(js + JS_AFFINITY_NEXT_HI, (uint32_t)(fShaderPresent >> 32));
+-	wr(js + JS_CONFIG_NEXT, (uint32_t)job->vm->asSlot | JS_CFG_THREAD_PRI(8) | JS_CFG_START_FLUSH_CLEAN_INV |
+-	    JS_CFG_END_FLUSH_CLEAN_INV);
++	wr(js + JS_CONFIG_NEXT, config);
+ 	/*
+ 	 * Flush reduction (as Linux's panfrost on FLUSH_REDUCTION GPUs, every Valhall): the start-of-chain L2 clean +
+ 	 * invalidate is skipped when a flush happened after the job was submitted. Every chain ends with one, so
+@@ -2338,6 +2361,39 @@ VivaGPUAccelerator::startJob(uint32_t slot, VivaGPUJob *job)
+ 		wr(js + JS_FLUSH_ID_NEXT, job->flushId);
+ 	}
+ 	wr(js + JS_COMMAND_NEXT, JS_CMD_START);
++}
++
++void
++VivaGPUAccelerator::startJob(uint32_t slot, VivaGPUJob *job)
++{
++	job->vm->running++;
++	jsWrite(slot, job, jsConfig(job));
++	jobStarted(slot, job, mach_absolute_time(), false);
++}
++
++/* Gated: `job` runs on `slot` since `at` (started here or by the filter; vm->running already counts it). */
++void
++VivaGPUAccelerator::jobStarted(uint32_t slot, VivaGPUJob *job, uint64_t at, bool fromFilter)
++{
++	if (fRunning[0] == NULL && fRunning[1] == NULL) {
++		fBusyStart = at;        /* GPU busy from now (DVFS load) */
++	}
++	fRunning[slot] = job;
++	fStopDeadline[slot] = 0;
++	job->startMs = nowMs();
++	job->startAt = at;
++	fJobs++;
++	/* start latency: from the moment it could run (submitted, every dependency signalled) */
++	uint64_t ready = job->submitAt;
++	for (unsigned int i = 0; job->deps != NULL && i < job->deps->getCount(); i++) {
++		ready = MAX(ready, ((VivaGPUFence *)job->deps->getObject(i))->signalAt);
++	}
++	uint32_t kind = ready == job->submitAt ? 0 : fromFilter ? 2 : 1;
++	uint64_t lat = at > ready ? at - ready : 0;
++	fLatN[kind]++;
++	fLatSum[kind] += lat;
++	fLatMax[kind] = MAX(fLatMax[kind], lat);
++	stateUpdate(at);
+ 	if (!fTimerArmed) {
+ 		fTimerArmed = true;
+ 		fTimer->setTimeoutMS(TIMER_MS);
+@@ -2351,19 +2407,27 @@ VivaGPUAccelerator::startJob(uint32_t slot, VivaGPUJob *job)
+ }
+ 
+ void
+-VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status)
++VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status, uint64_t at)
+ {
+ 	VivaGPUJob *job = fRunning[slot];
+ 	if (job == NULL) {
+ 		return;
+ 	}
++	if (at == 0) {
++		at = mach_absolute_time();
++	}
+ 	fRunning[slot] = NULL;
+ 	fStopDeadline[slot] = 0;
+ 	job->vm->running--;
+ 	if (fRunning[0] == NULL && fRunning[1] == NULL && fBusyStart != 0) {
+-		fBusyNs += mach_absolute_time() - fBusyStart;   /* absolute-time units */
++		fBusyNs += at > fBusyStart ? at - fBusyStart : 0;       /* absolute-time units */
+ 		fBusyStart = 0;
+ 	}
++	if (error == kIOReturnSuccess && at > job->startAt) {
++		fExecN++;
++		fExecSum += at - job->startAt;
++	}
++	stateUpdate(at);
+ 	if (error != kIOReturnSuccess) {
+ 		fJobFaults++;
+ 		if (fJobFaults <= 32) {
+@@ -2406,6 +2470,7 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status)
+ 	}
+ 	job->fence->signalled = true;
+ 	job->fence->error = error;
++	job->fence->signalAt = at;
+ 	OSSafeReleaseNULL(job->deps);
+ 	OSSafeReleaseNULL(job->bos);
+ 	OSSafeReleaseNULL(job->fence);
+@@ -2442,6 +2507,8 @@ VivaGPUAccelerator::resetGPU(const char *why)
+ 	fResets++;
+ 	fWatchFragment = false;
+ 	IOLog("VIVA GPU: reset (%s)\n", why);
++	fastSync();             /* a job the filter started is one of the running ones */
++	fastLive(false);
+ 	wr(JOB_INT_MASK, 0);
+ 	wr(MMU_INT_MASK, 0);
+ 	softReset();            /* stop the GPU before the jobs' memory is released */
+@@ -2462,6 +2529,7 @@ VivaGPUAccelerator::resetGPU(const char *why)
+ 		fPowered = false;
+ 		return;
+ 	}
++	fastLive(true);
+ 	kick();
+ }
+ 
+@@ -2490,6 +2558,7 @@ VivaGPUAccelerator::mmuInterrupt(OSObject *owner, IOInterruptEventSource *src __
+ 	if (self == NULL || !self->fPowered) {
+ 		return;
+ 	}
++	self->fastSync();       /* nothing armed while address spaces change (re-armed at the next kick) */
+ 	uint32_t stat = self->rd(MMU_INT_STAT);
+ 	for (uint32_t as = 0; as < self->fASCount; as++) {
+ 		uint32_t bits = stat & ((1u << as) | (1u << (16 + as)));
+@@ -2546,6 +2615,7 @@ VivaGPUAccelerator::jobInterrupt(OSObject *owner, IOInterruptEventSource *src __
+ 	if (self == NULL || !self->fPowered) {
+ 		return;
+ 	}
++	self->fastSync();       /* the jobs the filter saw done, the ones it started */
+ 	uint32_t stat = self->rd(JOB_INT_STAT);
+ 	for (uint32_t slot = 0; slot < 3; slot++) {
+ 		uint32_t done = 1u << slot, fail = 1u << (16 + slot);
+@@ -2587,6 +2657,223 @@ VivaGPUAccelerator::jobInterrupt(OSObject *owner, IOInterruptEventSource *src __
+ 	self->kick();
+ }
+ 
++/*
++ * K0e. The job interrupt's filter, primary interrupt context (CPU 0, interrupts off). Clears the done bits it sees
++ * (the failures stay for the gated handler), notes when they came, and starts each armed job whose awaited slots
++ * are now all done. Always true when there was something: the source stays masked until the handler has run, so
++ * the filter runs at most once per handler run.
++ */
++bool
++VivaGPUAccelerator::jobFilter(OSObject *owner, IOFilterInterruptEventSource *src __unused)
++{
++	return ((VivaGPUAccelerator *)owner)->jobFilterRun();
++}
++
++bool
++VivaGPUAccelerator::jobFilterRun(void)
++{
++	IOSimpleLockLock(fFastLock);
++	if (!fFastOn) {
++		IOSimpleLockUnlock(fFastLock);
++		return true;            /* GPU off or resetting: the handler sorts it out */
++	}
++	uint32_t stat = rd(JOB_INT_STAT);
++	if (stat == 0) {
++		IOSimpleLockUnlock(fFastLock);
++		return false;
++	}
++	uint64_t now = mach_absolute_time();
++	for (uint32_t slot = 0; slot < 2; slot++) {
++		if (stat & (0x10001u << slot)) {
++			fIrqAt[slot] = now;
++		}
++	}
++	uint32_t done = stat & 3u & ~(stat >> 16);
++	if (done != 0) {
++		wr(JOB_INT_CLEAR, done);
++		fIrqDone |= done;
++	}
++	for (uint32_t slot = 0; slot < 2 && fFastKick; slot++) {
++		FastArm *a = &fArm[slot];
++		if (a->job != NULL && !a->started && (a->wait & ~fIrqDone) == 0) {
++			jsWrite(slot, a->job, a->config);
++			a->started = true;
++			a->startAt = mach_absolute_time();
++		}
++	}
++	IOSimpleLockUnlock(fFastLock);
++	return true;
++}
++
++/* Gated: filter on/off with the GPU's power (off: it must not read the registers; on: nothing left from before). */
++void
++VivaGPUAccelerator::fastLive(bool live)
++{
++	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fFastLock);
++	fFastOn = live;
++	fIrqDone = 0;
++	bzero(fArm, sizeof(fArm));
++	IOSimpleLockUnlockEnableInterrupt(fFastLock, is);
++}
++
++/*
++ * Gated, before anything looks at fRunning/fQueue: complete the jobs the filter saw done (at the time it saw them),
++ * take over the jobs it started, release the reservation of those it did not. Nothing is armed afterwards (until
++ * fastArm), so the filter cannot start a job behind the gated code's back.
++ */
++void
++VivaGPUAccelerator::fastSync(void)
++{
++	FastArm arm[2];
++	uint64_t at[2];
++	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fFastLock);
++	uint32_t done = fIrqDone;
++	fIrqDone = 0;
++	at[0] = fIrqAt[0];
++	at[1] = fIrqAt[1];
++	memcpy(arm, fArm, sizeof(arm));
++	bzero(fArm, sizeof(fArm));
++	IOSimpleLockUnlockEnableInterrupt(fFastLock, is);
++
++	if (done != 0) {
++		uint64_t now = mach_absolute_time(), first = (done & 1) ? at[0] : at[1];
++		if ((done & 3) == 3) {
++			first = MIN(at[0], at[1]);
++		}
++		uint64_t d = now > first ? now - first : 0;
++		fIrqN++;
++		fIrqSum += d;
++		fIrqMax = MAX(fIrqMax, d);
++	}
++	for (uint32_t slot = 0; slot < 2; slot++) {
++		if (done & (1u << slot)) {
++			if (slot == 0) {
++				fWatchFragment = false;
++			}
++			completeJob(slot, kIOReturnSuccess, 0x01, at[slot]);
++		}
++	}
++	for (uint32_t slot = 0; slot < 2; slot++) {
++		VivaGPUJob *job = arm[slot].job;
++		if (job == NULL) {
++			continue;
++		}
++		if (!arm[slot].started) {
++			job->vm->running--;             /* reservation of fastArm */
++			continue;
++		}
++		/* armed = head of its queue, and nothing dequeues without fastSync first */
++		fQueue[slot] = job->next;
++		if (fQueue[slot] == NULL) {
++			fQueueTail[slot] = NULL;
++		}
++		job->next = NULL;
++		fFastStarts++;
++		jobStarted(slot, job, arm[slot].startAt, true);
++	}
++}
++
++/*
++ * Gated, after kick: arm the head of each slot's queue when every dependency it still waits for is a job on the
++ * hardware (and its own slot frees up when that slot's job is done). Its address space is bound now and reserved
++ * (vm->running) so it is not given away before the filter starts it.
++ */
++void
++VivaGPUAccelerator::fastArm(void)
++{
++	if (!fFastKick || !fFastOn) {
++		return;
++	}
++	for (uint32_t slot = 0; slot < 2; slot++) {
++		VivaGPUJob *job = fQueue[slot];
++		if (job == NULL) {
++			continue;
++		}
++		uint32_t wait = fRunning[slot] != NULL ? 1u << slot : 0;
++		bool ok = true;
++		for (unsigned int i = 0; ok && job->deps != NULL && i < job->deps->getCount(); i++) {
++			VivaGPUFence *f = (VivaGPUFence *)job->deps->getObject(i);
++			if (f->signalled) {
++				continue;
++			}
++			if (fRunning[0] != NULL && f == fRunning[0]->fence) {
++				wait |= 1;
++			} else if (fRunning[1] != NULL && f == fRunning[1]->fence) {
++				wait |= 2;
++			} else {
++				ok = false;             /* waits for a queued job or a syncobj: the normal path */
++			}
++		}
++		if (!ok || wait == 0 || !asBind(job->vm)) {
++			continue;
++		}
++		job->vm->running++;
++		IOInterruptState is = IOSimpleLockLockDisableInterrupt(fFastLock);
++		fArm[slot].job = job;
++		fArm[slot].wait = wait;
++		fArm[slot].config = jsConfig(job);
++		fArm[slot].started = false;
++		fArm[slot].startAt = 0;
++		IOSimpleLockUnlockEnableInterrupt(fFastLock, is);
++		fFastArmed++;
++	}
++}
++
++/* Gated: something changed at `at`; the time since the last change goes to the state the GPU was in. */
++void
++VivaGPUAccelerator::stateUpdate(uint64_t at)
++{
++	if (fStatSince == 0) {
++		fStatSince = fStateSince = at;
++	}
++	if (at > fStateSince) {
++		fStateNs[fState] += at - fStateSince;
++		fStateSince = at;
++	}
++	fState = (fRunning[0] != NULL || fRunning[1] != NULL) ? kStateBusy :
++	    (fQueue[0] != NULL || fQueue[1] != NULL) ? kStateWaiting : kStateIdle;
++}
++
++void
++VivaGPUAccelerator::latencyReset(void)
++{
++	fStatSince = fStateSince = mach_absolute_time();
++	bzero(fStateNs, sizeof(fStateNs));
++	bzero(fLatN, sizeof(fLatN));
++	bzero(fLatSum, sizeof(fLatSum));
++	bzero(fLatMax, sizeof(fLatMax));
++	fExecN = fExecSum = fIrqN = fIrqSum = fIrqMax = fFastStarts = fFastArmed = 0;
++}
++
++static uint64_t
++absUs(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
++void
++VivaGPUAccelerator::latencyStats(char **out, char *end)
++{
++	stateUpdate(mach_absolute_time());
++	uint64_t total = fStateNs[kStateBusy] + fStateNs[kStateWaiting] + fStateNs[kStateIdle];
++	uint64_t t = total ? total : 1;
++	say(out, end, "timing over %llu ms: GPU busy %llu%%, waiting with jobs queued %llu%%, idle (nothing queued) "
++	    "%llu%%; job on the hardware avg %llu us (%llu jobs)\n", absUs(total) / 1000, fStateNs[kStateBusy] * 100 / t,
++	    fStateNs[kStateWaiting] * 100 / t, fStateNs[kStateIdle] * 100 / t,
++	    fExecN ? absUs(fExecSum / fExecN) : 0, fExecN);
++	static const char *const kind[3] = { "ready at submit", "after a dependency, work loop", "after a dependency, IRQ filter" };
++	say(out, end, "start latency (ready -> running):");
++	for (int i = 0; i < 3; i++) {
++		say(out, end, " %s avg %llu us max %llu (%llu)%s", kind[i], fLatN[i] ? absUs(fLatSum[i] / fLatN[i]) : 0,
++		    absUs(fLatMax[i]), fLatN[i], i < 2 ? ";" : "\n");
++	}
++	say(out, end, "IRQ -> handler avg %llu us max %llu (%llu); fast kick %s: %llu armed, %llu started by the filter "
++	    "(vivagpufastkick, gpu fastkick on|off; gpu lat reset)\n", fIrqN ? absUs(fIrqSum / fIrqN) : 0, absUs(fIrqMax),
++	    fIrqN, fFastKick ? "on" : "off", fFastArmed, fFastStarts);
++}
++
+ void
+ VivaGPUAccelerator::jobTimer(OSObject *owner, IOTimerEventSource *src __unused)
+ {
+@@ -2598,6 +2885,7 @@ VivaGPUAccelerator::jobTimer(OSObject *owner, IOTimerEventSource *src __unused)
+ 	if (!self->fPowered) {
+ 		return;
+ 	}
++	self->fastSync();
+ 	uint64_t now = nowMs();
+ 	bool busy = false;
+ 	for (uint32_t slot = 0; slot < 2; slot++) {
+@@ -2910,6 +3198,22 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
+ 			say(o, end, "dvfs %s: %u..%u MHz (vivagpufreq..vivagpufreqmax), now %u MHz, load %u%%, %llu up %llu down\n",
+ 			    fDvfs ? "on" : "off", gVivaOpp[fOpp].khz / 1000, gVivaOpp[MIN(fDvfsFast, fOpp)].khz / 1000,
+ 			    gVivaOpp[fClockOpp].khz / 1000, fLoadPct, fDvfsUps, fDvfsDowns);
++		} else if (strncmp(args, "lat", 3) == 0) {
++			if (strncmp(args, "lat reset", 9) == 0) {
++				latencyReset();
++				say(o, end, "latency counters reset\n");
++			} else {
++				latencyStats(o, end);
++			}
++		} else if (strncmp(args, "fastkick", 8) == 0) {
++			if (strncmp(args, "fastkick on", 11) == 0) {
++				fFastKick = true;
++				kick();
++			} else if (strncmp(args, "fastkick off", 12) == 0) {
++				fFastKick = false;
++				fastSync();             /* drop what is armed */
++			}
++			say(o, end, "fast kick %s\n", fFastKick ? "on" : "off");
+ 		} else if (strncmp(args, "probe", 5) == 0) {
+ 			probeDump(o, end);
+ 		} else if (strncmp(args, "publish", 7) == 0) {
+@@ -2961,7 +3265,9 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
+ 			say(o, end, "dvfs %s (%u..%u MHz, load %u%%, %llu up %llu down), flush reduction %s\n", fDvfs ? "on" : "off",
+ 			    gVivaOpp[fOpp].khz / 1000, gVivaOpp[MIN(fDvfsFast, fOpp)].khz / 1000, fLoadPct, fDvfsUps, fDvfsDowns,
+ 			    fFlushReduce ? "on" : "off");
+-			say(o, end, "usage: gpu [status|mfg|on|off|regs|freq [MHz]|dvfs [on|off]|selftest [fault]|probe|publish]\n");
++			latencyStats(o, end);
++			say(o, end, "usage: gpu [status|mfg|on|off|regs|freq [MHz]|dvfs [on|off]|lat [reset]|fastkick [on|off]|"
++			    "selftest [fault]|probe|publish]\n");
+ 		}
+ 		return kIOReturnSuccess;
+ 	});
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+index 78e0cc2..5739e62 100644
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -17,7 +17,10 @@
+  *
+  * Locking: everything runs under the accelerator's work-loop gate (the
+  * GPU, MMU and job interrupts, the job timer, user client calls, link
+- * commands). Waits sleep on the gate with commandSleep().
++ * commands). Waits sleep on the gate with commandSleep(). The one exception
++ * is the job interrupt's filter (primary interrupt context, K0e fast kick):
++ * it only touches fArm/fIrqDone/fIrqAt and the job slot registers, under
++ * fFastLock (a spinlock taken with interrupts off on the gated side).
+  */
+ #ifndef _IOKIT_ARM_VIVAGPU_H
+ #define _IOKIT_ARM_VIVAGPU_H
+@@ -29,7 +32,9 @@
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOCommandGate.h>
+ #include <IOKit/IOInterruptEventSource.h>
++#include <IOKit/IOFilterInterruptEventSource.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IOLocks.h>
+ 
+ #include "viva_gpu_uapi.h"
+ 
+@@ -58,6 +63,7 @@ public:
+ 	static VivaGPUFence *create(bool signalled);
+ 	bool     signalled;
+ 	IOReturn error;
++	uint64_t signalAt;      /* mach_absolute_time of the job's interrupt (0: signalled by hand or not yet) */
+ };
+ 
+ /* A GPU address space: AArch64 4K page tables plus the VA allocator for [VGPU_VA_START, VGPU_VA_END). */
+@@ -238,12 +244,26 @@ private:
+ 	void addImplicitDep(OSArray *deps, VivaGPUFence *f, VivaGPUFence *self);
+ 	void kick(void);
+ 	void startJob(uint32_t slot, VivaGPUJob *job);
+-	void completeJob(uint32_t slot, IOReturn error, uint32_t status);
++	void jsWrite(uint32_t slot, VivaGPUJob *job, uint32_t config);
++	uint32_t jsConfig(VivaGPUJob *job);
++	void jobStarted(uint32_t slot, VivaGPUJob *job, uint64_t at, bool fromFilter);
++	void completeJob(uint32_t slot, IOReturn error, uint32_t status, uint64_t at = 0);
+ 	void failAll(IOReturn error);
+ 	void resetGPU(const char *why);
+ 	static void gpuInterrupt(OSObject *owner, IOInterruptEventSource *src, int count);
+ 	static void mmuInterrupt(OSObject *owner, IOInterruptEventSource *src, int count);
+ 	static void jobInterrupt(OSObject *owner, IOInterruptEventSource *src, int count);
++	static bool jobFilter(OSObject *owner, IOFilterInterruptEventSource *src);
++	bool jobFilterRun(void);
++	/* K0e fast kick (gated): take over what the filter did; arm the queue heads that wait only for running jobs */
++	void fastSync(void);
++	void fastArm(void);
++	void fastLive(bool live);
++	/* where the GPU's time goes: a job on the hardware, jobs queued but none running, nothing queued */
++	enum { kStateBusy, kStateWaiting, kStateIdle, kStateCount };
++	void stateUpdate(uint64_t at);
++	void latencyStats(char **out, char *end);
++	void latencyReset(void);
+ 	static void jobTimer(OSObject *owner, IOTimerEventSource *src);
+ 	static void dvfsTimer(OSObject *owner, IOTimerEventSource *src);
+ 	void dvfsSample(void);
+@@ -320,6 +340,30 @@ private:
+ 	uint64_t fFaultsNoReset;            /* chains killed by an MMU fault without a GPU reset */
+ 	bool     fWatchFragment;            /* since then no fragment chain completed: short timeout on JS0 */
+ 
++	/*
++	 * K0e fast kick (vivagpufastkick, 1 default): the queue head of a slot whose unfinished dependencies are all
++	 * jobs on the hardware is "armed" (AS bound and reserved, JS_CONFIG ready). The job interrupt's filter
++	 * starts it the moment those jobs signal done, in primary interrupt context, instead of after the work-loop
++	 * thread wakes up; the gated handler then completes the finished jobs and takes the started one over.
++	 */
++	struct FastArm {
++		VivaGPUJob *job;
++		uint32_t    wait;                   /* slots whose running job must be done (bit n = slot n) */
++		uint32_t    config;
++		bool        started;
++		uint64_t    startAt;
++	};
++	IOSimpleLock *fFastLock;                /* fIrq[2] is the job interrupt's IOFilterInterruptEventSource */
++	FastArm       fArm[2];
++	uint32_t      fIrqDone;                 /* done bits the filter cleared, not handled yet */
++	uint64_t      fIrqAt[2];                /* when the filter saw each slot's interrupt */
++	bool          fFastKick, fFastOn;       /* boot-arg / link switch; GPU powered with interrupts set up */
++	/* latency accounting ("gpu lat"), mach_absolute_time units */
++	uint64_t fStatSince, fStateSince, fStateNs[kStateCount];
++	uint32_t fState;
++	uint64_t fLatN[3], fLatSum[3], fLatMax[3];  /* start - ready: ready at submit, after a dependency (work loop, filter) */
++	uint64_t fExecN, fExecSum, fIrqN, fIrqSum, fIrqMax, fFastStarts, fFastArmed;
++
+ 	/* unknown user clients and property reads, for "gpu probe" (fProbeLock) */
+ 	IOLock *fProbeLock;
+ 	int     fProbeMode;                 /* vivagpuprobe: 0 refuse unknown types, 1 accept and log */
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index b8702a3..a9efa61 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -759,6 +759,11 @@ fbcon_transmit_ready(void)
+ }
+ 
+ extern int sweet_console_muted;         /* osfmk/console/serial_console.c: set once the GUI presents */
++/*
++ * Set by AppleCLCD when the display may scan out something other than this framebuffer (its second buffer, an
++ * IOSurface): points the display back here, called once when a panic starts drawing.
++ */
++void (*sweet_fb_panic_hook)(void);
+ 
+ static void
+ fbcon_transmit_data(uint8_t c)
+@@ -766,6 +771,11 @@ fbcon_transmit_data(uint8_t c)
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;                 /* kprintf comes straight here, not through the muted console */
+ 	}
++	if (sweet_fb_panic_hook != NULL && panic_active()) {
++		void (*hook)(void) = sweet_fb_panic_hook;
++		sweet_fb_panic_hook = NULL;
++		hook();
++	}
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
+ 		return;

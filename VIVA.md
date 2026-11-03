@@ -303,6 +303,30 @@ Patches 0114-0115 (2026-11-03, NOT tested on the phone yet; details and verifica
   one memmove from fQueue[0] (fortify sees one record). **0116** (CI run 41699672332, image
   `out/xnu-ufs-rw-0116.img`, = 0114+0115+fix) shifts one record at a time.
 - If the GPU's first CREATE_BO panics in pmap (WC path, 0112 not enough): boot with `vivagpuwc=0`.
+- 0116 on the phone (2026-11-03): no more black tiles / mixed frames in `vctl burst`. Left (gpu/docs/RICHIESTE-KERNEL.md):
+  K0d copy tearing (1-2 of 8 frames split between two whole frames), K0e ~0.28 ms per job independent of the clock.
+
+Patch 0117 (2026-11-03, NOT tested on the phone yet):
+- **K0e fast kick**: the job IRQ is an IOFilterInterruptEventSource. After every kick the queue head of each slot
+  whose unfinished deps are all jobs on the hardware is *armed* (AS bound, `vm->running` reserved, JS_CONFIG ready);
+  the filter (primary interrupt context, `fFastLock` spinlock) clears the done bits, starts armed jobs whose awaited
+  slots are done, and the gated handler (`fastSync`, first thing in every gated entry that looks at fRunning/fQueue)
+  completes the done jobs at the IRQ time and takes the started ones over. Failures stay with the gated handler.
+  `vivagpufastkick=0` / link `gpu fastkick off` = old path. Same-slot `JS_*_NEXT` queueing not done: the filter
+  restarts the slot within microseconds anyway, without the "two jobs, one done bit" ambiguity.
+  Measuring: `gpu lat` (also in `gpu status`; `gpu lat reset`): % of time GPU busy / jobs queued but none running /
+  nothing queued, avg time on the hardware per job, start latency split (ready at submit / after a dependency via work
+  loop / via filter), IRQ -> handler latency.
+- **K0d double buffer**: copies go to the panel buffer not on screen (LK's 0x7bc10000 or LK's next one,
+  fPhys + rowBytes*height = 0x7c606000) and LK's layer (OVL0_2L L0) is switched at the next frame end = OVL INTSTA bit
+  1 (FME_CPL) rising, polled; calibrated once at the first swap (3 frame ends; if the bit does not latch, retried with
+  INTEN bit 1 set, harmless: the GIC masks an unhandled line). The vsync timer is phase-locked: it fires
+  `sweetfb_lead` (1000 us) before the predicted frame end; with a switch pending it polls (interrupts off from seeing
+  the bit to the register writes, skipped if the poll was held up > 20 us). Partial frames, the default surface and the
+  unmuted console go to the buffer on screen as before. Scanout (`vivascanout=1`) switches at frame ends too. A panic
+  points the layer back at LK's buffer (`sweet_fb_panic_hook`, pe_serial.c). `sweetfb_flip=0` / link `disp flip off`
+  = old copy; `disp` shows state, frame period, switches/missed/unsure; `disp regs` shows INTEN/INTSTA/ADDCON_DBG.
+  If `disp` says "no frame-end status from the OVL", the double buffer is off and nothing else changed.
 
 Workflow notes:
 - Kernel patches are made against a local xnu-8796.141.3 tree with all
