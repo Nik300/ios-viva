@@ -259,7 +259,7 @@ scheduler does not prefer the A76s (AMP/P-E clusters = `__ARM_AMP__`, a much lar
 `SWEET CPU: cpu=6 PSCI CPU_ON rc=N` (firmware refused) or `NOT alive after 5s` (entry/MMU/GIC); fall back
 with `VIVA_EXTRA="cpus=6 vivausb=3 vivagpu=2"`.
 
-Patches 0111-0113 (2026-11-03, GPU rendering in pieces + quiet screen; NOT tested on the phone yet):
+Patches 0111-0113 (2026-11-03, CI run 41593631050, image `out/xnu-ufs-rw-0113.img` with `cpus=8 vivausb=3 vivagpu=2` + sweetfb_noconsole=1; NOT tested on the phone yet):
 - Symptom (link-gpu8.log, 0109-quiet): SpringBoard/backboardd frames with whole tiles black or holding old pixels.
   Each one is a fragment chain killed by a GPU MMU read fault (status 0x48 after `MMU fault ... translation fault,
   read access`): the tiles after the fault are never written. Faulting addresses were unmapped VAs (0x16603900,
