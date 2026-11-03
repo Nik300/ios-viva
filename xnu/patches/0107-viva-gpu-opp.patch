@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
-index d481fa0..834bbac 100644
+index 11f3572..2ae1790 100644
 --- a/iokit/Kernel/arm/VivaGPU.cpp
 +++ b/iokit/Kernel/arm/VivaGPU.cpp
 @@ -13,8 +13,9 @@

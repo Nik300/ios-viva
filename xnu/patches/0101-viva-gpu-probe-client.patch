@@ -68,7 +68,7 @@ index 163fce1..6c4fbf2 100644
  		return err;
  	}
 diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
-index 177df45..c5e8400 100644
+index 177df45..017219d 100644
 --- a/iokit/Kernel/arm/VivaGPU.cpp
 +++ b/iokit/Kernel/arm/VivaGPU.cpp
 @@ -37,6 +37,7 @@
@@ -237,7 +237,7 @@ index 177df45..c5e8400 100644
 +}
 +
 +/* IOUserClient.cpp: registry property reads by userspace (key "*" = all properties). */
-+void
++extern "C" void
 +viva_gpu_property_read(IORegistryEntry *entry, const char *key, bool found)
 +{
 +	VivaGPUAccelerator *gpu = gVivaGPU;

@@ -132,7 +132,7 @@ index fbcdfac..1f90c80 100644
  mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
  
 diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
-index cf5d47f..d481fa0 100644
+index 08ae664..11f3572 100644
 --- a/iokit/Kernel/arm/VivaGPU.cpp
 +++ b/iokit/Kernel/arm/VivaGPU.cpp
 @@ -709,11 +709,11 @@ VivaGPUBO::growHeap(uint64_t addr)
