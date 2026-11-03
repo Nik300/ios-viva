@@ -84,7 +84,11 @@ initrd properties.
    high speed, live console from the first kernel line, `ping`/`stat` answer. Host:
    `tools/viva-link.py -o FILE`. Measured after the PHY wake: DTM0 0x02000000, DTM1 0x00003f2f,
    POWER 0x70 (HS), DEVCTL 0x99.
-6. Keys (MT6366 PMIC via pwrap), touch (Goodix on MTK I²C), then SMP/perf, battery, GPU.
+6. ✅ **Keys** (2026-11-03, patches 0094-0096, `out/xnu-ufs-rw-keys.img`): power, volume up (MT6366 PMIC
+   PWRKEY/HOMEKEY via pwrap + EINT 144) and volume down (keypad) are HID consumer events through
+   SweetGIC/VivaEINT interrupts, no polling; iOS reacts (screen on/off, volume HUD).
+7. Touch (Goodix GT9896 on MTK I²C0, EINT 13), then battery/charger (PMIC BM/chrdet), SMP/perf, GPU
+   (Metal driver on Mesa Panfrost, see the GPU plan).
 
 ## Handoff (2026-11-02, end of session)
 
@@ -136,7 +140,7 @@ Patch 0095 (CI run 41548885484, image `out/xnu-ufs-rw-pwrap.img`, untested): Viv
 TOPSTATUS 0x0e idle, 0x0c power held, 0x06 volume up held. LK leaves PSC interrupts enabled (con 0x0065)
 with chrdet (bit 5) pending while USB is plugged.
 
-Patch 0096 (CI run 41551405221, image `out/xnu-ufs-rw-keys.img`, untested): VivaEINT (IOInterruptController
+Patch 0096 (CI run 41551405221, image `out/xnu-ufs-rw-keys.img`, works 2026-11-03: all keys, no stray PMIC/EINT interrupts; LK had LDO[0..1] and PSC interrupts on): VivaEINT (IOInterruptController
 under SweetGIC, SPI 186), VivaPwrap as a bus (VivaDTNub children) with writePMIC() limited to interrupt
 enable SET/CLR + status registers, VivaPMIC (all PMIC interrupts off at start, EINT 144 on its work loop),
 VivaPMICKeys (power, volume up). ADT: /arm-io/eint, /arm-io/pwrap/pmic/keys.
