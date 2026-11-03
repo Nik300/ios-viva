@@ -168,7 +168,7 @@ Patch 0098 (CI run 41557214919, image `out/xnu-ufs-rw-ys.img`, works 2026-11-03:
 (config requests are not answered yet: the IC keeps its flash config); USB link `i2c DEV REG N` and
 `i2cw DEV REG B..` for live exploration.
 
-Patch 0100 "viva GPU" (2026-11-03, CI run 41569069049, image `out/xnu-ufs-rw-gpu.img` with vivagpu=1, untested; kernel side of `~/Developer/ios-viva/gpu/uapi`, phases G1-G2 of
+Patch 0100 "viva GPU" (2026-11-03, CI run 41569069049, image `out/xnu-ufs-rw-gpu.img` with vivagpu=1, works; kernel side of `~/Developer/ios-viva/gpu/uapi`, phases G1-G2 of
 `docs/PIANO-GPU.md`): `VivaGPUAccelerator : IOAcceleratorES` on ADT `/arm-io/gpu` ("mediatek,mt6781-mali",
 reg = Mali, mfgcfg, SPM, topckgen, apmixed, infracfg_ao; SPI 274-276 GPU/MMU/JOB) + `VivaGPUUserClient`
 (viva_gpu_uapi.h: BOs, mmap, submit, WAIT_BO, syncobjs, IOSurface/user-memory import, SYNC_BO).
@@ -200,6 +200,11 @@ reg = Mali, mfgcfg, SPM, topckgen, apmixed, infracfg_ao; SPI 274-276 GPU/MMU/JOB
   0xc0000000 is VM-managed (pa_valid) but outside the physical aperture (ptov_table), so changing any such page's
   cache mode (WC/uncached buffers, any driver) panics. Workaround in 0100: all BOs cacheable, the kernel flushes
   every BO of a job before it and invalidates after it. Real fix (later): cover low RAM in the aperture.
+- Third test (run 41572312019, image `out/xnu-ufs-rw-gpu.img`, vivagpu=1), **G1 + G2 kernel side WORK**:
+  `gpu on` twice (after `gpu off`, rails really off/on), `selftest` PASS (<1 ms), `selftest fault`: translation fault
+  (write) on AS0 caught, the chain fails with 0x48 (job bus fault: the AS is disabled under it) -> TTRX_3076 reset
+  (316 ms), next `selftest` PASS, counters consistent. To improve: a user MMU fault always costs a full reset.
+  Next: userspace on the phone (`gpu/ios/build.sh` needs Xcode: test_vgpu with `gpu publish`, then the Metal bundle).
 - Not yet: DVFS, runtime power gating, IOSurface cache flush cost (whole surface per job), performance counters.
 
 Workflow notes:
