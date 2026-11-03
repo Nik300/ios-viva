@@ -350,7 +350,7 @@ Patch 0118 (2026-11-03, K0g, NOT tested on the phone yet; analysis in `~/Develop
 
 0118 built: CI run 41731434461, image `~/Developer/ios-viva/out/xnu-ufs-rw-0118.img` (cpus=8 vivausb=3 vivagpu=2).
 
-Patch 0119 (2026-11-04, userspace requests K0h/K0i in gpu/docs/RICHIESTE-KERNEL.md, NOT tested on the phone yet; UAPI minor 2):
+Patch 0119 (2026-11-04, CI run 41733230639, image `out/xnu-ufs-rw-0119.img` = 0118+0119; userspace requests K0h/K0i in gpu/docs/RICHIESTE-KERNEL.md, NOT tested on the phone yet; UAPI minor 2):
 - **K0h.1 SUBMIT_BATCH** (selector 21): up to 64 `vgpu_submit` in one call, queued in order under one gate acquisition,
   exactly as N SUBMITs; `done` = how many were queued (stops at the first error); each element's `seq` written back.
 - **K0h.2 completion page**: `vgpu_submit.seq` (was `pad`) = the job's number in its connection; IOConnectMapMemory64
