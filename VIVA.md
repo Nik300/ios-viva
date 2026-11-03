@@ -194,6 +194,12 @@ reg = Mali, mfgcfg, SPM, topckgen, apmixed, infracfg_ao; SPI 274-276 GPU/MMU/JOB
   `gpu selftest` panicked: `phystokv_range: illegal PA 0x6860c000; phys base 0xc0000000` - on this port the
   physical aperture only covers RAM from 0xc0000000 while kernel allocations also come from below: never use
   phystokv; cache maintenance and page tables go through kernel mappings (fixed in the next build).
+- Second test (run 41570731376): `gpu selftest` PASS (WRITE_VALUE 0xc0ffee00, status 0x01, 0 ms). `gpu selftest
+  fault` panicked inside XNU: IOBufferMemoryDescriptor with kIOMapWriteCombineCache -> vm_object_change_wimg_mode ->
+  pmap_set_cache_attributes -> flush_dcache(phys) -> phystokv_range: illegal PA 0x6a01c000. **Port bug**: RAM below
+  0xc0000000 is VM-managed (pa_valid) but outside the physical aperture (ptov_table), so changing any such page's
+  cache mode (WC/uncached buffers, any driver) panics. Workaround in 0100: all BOs cacheable, the kernel flushes
+  every BO of a job before it and invalidates after it. Real fix (later): cover low RAM in the aperture.
 - Not yet: DVFS, runtime power gating, IOSurface cache flush cost (whole surface per job), performance counters.
 
 Workflow notes:

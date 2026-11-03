@@ -40,7 +40,7 @@ index 91ff7ec..8e06076 100644
  	}
 diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
 new file mode 100644
-index 0000000..204fd4f
+index 0000000..177df45
 --- /dev/null
 +++ b/iokit/Kernel/arm/VivaGPU.cpp
 @@ -0,0 +1,2080 @@
@@ -729,7 +729,7 @@ index 0000000..204fd4f
 +	}
 +	uint64_t len = MIN(HEAP_CHUNK, vaSize - (uint64_t)idx * HEAP_CHUNK);
 +	IOBufferMemoryDescriptor *c = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-+	    kIODirectionInOut | kIOMapWriteCombineCache, len, page_size);
++	    kIODirectionInOut, len, page_size);         /* cacheable: see createBO; GPU-only afterwards */
 +	if (c == NULL) {
 +		vm->gpu->chargeMemory(-(int64_t)HEAP_CHUNK);
 +		return false;
@@ -1982,7 +1982,7 @@ index 0000000..204fd4f
 +	}
 +	VivaGPUBO *bo = new VivaGPUBO;
 +	IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-+	    kIODirectionInOut | kIOMapWriteCombineCache, page_size, page_size);
++	    kIODirectionInOut, page_size, page_size);
 +	if (bo == NULL || !bo->init() || mem == NULL) {
 +		OSSafeReleaseNULL(bo);
 +		OSSafeReleaseNULL(mem);
@@ -2404,7 +2404,7 @@ index 0000000..288c5da
 +#endif /* _IOKIT_ARM_VIVAGPU_H */
 diff --git a/iokit/Kernel/arm/VivaGPUUserClient.cpp b/iokit/Kernel/arm/VivaGPUUserClient.cpp
 new file mode 100644
-index 0000000..5916189
+index 0000000..c8e983b
 --- /dev/null
 +++ b/iokit/Kernel/arm/VivaGPUUserClient.cpp
 @@ -0,0 +1,793 @@
@@ -2882,8 +2882,7 @@ index 0000000..5916189
 +				return kIOReturnNoMemory;
 +			}
 +			IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-+			    kIODirectionInOut | kIOMemoryKernelUserShared | ((flags & VGPU_BO_WB_MMAP) ? 0 : kIOMapWriteCombineCache),
-+			    size, page_size);
++			    kIODirectionInOut | kIOMemoryKernelUserShared, size, page_size);
 +			if (mem == NULL) {
 +				fGPU->chargeMemory(-(int64_t)size);
 +				b->vaSize = 0;
@@ -2892,10 +2891,11 @@ index 0000000..5916189
 +			}
 +			b->memory = mem;
 +			/*
-+			 * The allocator zeroed it through the kernel's cacheable mapping (the cache mode only applies to
-+			 * later mappings): push the zeros out and drop the lines before the GPU or a WC user mapping
-+			 * sees the pages.
++			 * Cacheable everywhere: no write-combined BOs on this port (changing a page's cache mode panics
++			 * for RAM below 0xc0000000, outside XNU's physical aperture). The kernel keeps CPU and GPU
++			 * coherent: zeros pushed out now, then a flush before and an invalidate after every job.
 +			 */
++			b->cacheMaint = true;
 +			cacheBuffer(mem, 0, size, kVivaCacheFlush);
 +		}
 +		b->va = fVM->allocVA(size, align);
@@ -3073,7 +3073,7 @@ index 0000000..5916189
 +		b->prepared = b->memory->prepare() == kIOReturnSuccess;
 +		b->memOffset = mapStart;
 +		b->size = b->vaSize = mapSize;
-+		b->cacheMaint = s->mapCache == kIOMapDefaultCache;     /* CPU-cacheable pixels */
++		b->cacheMaint = s->mapCache != kIOMapWriteCombineCache && s->mapCache != kIOMapInhibitCache;
 +		b->va = fVM->allocVA(mapSize, mapSize >= HEAP_ALIGN ? HEAP_ALIGN : page_size);
 +		b->gpuOffset = planeOff - mapStart;
 +		if (!b->prepared || b->va == 0 || !fVM->map(b->va, b->memory, mapStart, mapSize, VivaGPUVM::leafAttrs(false))) {
