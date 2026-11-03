@@ -157,6 +157,17 @@ whitelist 17/73/166), VivaI2C (I2C0 v2 FIFO, 400 kHz from 124.8 MHz / 5; probe 2
 SCL0/SDA0 already mode 1, timing registers 0 = LK never used I2C0), VivaGT9896 (touch was unpowered:
 avdd/dvdd/reset outputs at 0), dispatching through SweetHIDTouch.
 
+0097 result (2026-11-03): I2C0 and power-on work (the IC ACKs, its INT line toggles, EINT 13 correct) but
+no touches: this GT9896 is a *Yellowstone* IC, not Normandy. The register map is in the vendor's
+/vendor/firmware/goodix_cfg_group.bin (super.img -> vendor_a ext4; tools/viva-super-extract.py, debugfs,
+tools/viva-goodix-cfg.py): coor 0x4180, pid 0x4022, version 0x4014 (135 bytes), command 0x4160, esd 0x4166,
+cfg_addr 0x96f8, cfg_send_flag 0x4034. Yellowstone events: 8-byte head (byte 0 bit 7 touch, bit 6 request,
+byte 2 = contacts, BE16 sum in bytes 6-7), 8 bytes per contact (id << 4 | type, x/y/w BE16), BE16 contact sum.
+
+Patch 0098: VivaGT9896 on the Yellowstone protocol (registers from the ADT); request events logged/acked
+(config requests are not answered yet: the IC keeps its flash config); USB link `i2c DEV REG N` and
+`i2cw DEV REG B..` for live exploration.
+
 Workflow notes:
 - Kernel patches are made against a local xnu-8796.141.3 tree with all
   `xnu/patches/*.patch` applied in order (`git apply`; 0031/0041 need the CI's HFS

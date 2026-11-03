@@ -1,0 +1,330 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index 7c8eef9..91ff7ec 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -206,6 +206,7 @@ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);   /* bsd
+ extern uint64_t sweet_log_position(void);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern int viva_pwrap_read(uint32_t addr, uint32_t *value);               /* iokit/Kernel/arm/VivaPwrap.cpp */
++extern int viva_i2c_xfer(uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen); /* VivaIO.cpp */
+ 
+ static void
+ vl_sleep_ms(unsigned ms)
+@@ -486,6 +487,8 @@ vl_arg(char **p, uint64_t *v)
+  *   poke PA VALUE     write one 32-bit word, then read it back
+  *   rewind [BYTES]    resend the log from BYTES back (default: whole ring)
+  *   pmic ADDR [N]     read N (max 32) 16-bit PMIC registers through pwrap (read only)
++ *   i2c DEV REG N     read N (max 64) bytes from 16-bit register REG of I2C0 device DEV
++ *   i2cw DEV REG B..  write bytes (max 6) to register REG of I2C0 device DEV
+  *   panic [TEXT]      panic (to test the panic path)
+  *   reboot            watchdog software reset (back through preloader/LK)
+  * peek/poke have no guard: an address in a gated block can hang the bus.
+@@ -549,6 +552,34 @@ vl_command(void)
+ 			vl_reply(" %04x", val);
+ 		}
+ 		vl_reply("\n");
++	} else if ((IS("i2c") || IS("i2cw")) && vl_arg(&rest, &a) && vl_arg(&rest, &v)) {
++		bool wr = len == 4;
++		uint8_t w[8] = { (uint8_t)(v >> 8), (uint8_t)v }, r[8];
++		uint64_t n = 0, b;
++		if (wr) {
++			while (n < 6 && vl_arg(&rest, &b)) {
++				w[2 + n++] = (uint8_t)b;
++			}
++			int err = viva_i2c_xfer((uint8_t)a, w, 2 + (uint32_t)n, NULL, 0);
++			vl_reply("i2c 0x%02llx 0x%04llx <- %llu bytes: %s\n", a, v, n, err ? "error" : "ok");
++		} else {
++			(void)vl_arg(&rest, &n);
++			n = MIN(MAX(n, 1ull), 64ull);
++			for (uint64_t off = 0; off < n; off += 8) {
++				uint32_t k = (uint32_t)MIN(8ull, n - off);
++				w[0] = (uint8_t)((v + off) >> 8);
++				w[1] = (uint8_t)(v + off);
++				if (viva_i2c_xfer((uint8_t)a, w, 2, r, k)) {
++					vl_reply("i2c 0x%02llx 0x%04llx: error\n", a, v + off);
++					break;
++				}
++				vl_reply("i2c 0x%02llx 0x%04llx:", a, v + off);
++				for (uint32_t i = 0; i < k; i++) {
++					vl_reply(" %02x", r[i]);
++				}
++				vl_reply("\n");
++			}
++		}
+ 	} else if (IS("rewind")) {
+ 		uint64_t total = sweet_log_position(), back = UINT64_MAX;
+ 		(void)vl_arg(&rest, &back);
+@@ -566,7 +597,7 @@ vl_command(void)
+ 			delay(5000);
+ 		}
+ 	} else if (IS("help")) {
+-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | rewind [BYTES] | panic [TEXT] | reboot\n");
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | rewind [BYTES] | panic [TEXT] | reboot\n");
+ 	} else {
+ 		vl_reply("unknown command: %s (try help)\n", c);
+ 	}
+diff --git a/iokit/Kernel/arm/VivaIO.cpp b/iokit/Kernel/arm/VivaIO.cpp
+index 8c8fddc..2d46840 100644
+--- a/iokit/Kernel/arm/VivaIO.cpp
++++ b/iokit/Kernel/arm/VivaIO.cpp
+@@ -145,6 +145,8 @@ VivaGPIO::getInput(uint32_t pin, bool *high)
+ 
+ OSDefineMetaClassAndStructors(VivaI2C, IOService);
+ 
++static VivaI2C *gVivaI2C;
++
+ static uint32_t
+ dtU32(IOService *provider, const char *key, uint32_t dflt)
+ {
+@@ -233,11 +235,22 @@ VivaI2C::start(IOService *provider)
+ 	fInterrupt->enable();
+ 	IOLog("VIVA I2C: %s, source %u Hz, %u Hz: timing 0x%04x ltiming 0x%04x hw_timeout 0x%04x\n",
+ 	    provider->getName(), fSrcHz, fSpeedHz, fTiming, fLTiming, fHWTimeout);
++	gVivaI2C = this;
+ 	registerService();
+ 	VivaDTNub::publishChildren(this, provider);
+ 	return true;
+ }
+ 
++/* USB link "i2c" commands (bsd/dev/viva_usb.c): one transaction on I2C0. */
++extern "C" int
++viva_i2c_xfer(uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen)
++{
++	if (gVivaI2C == NULL) {
++		return -1;
++	}
++	return gVivaI2C->transfer(addr, wbuf, wlen, rbuf, rlen) == kIOReturnSuccess ? 0 : -2;
++}
++
+ void
+ VivaI2C::free(void)
+ {
+diff --git a/iokit/Kernel/arm/hid/VivaGT9896.cpp b/iokit/Kernel/arm/hid/VivaGT9896.cpp
+index 352d01c..98acf53 100644
+--- a/iokit/Kernel/arm/hid/VivaGT9896.cpp
++++ b/iokit/Kernel/arm/hid/VivaGT9896.cpp
+@@ -5,20 +5,24 @@
+  * the same digitizer collection events (fingers, edge tips) as on sweet.
+  *
+  * Protocol and power sequence from Xiaomi's driver for this phone
+- * (viva-r-oss drivers/input/touchscreen/goodix_gtx8, GT9896 = "Normandy"):
++ * (viva-r-oss drivers/input/touchscreen/goodix_gtx8). This GT9896 is a
++ * "Yellowstone" IC: its register map comes from the vendor's
++ * goodix_cfg_group.bin (ic_type "yellowstone", pid "9896"), copied into the
++ * ADT: coordinates 0x4180, pid 0x4022, fw_request 0x4180 (2026-11-03).
+  *  - power: avdd GPIO high, 100 us, dvdd GPIO high (load switches); reset
+  *    GPIO low 2 ms, high, 110 ms, then the IC answers on I2C
+- *  - registers have 16-bit big-endian addresses; version at 0x8240
+- *  - interrupt (EINT 13, falling edge) -> event head at 0x824E:
+- *    byte 0 bit 7 touch event, bit 6 request; byte 1 low nibble = contacts;
+- *    then 8 bytes per contact (id, x LE16, y LE16, w, ...) and 2 more bytes;
+- *    the byte sum of the first 4 + 8 * n bytes is 0; write 0 to 0x824E
+- *    when done
++ *  - registers have 16-bit big-endian addresses
++ *  - interrupt (EINT 13, falling edge) -> 8-byte event head at coor:
++ *    byte 0 bit 7 touch event, bit 6 request; byte 2 low nibble = contacts;
++ *    head checksum: sum of bytes 0-5 == big-endian bytes 6-7. Then 8 bytes
++ *    per contact (id << 4 | type, -, x BE16, y BE16, w BE16) and a BE16
++ *    sum of the contact bytes; write 0 to coor when done
+  *  - coordinates 0..panel-max (8640 x 19200 = 8x the 1080 x 2400 panel)
+  * Reads go in 8-byte pieces (VivaI2C FIFO transfers).
+  *
+- * ADT: i2c-address, avdd-gpio, dvdd-gpio, reset-gpio, max-x, max-y; the
+- * interrupt is interrupts/interrupt-parent (VivaEINT).
++ * ADT: i2c-address, avdd-gpio, dvdd-gpio, reset-gpio, max-x, max-y,
++ * reg-coor, reg-pid, reg-fw-request; the interrupt is
++ * interrupts/interrupt-parent (VivaEINT).
+  */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+@@ -28,14 +32,16 @@
+ #include "SweetHIDTouch.h"
+ #include "../VivaIO.h"
+ 
+-#define GT_REG_VERSION          0x8240
+-#define GT_REG_COORDS           0x824e
+ #define GT_REG_TEST             0x4100
+ #define GT_EVENT_TOUCH          0x80
+ #define GT_EVENT_REQUEST        0x40
+ #define GT_BYTES_PER_COORD      8
+-#define GT_HEAD_LEN             2
++#define GT_HEAD_LEN             8       /* Yellowstone IRQ_HEAD_LEN_YS */
+ #define GT_MAX_TOUCH            10
++#define GT_POINT_STYLUS         0x01
++#define GT_POINT_STYLUS_HOVER   0x03
++#define GT_REQUEST_CONFIG       0x01
++#define GT_REQUEST_RESET        0x03
+ #define PANEL_W                 1080
+ #define PANEL_H                 2400
+ 
+@@ -58,6 +64,7 @@ private:
+ 	IOReturn writeReg(uint16_t reg, const uint8_t *buf, uint32_t len);
+ 	bool powerOn(void);
+ 	void handleEvent(void);
++	void handleRequest(void);
+ 
+ 	VivaI2C                *fBus;
+ 	VivaGPIO               *fGPIO;
+@@ -65,6 +72,8 @@ private:
+ 	IOInterruptEventSource *fInterrupt;
+ 	uint8_t                 fAddr;
+ 	uint32_t                fAvdd, fDvdd, fReset, fMaxX, fMaxY;
++	uint16_t                fRegCoor, fRegPid, fRegRequest;
++	uint32_t                fHeadErrors;
+ 	uint32_t                fPrevMap;
+ 	uint32_t                fEvents, fBadSums;
+ };
+@@ -147,6 +156,9 @@ VivaGT9896::start(IOService *provider)
+ 	fReset = dtU32(provider, "reset-gpio", 17);
+ 	fMaxX = dtU32(provider, "max-x", 8640);
+ 	fMaxY = dtU32(provider, "max-y", 19200);
++	fRegCoor = (uint16_t)dtU32(provider, "reg-coor", 0x4180);
++	fRegPid = (uint16_t)dtU32(provider, "reg-pid", 0x4022);
++	fRegRequest = (uint16_t)dtU32(provider, "reg-fw-request", 0x4180);
+ 	if (fBus == NULL || fGPIO == NULL || fWorkLoop == NULL) {
+ 		IOLog("VIVA TOUCH: missing I2C bus, GPIO or work loop\n");
+ 		return false;
+@@ -155,15 +167,14 @@ VivaGT9896::start(IOService *provider)
+ 		IOLog("VIVA TOUCH: GT9896 at 0x%02x does not answer after reset\n", fAddr);
+ 		return false;
+ 	}
+-	uint8_t ver[16] = { 0 };
+-	readReg(GT_REG_VERSION, ver, sizeof(ver));
+-	IOLog("VIVA TOUCH: version %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x"
+-	    " ('%c%c%c%c')\n", ver[0], ver[1], ver[2], ver[3], ver[4], ver[5], ver[6], ver[7], ver[8], ver[9],
+-	    ver[10], ver[11], ver[12], ver[13], ver[14], ver[15],
+-	    ver[0] >= 0x20 && ver[0] < 0x7f ? ver[0] : '.', ver[1] >= 0x20 && ver[1] < 0x7f ? ver[1] : '.',
+-	    ver[2] >= 0x20 && ver[2] < 0x7f ? ver[2] : '.', ver[3] >= 0x20 && ver[3] < 0x7f ? ver[3] : '.');
++	uint8_t pid[4] = { 0 };
++	readReg(fRegPid, pid, sizeof(pid));
++	IOLog("VIVA TOUCH: pid %02x %02x %02x %02x ('%c%c%c%c'), coordinates at 0x%04x\n",
++	    pid[0], pid[1], pid[2], pid[3], pid[0] >= 0x20 && pid[0] < 0x7f ? pid[0] : '.',
++	    pid[1] >= 0x20 && pid[1] < 0x7f ? pid[1] : '.', pid[2] >= 0x20 && pid[2] < 0x7f ? pid[2] : '.',
++	    pid[3] >= 0x20 && pid[3] < 0x7f ? pid[3] : '.', fRegCoor);
+ 	uint8_t zero = 0;
+-	writeReg(GT_REG_COORDS, &zero, 1);
++	writeReg(fRegCoor, &zero, 1);
+ 
+ 	/* HID service (SweetHIDTouch publishes the digitizer properties) */
+ 	if (!SweetHIDTouch::start(provider)) {
+@@ -202,7 +213,42 @@ VivaGT9896::interruptOccurred(OSObject *owner, IOInterruptEventSource *src __unu
+ 	}
+ }
+ 
+-/* Work loop: goodix_event_handler + goodix_touch_handler_nor. */
++/* goodix_request_handler: the IC asks for something. */
++void
++VivaGT9896::handleRequest(void)
++{
++	uint8_t req = 0, zero = 0;
++	readReg(fRegRequest, &req, 1);
++	IOLog("VIVA TOUCH: request 0x%02x%s\n", req,
++	    req == GT_REQUEST_CONFIG ? " (config: not sent, the IC keeps its flash config)" :
++	    req == GT_REQUEST_RESET ? " (reset)" : "");
++	if (req == GT_REQUEST_RESET) {
++		fGPIO->setOutput(fReset, false);
++		IODelay(2000);
++		fGPIO->setOutput(fReset, true);
++		IOSleep(100);
++	}
++	writeReg(fRegRequest, &zero, 1);
++}
++
++static inline uint16_t
++be16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] << 8 | p[1]);
++}
++
++/* checksum_u8_ys: the byte sum of all but the last 2 bytes equals them (big endian). */
++static bool
++sumOK(const uint8_t *p, uint32_t len)
++{
++	uint16_t sum = 0;
++	for (uint32_t i = 0; i < len - 2; i++) {
++		sum += p[i];
++	}
++	return sum == be16(p + len - 2);
++}
++
++/* Work loop: goodix_event_handler + goodix_touch_handler_ys. */
+ void
+ VivaGT9896::handleEvent(void)
+ {
+@@ -210,50 +256,58 @@ VivaGT9896::handleEvent(void)
+ 	uint32_t pre = GT_HEAD_LEN + GT_BYTES_PER_COORD + 2;
+ 	uint8_t zero = 0;
+ 
+-	if (readReg(GT_REG_COORDS, buf, pre) != kIOReturnSuccess) {
++	if (readReg(fRegCoor, buf, pre) != kIOReturnSuccess) {
++		return;
++	}
++	if (!sumOK(buf, GT_HEAD_LEN)) {
++		if (++fHeadErrors <= 8) {
++			IOLog("VIVA TOUCH: head checksum %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
++		}
++		if (fHeadErrors % 2 == 0) {
++			writeReg(fRegCoor, &zero, 1);
++		}
+ 		return;
+ 	}
+ 	if (!(buf[0] & GT_EVENT_TOUCH)) {
+ 		if (buf[0] & GT_EVENT_REQUEST) {
+-			IOLog("VIVA TOUCH: request event 0x%02x 0x%02x\n", buf[0], buf[1]);
++			handleRequest();
+ 		}
+-		writeReg(GT_REG_COORDS, &zero, 1);
++		writeReg(fRegCoor, &zero, 1);
+ 		return;
+ 	}
+-	uint32_t n = buf[1] & 0x0f;
++	uint32_t n = buf[2] & 0x0f;
+ 	if (n > GT_MAX_TOUCH) {
+-		writeReg(GT_REG_COORDS, &zero, 1);
++		writeReg(fRegCoor, &zero, 1);
+ 		return;
+ 	}
+-	if (n > 1 && readReg(GT_REG_COORDS + pre, buf + pre, (n - 1) * GT_BYTES_PER_COORD) != kIOReturnSuccess) {
++	if (n > 1 && readReg(fRegCoor + pre, buf + pre, (n - 1) * GT_BYTES_PER_COORD) != kIOReturnSuccess) {
+ 		return;
+ 	}
+-	writeReg(GT_REG_COORDS, &zero, 1);
++	writeReg(fRegCoor, &zero, 1);
+ 
+-	uint8_t sum = 0;
+-	for (uint32_t i = 0; i < n * GT_BYTES_PER_COORD + 4; i++) {
+-		sum += buf[i];
+-	}
+-	if (sum != 0) {
++	if (n > 0 && !sumOK(buf + GT_HEAD_LEN, n * GT_BYTES_PER_COORD + 2)) {
+ 		if (++fBadSums <= 8) {
+-			IOLog("VIVA TOUCH: checksum 0x%02x (n %u)\n", sum, n);
++			IOLog("VIVA TOUCH: contact checksum (n %u)\n", n);
+ 		}
+ 		return;
+ 	}
+-	if (n >= 1 && buf[(n - 1) * GT_BYTES_PER_COORD + 2] >= 0x80) {
+-		return;         /* pen report: not a finger */
++	if (n > 0) {
++		uint8_t type = buf[GT_HEAD_LEN + (n - 1) * GT_BYTES_PER_COORD] & 0x0f;
++		if (type == GT_POINT_STYLUS || type == GT_POINT_STYLUS_HOVER) {
++			return;         /* pen report: not a finger */
++		}
+ 	}
+ 
+ 	fEvents++;
+ 	uint32_t map = 0;
+ 	const uint8_t *c = buf + GT_HEAD_LEN;
+ 	for (uint32_t i = 0; i < n; i++, c += GT_BYTES_PER_COORD) {
+-		uint32_t id = c[0];
++		uint32_t id = (c[0] >> 4) & 0x0f;
+ 		if (id >= GT_MAX_TOUCH || id >= SWEET_TOUCH_FINGERS) {
+ 			break;
+ 		}
+-		uint32_t x = (uint32_t)c[1] | (uint32_t)c[2] << 8;
+-		uint32_t y = (uint32_t)c[3] | (uint32_t)c[4] << 8;
++		uint32_t x = be16(c + 2), y = be16(c + 4);
+ 		map |= 1u << id;
+ 		touch((int)id, true, (int)(x * PANEL_W / fMaxX), (int)(y * PANEL_H / fMaxY));
+ 	}

@@ -179,6 +179,11 @@ def viva_devices(ph, phandle, gic_ph):
                 ('reset-gpio', u32(17)),
                 ('max-x', u32(8640)),
                 ('max-y', u32(19200)),
+                # Yellowstone register map from vendor/firmware/goodix_cfg_group.bin
+                # (tools/viva-goodix-cfg.py; ic_type "yellowstone", pid "9896")
+                ('reg-coor', u32(0x4180)),
+                ('reg-pid', u32(0x4022)),
+                ('reg-fw-request', u32(0x4180)),
             ]),
         ]),
     ]
