@@ -186,6 +186,19 @@ def viva_devices(ph, phandle, gic_ph):
                 ('reg-fw-request', u32(0x4180)),
             ]),
         ]),
+        # Mali-G57 MC2 (mali@13000000; GIC SPI 274/275/276 = GPU, MMU, JOB, level high; EVENT and PWR
+        # belong to ARM's kbase and stay unused): iokit/Kernel/arm/VivaGPU.cpp, started only with the
+        # boot-arg vivagpu=1|2. reg: the Mali, then the MFG power blocks it drives: mfgcfg, SPM,
+        # topckgen, apmixed, infracfg_ao (sequences from Xiaomi's gpufreq/clk-mt6781-pg).
+        node('gpu', [
+            ph(),
+            ('compatible', cstr('mediatek,mt6781-mali')),
+            ('reg', u64(0x13000000 - SOC_BASE, 0x4000, 0x13fbf000 - SOC_BASE, 0x1000,
+                        0x10006000 - SOC_BASE, 0x1000, 0x10000000 - SOC_BASE, 0x1000,
+                        0x1000c000 - SOC_BASE, 0x1000, 0x10001000 - SOC_BASE, 0x1000)),
+            ('interrupt-parent', u32(gic_ph)),
+            ('interrupts', spi(0x112, IRQ_LEVEL_HIGH) + spi(0x113, IRQ_LEVEL_HIGH) + spi(0x114, IRQ_LEVEL_HIGH)),
+        ]),
     ]
 
 

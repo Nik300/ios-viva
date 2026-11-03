@@ -164,9 +164,30 @@ tools/viva-goodix-cfg.py): coor 0x4180, pid 0x4022, version 0x4014 (135 bytes), 
 cfg_addr 0x96f8, cfg_send_flag 0x4034. Yellowstone events: 8-byte head (byte 0 bit 7 touch, bit 6 request,
 byte 2 = contacts, BE16 sum in bytes 6-7), 8 bytes per contact (id << 4 | type, x/y/w BE16), BE16 contact sum.
 
-Patch 0098: VivaGT9896 on the Yellowstone protocol (registers from the ADT); request events logged/acked
+Patch 0098 (CI run 41557214919, image `out/xnu-ufs-rw-ys.img`, works 2026-11-03: touch OK on the lock screen): VivaGT9896 on the Yellowstone protocol (registers from the ADT); request events logged/acked
 (config requests are not answered yet: the IC keeps its flash config); USB link `i2c DEV REG N` and
 `i2cw DEV REG B..` for live exploration.
+
+Patch 0100 "viva GPU" (2026-11-03, kernel side of `~/Developer/ios-viva/gpu/uapi`, phases G1-G2 of
+`docs/PIANO-GPU.md`): `VivaGPUAccelerator : IOAcceleratorES` on ADT `/arm-io/gpu` ("mediatek,mt6781-mali",
+reg = Mali, mfgcfg, SPM, topckgen, apmixed, infracfg_ao; SPI 274-276 GPU/MMU/JOB) + `VivaGPUUserClient`
+(viva_gpu_uapi.h: BOs, mmap, submit, WAIT_BO, syncobjs, IOSurface/user-memory import, SYNC_BO).
+- MFG power (facts from viva-r-oss gpufreq_v1/mt6781 + clk-mt6781-pg, summary in the session's
+  MT6781-GPU-POWER.md, reproduced here): MT6366 VSRAM_GPU (EN 0x1bc8.0, VOSEL 0x1bf4[6:0], DA 0x1be4/0x1be2[14:8])
+  then VGPU (EN 0x1508.0, VOSEL 0x1526[6:0], DA 0x1520/0x151e), 0.5 V + 6.25 mV/step; MFGPLL apmixed
+  0x250/0x254/0x25c, 300 MHz = CON1 0x831713b1; mfg_sel CLK_CFG_0[17:16] (SET 0x44 CLR 0x48, UPDATE 0x004 bit 2),
+  1 = mfgpll, 3 = mainpll_d5 (park); SPM key 0x0b160001, MFG0-3 PWR_CON 0x308 + 4n, status 0x16c/0x170 bit 2+n;
+  MFG1 bus protection infracfg_ao SET 0x2a0/0x2a8, CLR 0x2a4/0x2ac, STA 0x228/0x258, masks 0x18000000 (1),
+  0x00600000, 0x02000000, 0x20000000 (1); mfgcfg CG CLR 0x008 bit 0 + async/global/qchannel setup; ACP off
+  (infracfg_ao 0x290 bit 9). Fixed OPP: 300 MHz, VGPU 0.65 V, VSRAM 0.85 V. VivaPwrap::writeRegulator() only
+  writes those four PMIC fields (VGPU <= 0.9 V, VSRAM <= 1.0 V).
+- Mali: soft reset, L2/stack/tiler/shader power, TLS hash + IDVS quirks, COHERENCY_NONE; AArch64 4K page tables
+  (48-bit, MEMATTR byte 0 = 0x8f), one AS per connection (LRU over AS_PRESENT); slot 0 fragment, slot 1 the rest,
+  one chain per slot, flush clean+invalidate at start and end; heap BOs grow 2 MiB per translation fault; other
+  faults disable the AS and fail the chain; 3 s timeout -> hard stop -> soft reset.
+- Boot-arg `vivagpu`: 0 (default) off; 1 started, unpowered (USB link `gpu ...`); 2 power at boot + publish.
+  Link: `gpu [status|mfg|on|off|regs|selftest [fault]|publish]` (`mfg` is read-only).
+- Not yet: DVFS, runtime power gating, IOSurface cache flush cost (whole surface per job), performance counters.
 
 Workflow notes:
 - Kernel patches are made against a local xnu-8796.141.3 tree with all
@@ -176,6 +197,6 @@ Workflow notes:
 - Single files compile-check locally with `tools/xnu-cc.py LOG BUILDTREE FILES` against the
   `xnu-buildtree` artifact (it holds the patched source: edit there, `git diff` = next patch)
   and the CI log (`gh run view RUN --log`); CI_DXB/CLANG in it are set for this fork.
-- Build: `gh workflow run xnu.yml -R Nik300/ios-viva --ref viva` (~1 h), then
+- Build: `gh workflow run xnu.yml -R Nik300/ios-viva --ref viva` (~8-10 min), then
   `tools/viva-mkboot.sh KERNEL ~/Developer/ios-viva/stock/boot.img STAGE`; extra boot-args via
   `VIVA_CMDLINE`. Debug features stay compiled in and are switched by boot-args.
