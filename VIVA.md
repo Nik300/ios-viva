@@ -168,7 +168,7 @@ Patch 0098 (CI run 41557214919, image `out/xnu-ufs-rw-ys.img`, works 2026-11-03:
 (config requests are not answered yet: the IC keeps its flash config); USB link `i2c DEV REG N` and
 `i2cw DEV REG B..` for live exploration.
 
-Patch 0100 "viva GPU" (2026-11-03, kernel side of `~/Developer/ios-viva/gpu/uapi`, phases G1-G2 of
+Patch 0100 "viva GPU" (2026-11-03, CI run 41569069049, image `out/xnu-ufs-rw-gpu.img` with vivagpu=1, untested; kernel side of `~/Developer/ios-viva/gpu/uapi`, phases G1-G2 of
 `docs/PIANO-GPU.md`): `VivaGPUAccelerator : IOAcceleratorES` on ADT `/arm-io/gpu` ("mediatek,mt6781-mali",
 reg = Mali, mfgcfg, SPM, topckgen, apmixed, infracfg_ao; SPI 274-276 GPU/MMU/JOB) + `VivaGPUUserClient`
 (viva_gpu_uapi.h: BOs, mmap, submit, WAIT_BO, syncobjs, IOSurface/user-memory import, SYNC_BO).
