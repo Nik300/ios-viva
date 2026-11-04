@@ -1,0 +1,94 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c0937cc..a80c363 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -287,6 +287,7 @@ public:
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ static AppleCLCD *gSweetFB;     /* for the USB link "disp" command */
++volatile uint32_t sweet_fb_gpu_waits;
+ static volatile uint32_t gSweetFbDutyCap;       /* sweet_fb_set_duty_cap (Low Power Mode); 0 = sweetfb_duty */
+ 
+ /* Low Power Mode (VivaBattery.cpp): panel copies take at most `pct` % of one CPU (0 = sweetfb_duty again). */
+@@ -802,6 +803,7 @@ AppleCLCD::presentQueued(const uint8_t *recs, uint32_t n, bool early)
+ 		if (fGpuWaitMax != 0 && fGpuTicks < fGpuWaitMax) {
+ 			fGpuTicks++;
+ 			fGpuWaits++;
++			sweet_fb_gpu_waits++;   /* 0137: the GPU governor boosts */
+ 			return -1;
+ 		}
+ 		pick = (int)n - 1;
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 0ff1220..205c8f5 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -108,6 +108,13 @@ IOReturn viva_gpu_surface_wait(SweetSurface *surface, uint32_t timeoutMs);
+  */
+ void sweet_fb_gpu_done(void);
+ 
++/*
++ * 0137: vsync ticks at which the display had a frame queued but the GPU had not finished it (K0c). The GPU's DVFS
++ * governor goes to its fastest OPP when this moves: with SwapWait (0133) every frame of GPU latency is a frame less
++ * per second, and the load average of bursty frames kept the clock low.
++ */
++extern volatile uint32_t sweet_fb_gpu_waits;
++
+ /*
+  * Size of the surfaces the display may scan out directly (viva OVL, SweetFramebuffer.cpp; 0 = none): such
+  * 4-byte single-plane surfaces are allocated physically contiguous below 4 GiB when possible.
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index 76d4749..de65a74 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -909,6 +909,9 @@ VivaGPUAccelerator::start(IOService *provider)
+ 	PE_parse_boot_argn("vivagpudvfs", &flag, sizeof(flag));
+ 	fDvfs = flag != 0;
+ 	flag = 1;
++	PE_parse_boot_argn("vivagpuboost", &flag, sizeof(flag));
++	fDvfsBoost = flag != 0;
++	flag = 1;
+ 	PE_parse_boot_argn("vivagpufastkick", &flag, sizeof(flag));
+ 	fFastKick = flag != 0;
+ 	uint32_t maxMhz = 950;
+@@ -3265,7 +3268,14 @@ VivaGPUAccelerator::dvfsSample(void)
+ 		fast = MIN(MAX(fast, oppForMHz(gVivaGPUCapMHz)), fOpp);   /* Low Power Mode ceiling */
+ 	}
+ 	uint64_t msec = nowMs();
+-	if (pct >= DVFS_UP_PCT) {
++	uint32_t waits = sweet_fb_gpu_waits;
++	bool boost = fDvfsBoost && waits != fDvfsSeenWaits;
++	fDvfsSeenWaits = waits;
++	if (boost) {
++		want = fast;            /* 0137: a frame missed its vsync waiting for us (bursty load averages low) */
++		fDvfsBoosts++;
++	}
++	if (pct >= DVFS_UP_PCT || boost) {
+ 		want = fast;
+ 	} else if (msec - fDvfsUpMs >= DVFS_HOLD_MS) {
+ 		uint32_t khz = (uint32_t)((uint64_t)gVivaOpp[cur].khz * pct / DVFS_TARGET_PCT);
+@@ -4054,8 +4064,9 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
+ 			    fWatchFragment ? ", watching fragment jobs" : "", fHeapGrows, fGpuFaults, fTimeouts, fResets);
+ 			memoryDump(o, end);
+ 			cacheStats(o, end);
+-			say(o, end, "dvfs %s (%u..%u MHz, load %u%%, %llu up %llu down), flush reduction %s\n", fDvfs ? "on" : "off",
+-			    gVivaOpp[fOpp].khz / 1000, gVivaOpp[MIN(fDvfsFast, fOpp)].khz / 1000, fLoadPct, fDvfsUps, fDvfsDowns,
++			say(o, end, "dvfs %s (%u..%u MHz, load %u%%, %llu up %llu down, %llu display boosts%s), flush reduction "
++			    "%s\n", fDvfs ? "on" : "off", gVivaOpp[fOpp].khz / 1000, gVivaOpp[MIN(fDvfsFast, fOpp)].khz / 1000,
++			    fLoadPct, fDvfsUps, fDvfsDowns, fDvfsBoosts, fDvfsBoost ? "" : ", vivagpuboost=0",
+ 			    fFlushReduce ? "on" : "off");
+ 			latencyStats(o, end);   /* per-call costs: "gpu calls" (the reply holds 4000 bytes) */
+ 			say(o, end, "usage: gpu [status|mfg|on|off|regs|freq [MHz]|dvfs [on|off]|lat [reset]|calls [reset]|clocks|"
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+index 604951e..a590fac 100644
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -413,6 +413,9 @@ private:
+ 	bool     fDvfs, fDvfsArmed;
+ 	uint32_t fDvfsFast, fLoadPct;
+ 	uint64_t fBusyStart, fBusyNs, fWindowStart, fDvfsUpMs, fDvfsUps, fDvfsDowns;
++	bool     fDvfsBoost;                /* 0137 vivagpuboost: fastest OPP while the display waits for frames */
++	uint32_t fDvfsSeenWaits;
++	uint64_t fDvfsBoosts;
+ 	uint64_t fImplicitDeps, fLazyListed, fLazyBytes, fLazyNs, fLazyWaits, fLazyOverflows;
+ 	void cacheStats(char **out, char *end);
+ public:

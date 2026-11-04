@@ -525,3 +525,8 @@ done 27.5 ms (18.8 ms with the GPU pinned at 950 MHz), chosen -> on screen 27-32
 a frame end") per switch. Patch 0136 (NOT tested): the vsync timer is armed without leeway (kIOTimeOptionsWithLeeway, 0:
 the default thread-call coalescing slop let ticks land after the frame end), a tick up to 3 ms early polls instead of
 waiting a whole frame, `disp` counts late/early ticks with a switch pending ("ticks with a switch pending (0136)").
+Patch 0137 (NOT tested): **DVFS display boost**. The governor aims at 70% busy over 50 ms windows; frames come in bursts
+(~15-20 ms of GPU work every ~36 ms), so the average stayed low, the clock went down, each frame took longer to finish,
+and with SwapWait CA drew fewer frames: a loop toward low fps. Now a vsync tick at which the display had a frame queued
+that the GPU had not finished (K0c wait, counter `sweet_fb_gpu_waits`) sends the next DVFS sample to the fastest OPP
+(Low Power Mode ceiling still applies). `vivagpuboost=0` = off; `gpu status` shows "N display boosts".
