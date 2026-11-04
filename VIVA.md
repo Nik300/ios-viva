@@ -470,3 +470,15 @@ Patch 0128 (2026-11-04, from the GPU side, NOT tested on the phone yet):
   enabled on 0x7c606000 (1080x2400, pitch 4320), so every copy went to the buffer on screen (tearing bands while
   scrolling). LK reserves 3 buffers (mblock-18-framebuffer 0x7bc10000 + 0x1df0000): flipSetup now takes the first of
   buffers 1-2 that no layer reads (0x7cffc000 that boot).
+
+0127 on the phone (2026-11-04): `wifi fw` without WMT: the three DOWNLOAD_CONFIG got result 0 (the ROM's PDA path works),
+every PDA chunk taken (TX ring 3 cidx = didx = 12), but no WIFI_START result (RX ring 1 didx 3, RX ring 0 empty) and the ready
+bits went 0x2 -> 0x4 (not 0x6): the RAM code started and never finished its init.
+
+Patches 0129-0130 (CI run 41757521920 = 0128 from the GPU session + 0129 + 0130, image `out/xnu-ufs-rw-0130.img`, NOT tested):
+- 0129: `wifi fw` waits 3 s on both RX rings for WIFI_START and checks the ready bits anyway; `wifi` shows the WFDMA side.
+- 0130 **WiFi step 2b**, `wifi wmt` (between `wifi on` and `wifi fw`): WMT over STP/BTIF as wmt_core_stp_init +
+  mtk_wcn_soc_sw_init: BTIF @0x1100c000 in PIO (infracfg_ao CG0 bit 31, wake pulse), STP mand mode (4-byte header, 2 zero CRC
+  bytes), register read 0x80000008, query STP (11 00 00 00) / set STP (DB 0E 68 01) -> full mode (0x80|seq<<3|ack, header sum,
+  CRC-16 IBM, every data frame acknowledged with the received seq), query STP again, set chip id 0x6781, query A-die, RF
+  calibration (01 14 01 00 01), VCN28 off.
