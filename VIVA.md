@@ -630,3 +630,13 @@ Before: nobody set CPU clocks (LK's A55 1866 MHz, **A76 1085 MHz**, CCI 612 MHz)
   big 1670); `vivatherm=0` = no LVTS. TOPRGU hardware thermal reset NOT armed. Temperatures in `cpu`.
 - If the phone hangs at boot with 0147: boot with `VIVA_EXTRA="... vivacpufreq=0"` (clocks untouched) or
   `vivatherm=0`.
+
+### 0149: WiFi bring-up stack overflow (0148 panic)
+0148 on the phone: `wifi up` (and WiFi from Settings) panicked "Kernel stack memory corruption detected" in
+`wifi_init` (backtrace vl_thread -> viva_wifi_link -> wifi_up -> wifi_init -> __stack_chk_fail, symbolized with
+xnu/out-0148). Cause (since 0142, latent until the frame layout changed): `uint8_t p[64]` but SET_RX_FILTER does
+`bzero(p, 68)` and sends 68 bytes. Now p[80].
+RAM: the live DT says 6 GiB (`reg <0x40000000 0x1_80000000>`, rank0 2 GiB at 0x40000000, rank1 4 GiB at 0xc0000000);
+XNU gets only 0xc0000000-0x1be000000 (~3.97 GiB) because rank0 holds LK's no-map reservations (TEE, ATF, modem SMEM,
+SCP/SSPM, framebuffer: ~472 MiB in 24 regions); ~1.5 GiB of rank0 is free but in holes. Using it needs hole support
+in arm_vm_init/pmap (not done).
