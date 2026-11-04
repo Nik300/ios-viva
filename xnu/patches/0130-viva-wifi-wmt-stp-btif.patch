@@ -1,0 +1,312 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index d2fc8e8..d847f9e 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -909,7 +909,7 @@ vl_vivad_out(uint8_t *out, uint32_t max)
+  *   i2c8 BUS DEV REG N     read N (max 64) bytes from 8-bit register REG of device DEV on I2C bus BUS
+  *   i2c8w BUS DEV REG B..  write bytes (max 7) to 8-bit register REG of device DEV on I2C bus BUS
+  *   bat [poll|lpm on|off]  battery (VivaBattery.cpp): gauge, charger registers, Low Power Mode
+- *   wifi [status|detect|on|fw|off]  CONNSYS (viva_wifi.c): state (read only), A-die detection, power on with RAM patches / off
++ *   wifi [status|detect|on|wmt|fw|off]  CONNSYS (viva_wifi.c): state (read only), A-die detection, power on with RAM patches / off
+  *   gpu [ARGS]        Mali driver (VivaGPU.cpp): status, mfg, on, off, regs, freq, selftest [fault], probe, publish
+  *   push SIZE MODE FNV PATH  receive a file (raw OUT data follows; written to PATH.vivapush, renamed when
+  *                     its FNV-1a matches; missing directories are created)
+@@ -1097,7 +1097,7 @@ vl_command(void)
+ 			delay(5000);
+ 		}
+ 	} else if (IS("help")) {
+-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|fw|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+ 	} else {
+ 		vl_reply("unknown command: %s (try help)\n", c);
+ 	}
+diff --git a/bsd/dev/viva_wifi.c b/bsd/dev/viva_wifi.c
+index 940cf51..807c907 100644
+--- a/bsd/dev/viva_wifi.c
++++ b/bsd/dev/viva_wifi.c
+@@ -22,6 +22,12 @@
+  *                  pinmux, MTCMOS, bus protection, chip id, EMI HW mode, AFE, EMI entries, XO, A-die select, bus
+  *                  timeout, MCU mem delay, CPU reset released, then the MCU must reach its idle loop
+  *                  (0x18002600 == 0x1D1E). CONNSYS stays on (no WMT/STP yet, no EMI MPU SMC: tried without first).
++ *   wifi wmt       step 2b (after "wifi on", before "wifi fw"): what Linux's WMT does over STP/BTIF before the WiFi
++ *                  driver may start (wmt_core_stp_init + mtk_wcn_soc_sw_init, MT6781 options): BTIF in PIO (clock
++ *                  infracfg_ao bit 31, CONNSYS wake pulse), STP "mand" mode: register read 0x80000008 (proves the
++ *                  MCU answers), query/set STP -> full mode (seq/ack, header sum, CRC-16 IBM), set chip id 0x6781,
++ *                  query A-die, RF calibration, then VCN28 (efuse PALDO) off. 0127 showed the WiFi RAM code starting
++ *                  (ready bits 0x2 -> 0x4) but never finishing its init without this.
+  *   wifi fw        step 3 (after "wifi on"), gen4m wlanDownloadFW without WMT: driver own (LPCTL), WFDMA rings
+  *                  (TX 0/1/3/15, RX 0/1, 16 entries) in contiguous memory, GLO_CFG with the FW-download bypass,
+  *                  WIFI_FW_DIR/WIFI_RAM_CODE_soc2_2_2_1.bin (CONNAC tailer format): DL_TO_EMI regions copied into
+@@ -611,6 +617,261 @@ fail:
+ 	return o;
+ }
+ 
++/* ---- step 2b: WMT over STP/BTIF ---- */
++
++#define BTIF_BASE               0x1100c000
++#define BTIF_RBR                (BTIF_BASE + 0x00)
++#define BTIF_THR                (BTIF_BASE + 0x00)
++#define BTIF_IER                (BTIF_BASE + 0x04)
++#define BTIF_FIFOCTRL           (BTIF_BASE + 0x08)
++#define BTIF_FAKELCR            (BTIF_BASE + 0x0c)
++#define BTIF_LSR                (BTIF_BASE + 0x14)
++#define BTIF_DMA_EN             (BTIF_BASE + 0x4c)
++#define BTIF_TRI_LVL            (BTIF_BASE + 0x60)
++#define BTIF_WAK                (BTIF_BASE + 0x64)
++#define BTIF_HANDSHAKE          (BTIF_BASE + 0x6c)
++#define LSR_DR                  (1u << 0)
++#define LSR_THRE                (1u << 5)
++#define INFRA_CG0_CLR           0x10001084
++#define INFRA_CG0_STA           0x10001090
++#define INFRA_CG0_BTIF          (1u << 31)
++#define STP_TYPE_WMT            4
++
++static struct {
++	bool    full;
++	uint8_t txseq, txack, rxseq;
++	uint16_t crc[256];
++} st;
++
++static void
++crc_init(void)
++{
++	for (uint32_t i = 0; i < 256; i++) {            /* CRC-16 IBM (reflected 0xA001): osal.c crc16_table */
++		uint16_t c = (uint16_t)i;
++		for (int k = 0; k < 8; k++) {
++			c = (c & 1) ? (uint16_t)((c >> 1) ^ 0xa001) : (uint16_t)(c >> 1);
++		}
++		st.crc[i] = c;
++	}
++}
++
++static uint16_t
++crc16(const uint8_t *b, uint32_t n)
++{
++	uint16_t c = 0;
++	while (n--) {
++		c = (uint16_t)((c >> 8) ^ st.crc[(c ^ *b++) & 0xff]);
++	}
++	return c;
++}
++
++static bool
++btif_put(const uint8_t *b, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		if (!poll(BTIF_LSR, LSR_THRE, LSR_THRE, 20000)) {
++			return false;
++		}
++		wr(BTIF_THR, b[i]);
++	}
++	return true;
++}
++
++static int
++btif_get(uint32_t us)
++{
++	for (uint32_t t = 0; t <= us; t += 10) {
++		if (rd(BTIF_LSR) & LSR_DR) {
++			return (int)(rd(BTIF_RBR) & 0xff);
++		}
++		delay(10);
++	}
++	return -1;
++}
++
++/* hal_btif_hw_init in PIO, plus the AP -> CONNSYS wake pulse (hal_btif_raise_wak_sig). */
++static void
++btif_init(void)
++{
++	if (rd(INFRA_CG0_STA) & INFRA_CG0_BTIF) {
++		wr(INFRA_CG0_CLR, INFRA_CG0_BTIF);
++	}
++	wr(BTIF_FAKELCR, 0);
++	rmw(BTIF_HANDSHAKE, 1, 1);
++	rmw(BTIF_FIFOCTRL, 1u << 1, 1u << 1);
++	rmw(BTIF_FIFOCTRL, 1u << 1, 0);
++	rmw(BTIF_FIFOCTRL, 1u << 2, 1u << 2);
++	rmw(BTIF_FIFOCTRL, 1u << 2, 0);
++	wr(BTIF_TRI_LVL, 8 | (1u << 4));                /* TX 8, RX 1, loopback off */
++	wr(BTIF_DMA_EN, 1u << 2);                       /* PIO both ways, auto reset */
++	wr(BTIF_IER, 0);                                /* polled */
++	rmw(BTIF_WAK, 1, 0);
++	delay(160);
++	rmw(BTIF_WAK, 1, 1);
++	st.full = false;
++	st.txseq = 0;
++	st.txack = 7;
++	st.rxseq = 0;
++	crc_init();
++}
++
++static bool
++stp_ack(void)
++{
++	uint8_t h[4] = { (uint8_t)(0x80 | st.txack), 0, 0, 0 };
++	h[3] = (uint8_t)(h[0] + h[1] + h[2]);
++	return btif_put(h, 4);
++}
++
++/* One WMT packet in the current STP mode (stp_core.c mtk_wcn_stp_send_data, mand / full). */
++static bool
++stp_send(const uint8_t *p, uint32_t n)
++{
++	uint8_t h[4], c[2] = { 0, 0 };
++	h[0] = (uint8_t)(0x80 | (st.txseq << 3) | (st.full ? st.txack : 0));
++	h[1] = (uint8_t)((STP_TYPE_WMT << 4) | ((n >> 8) & 0xf));
++	h[2] = (uint8_t)n;
++	h[3] = st.full ? (uint8_t)(h[0] + h[1] + h[2]) : 0;
++	if (st.full) {
++		uint16_t crc = crc16(p, n);
++		c[0] = (uint8_t)crc;
++		c[1] = (uint8_t)(crc >> 8);
++		st.txseq = (st.txseq + 1) & 7;
++	}
++	return btif_put(h, 4) && btif_put(p, n) && btif_put(c, 2);
++}
++
++/* Next STP data frame (ack-only frames skipped; full mode: acknowledged). Payload into out, length returned, <0 none. */
++static int
++stp_recv(uint8_t *out, uint32_t max, uint32_t ms, uint8_t *type)
++{
++	for (uint32_t tries = 0; tries < 16; tries++) {
++		int b0;
++		do {                                    /* sync: bit 7 */
++			b0 = btif_get(ms * 1000);
++		} while (b0 >= 0 && !(b0 & 0x80));
++		int b1 = b0 < 0 ? -1 : btif_get(20000), b2 = b1 < 0 ? -1 : btif_get(20000), b3 = b2 < 0 ? -1 : btif_get(20000);
++		if (b3 < 0) {
++			return -1;
++		}
++		uint32_t n = ((uint32_t)(b1 & 0xf) << 8) | (uint32_t)b2;
++		if (n == 0) {
++			continue;                       /* an acknowledgement */
++		}
++		uint32_t got = 0;
++		for (uint32_t i = 0; i < n + 2; i++) {
++			int v = btif_get(20000);
++			if (v < 0) {
++				return -2;
++			}
++			if (i < n && got < max) {
++				out[got++] = (uint8_t)v;
++			}
++		}
++		if (type) {
++			*type = (uint8_t)(b1 >> 4);
++		}
++		if (st.full) {
++			st.txack = (uint8_t)((b0 >> 3) & 7);
++			st.rxseq = (st.txack + 1) & 7;
++			stp_ack();
++		}
++		return (int)got;
++	}
++	return -3;
++}
++
++/* WMT command -> its event (02 opcode ...); the event bytes are compared with `want` (wlen bytes) if given. */
++static int
++wmt_cmd(const char *what, const uint8_t *cmd, uint32_t clen, const uint8_t *want, uint32_t wlen, uint32_t ms,
++    uint8_t *ev, uint32_t evmax, char *out, size_t len, size_t *po)
++{
++	size_t o = *po;
++	uint8_t type = 0;
++	int n = -1;
++	if (!stp_send(cmd, clen)) {
++		say("wmt: %s: BTIF did not take it (LSR 0x%02x)\n", what, rd(BTIF_LSR) & 0xff);
++		*po = o;
++		return -1;
++	}
++	for (int k = 0; k < 4; k++) {
++		n = stp_recv(ev, evmax, ms, &type);
++		if (n < 0 || (type == STP_TYPE_WMT && n >= 2 && ev[0] == 0x02 && ev[1] == cmd[1])) {
++			break;
++		}
++		say("wmt: %s: other frame type %u, %d bytes (%02x %02x ..)\n", what, type, n, n > 0 ? ev[0] : 0,
++		    n > 1 ? ev[1] : 0);
++	}
++	if (n < 0) {
++		say("wmt: %s: no answer (%d, LSR 0x%02x)\n", what, n, rd(BTIF_LSR) & 0xff);
++	} else {
++		say("wmt: %s ->", what);
++		for (int i = 0; i < n && i < 16; i++) {
++			say(" %02x", ev[i]);
++		}
++		bool ok = want == NULL || ((uint32_t)n >= wlen && memcmp(ev, want, wlen) == 0);
++		say("%s\n", ok ? "" : "  (UNEXPECTED)");
++		if (!ok) {
++			n = -4;
++		}
++	}
++	*po = o;
++	return n;
++}
++
++static size_t
++wifi_wmt(char *out, size_t len, size_t o)
++{
++	if (!vw.on || rd(CONN_MCU_COM_REG0) != CONN_IDLE_MAGIC) {
++		say("wmt: CONNSYS not on with the MCU idle (wifi on first)\n");
++		return o;
++	}
++	btif_init();
++	say("wmt: BTIF clock %s, LSR 0x%02x\n", (rd(INFRA_CG0_STA) & INFRA_CG0_BTIF) ? "STILL GATED" : "on",
++	    rd(BTIF_LSR) & 0xff);
++	uint8_t ev[64];
++	/* wmt_core_hw_check: register read 0x80000008 (GEN_HCR) in mand mode */
++	static const uint8_t regrd[] = { 0x01, 0x08, 0x10, 0x00, 0x02, 0x01, 0x00, 0x01, 0x08, 0x00, 0x00, 0x80,
++		                         0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff };
++	static const uint8_t regrdEv[] = { 0x02, 0x08, 0x08, 0x00, 0x00, 0x01, 0x00, 0x01 };
++	if (wmt_cmd("read 0x80000008", regrd, sizeof(regrd), regrdEv, sizeof(regrdEv), 1000, ev, sizeof(ev), out, len, &o) < 0) {
++		return o;
++	}
++	static const uint8_t qstp[] = { 0x01, 0x04, 0x01, 0x00, 0x04 };
++	static const uint8_t qstpDef[] = { 0x02, 0x04, 0x06, 0x00, 0x00, 0x04, 0x11, 0x00, 0x00, 0x00 };
++	static const uint8_t qstpFull[] = { 0x02, 0x04, 0x06, 0x00, 0x00, 0x04, 0xdb, 0x0e, 0x68, 0x01 };
++	static const uint8_t sstp[] = { 0x01, 0x04, 0x05, 0x00, 0x03, 0xdb, 0x0e, 0x68, 0x01 };
++	static const uint8_t sstpEv[] = { 0x02, 0x04, 0x02, 0x00, 0x00, 0x03 };
++	(void)wmt_cmd("query stp", qstp, sizeof(qstp), qstpDef, sizeof(qstpDef), 1000, ev, sizeof(ev), out, len, &o);
++	if (wmt_cmd("set stp full", sstp, sizeof(sstp), sstpEv, sizeof(sstpEv), 1000, ev, sizeof(ev), out, len, &o) < 0) {
++		return o;
++	}
++	st.full = true;                                 /* host side switch, 10 ms */
++	st.txseq = 0;
++	st.txack = 7;
++	delay(10000);
++	if (wmt_cmd("query stp (full)", qstp, sizeof(qstp), qstpFull, sizeof(qstpFull), 1000, ev, sizeof(ev), out, len,
++	    &o) < 0) {
++		return o;
++	}
++	static const uint8_t chipid[] = { 0x01, 0x02, 0x05, 0x00, 0x11, 0x81, 0x67, 0x00, 0x00 };
++	static const uint8_t chipidEv[] = { 0x02, 0x02, 0x01, 0x00, 0x00 };
++	if (wmt_cmd("set chip id 0x6781", chipid, sizeof(chipid), chipidEv, sizeof(chipidEv), 1000, ev, sizeof(ev), out,
++	    len, &o) < 0) {
++		return o;
++	}
++	static const uint8_t adie[] = { 0x01, 0x02, 0x01, 0x00, 0x12 };
++	static const uint8_t adieEv[] = { 0x02, 0x02, 0x05, 0x00, 0x00 };
++	(void)wmt_cmd("query a-die", adie, sizeof(adie), adieEv, sizeof(adieEv), 1000, ev, sizeof(ev), out, len, &o);
++	static const uint8_t cal[] = { 0x01, 0x14, 0x01, 0x00, 0x01 };
++	static const uint8_t calEv[] = { 0x02, 0x14, 0x02, 0x00, 0x00, 0x01 };
++	int c = wmt_cmd("rf calibration", cal, sizeof(cal), calEv, sizeof(calEv), 5000, ev, sizeof(ev), out, len, &o);
++	/* wmt_ic_soc.c: the efuse PALDO (VCN28) goes off after the calibration */
++	viva_pwrap_write_regulator(PMIC_VCN28_CON0, 0x1, 0x0);
++	say("wmt: %s; VCN28 off. Next: wifi fw\n", c >= 0 ? "done" : "calibration FAILED");
++	return o;
++}
++
+ /* ---- step 3: WiFi RAM code over WFDMA ---- */
+ 
+ #define GLO_TX_EN               (1u << 0)
+@@ -929,6 +1190,10 @@ viva_wifi_link(const char *args, char *out, size_t len)
+ 		printf("VIVA WIFI: power on\n");
+ 		o = wifi_on(out, len, o);
+ 		printf("%s", out);
++	} else if (strncmp(args, "wmt", 3) == 0) {
++		printf("VIVA WIFI: WMT over STP/BTIF\n");
++		o = wifi_wmt(out, len, o);
++		printf("%s", out);
+ 	} else if (strncmp(args, "fw", 2) == 0) {
+ 		printf("VIVA WIFI: firmware download\n");
+ 		o = wifi_fw(out, len, o);
