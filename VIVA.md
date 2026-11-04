@@ -677,3 +677,12 @@ giving RX entry i back (write + clean of its line) wrote the CPU's stale copy of
 "done + length", so the driver waited forever on an entry that looked empty. Now viva_wifi_dma_uncached()
 (VivaWiFi.cpp: the same memory mapped write-combined) is the only way descriptors are touched; wr() issues a DSB
 before every register write (CIDX after the descriptor writes). NOT tested.
+
+### 0154: no TX A-MPDU, RX ring resync, `wifi ring`
+0153 on the phone: same stall. `wifi sta`: 127 MSDU reports came back (tokens work), then all 32 ring-0 tokens stayed
+out and the DMA stopped (CIDX 17 / DIDX 18, 479 "ring full"): the MAC stopped sending data, so the DMA scheduler ran
+out of room. RX ring 0: entries 7..15, 0 done by the hardware, entry 6 empty, driver waiting on 6 (CIDX 5).
+Guess for TX: the firmware's TX block-ack session (UPDATE_STA_RECORD ucTxAmpdu = 1, as gen4m) jams under load; now 0.
+RX: when the entry the driver waits on reads empty but the DMA is past it and the next one is done, give it back and
+move on (counted). `wifi ring`: both RX rings (hardware/driver indexes, every descriptor's d1), TX 0/15, GLO_CFG,
+INT_STA. NOT tested.

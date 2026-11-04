@@ -1,0 +1,65 @@
+diff --git a/bsd/dev/viva_wifi.c b/bsd/dev/viva_wifi.c
+index d63984e..356c3bf 100644
+--- a/bsd/dev/viva_wifi.c
++++ b/bsd/dev/viva_wifi.c
+@@ -926,6 +926,7 @@ static struct {
+ 	uint8_t *uva;                   /* the same memory mapped write-combined (uncached): the descriptors */
+ 	uint64_t pa;
+ 	uint32_t txIdx[16], rxIdx[2];
++	uint32_t rxGot[2], rxSkipped[2], rxSkipD1[2];
+ 	uint8_t  seq;
+ } wd;
+ 
+@@ -1017,10 +1018,24 @@ wfdma_rx(uint32_t r, uint8_t *out, uint32_t max, uint32_t us)
+ 			viva_wifi_dma_flush(OFF_RX(r) + 16 * i, 16);
+ 			wr(WF_RX_RING(r) + 8, i);              /* give the entry back */
+ 			wd.rxIdx[r] = (i + 1) % RING_N;
++			wd.rxGot[r]++;
+ 			return n ? n : 1;
+ 		}
+ 		delay(50);
+ 	}
++	/*
++	 * 0153 on the phone: RX ring 0 stopped at an entry that read empty while the DMA had filled the ten after it.
++	 * Not explained yet; resynchronise: if the DMA is past this entry and the next one is done, give this one back
++	 * and move on (counted in "wifi ring").
++	 */
++	uint32_t didx = rd(WF_RX_RING(r) + 12) & 0xfff;
++	if (didx != i && (desc(OFF_RX(r), (i + 1) % RING_N)[1] & DESC_DMADONE)) {
++		wd.rxSkipped[r]++;
++		wd.rxSkipD1[r] = d[1];
++		d[1] = (uint32_t)RX_BUF_LEN << 16;
++		wr(WF_RX_RING(r) + 8, i);
++		wd.rxIdx[r] = (i + 1) % RING_N;
++	}
+ 	return 0;
+ }
+ 
+@@ -2723,7 +2738,7 @@ hw_sta_rec(uint8_t state)
+ 	p[55] = 0xff;
+ 	p[68] = 3;                                      /* RTS policy legacy */
+ 	put16(p + 74, rate_code());
+-	p[76] = 1;                                      /* TX A-MPDU */
++	p[76] = 0;                                      /* no TX A-MPDU (0153: the data queue stalled under load) */
+ 	p[77] = 0;                                      /* no RX block ack: we do not reorder */
+ 	put32(p + 88, 0x10);
+ 	p[92] = 0x40;
+@@ -3395,6 +3410,18 @@ viva_wifi_link(const char *args, char *out, size_t len)
+ 		sta_leave(out, len, &o);
+ 	} else if (strncmp(args, "sta", 3) == 0) {
+ 		o = wifi_sta(out, len, o);
++	} else if (strncmp(args, "ring", 4) == 0 && wd.uva != NULL) {
++		for (uint32_t r = 0; r < 2; r++) {
++			say("rx%u: hw cidx %u didx %u, driver next %u, %u taken, %u skipped (last skipped d1 0x%08x); d1:", r,
++			    rd(WF_RX_RING(r) + 8), rd(WF_RX_RING(r) + 12), wd.rxIdx[r], wd.rxGot[r], wd.rxSkipped[r], wd.rxSkipD1[r]);
++			for (uint32_t i = 0; i < RING_N; i++) {
++				say(" %08x", desc(OFF_RX(r), i)[1]);
++			}
++			say("\n");
++		}
++		say("tx0: hw cidx %u didx %u, driver next %u; tx15: cidx %u didx %u; GLO_CFG 0x%08x INT_STA 0x%08x\n",
++		    rd(WF_TX_RING(0) + 8), rd(WF_TX_RING(0) + 12), wd.txIdx[0], rd(WF_TX_RING(15) + 8), rd(WF_TX_RING(15) + 12),
++		    rd(WF_GLO_CFG), rd(WF_INT_STA));
+ 	} else if (strncmp(args, "cap", 3) == 0) {
+ 		o = wifi_cap(out, len, o);
+ 	} else if (strncmp(args, "fw", 2) == 0) {
