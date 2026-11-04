@@ -655,3 +655,8 @@ The MT6366 RTC (base 0x588, rtc-mt6397 layout, year = 1968 + reg) holds UTC kept
 2026-11-04 21:00:07 = the Mac's UTC. VivaPwrap::start reads it (`VIVA RTC: N s since 1970`), publishes IORTC;
 SweetPlatformExpert::getUTCTimeOfDay returns it. setUTCTimeOfDay is a no-op (no RTC writes; NTP/timed only moves
 the kernel calendar). Settings > General > Date & Time crashing is a separate (userland) issue, not looked at yet.
+0151 on the phone: `VIVA RTC: 1793827603 s since 1970` (right UTC; awdd session ids agree). The "old clock" was the time
+zone: /private/var/db/timezone/localtime -> zoneinfo/US/Pacific (the iPhone image's default), 9 h behind Italy.
+New tools/vivad/vln.c (built by CI next to vivad; iOS has no ln), pushed to /private/var/root/viva-tests/vln:
+`viva-link.py run -- /private/var/root/viva-tests/vln /var/db/timezone/zoneinfo/Europe/Rome /private/var/db/timezone/localtime`
+(set 2026-11-04, survives reboot). Settings > Date & Time hangs (no CRASH line in the console): not looked at yet.
