@@ -668,3 +668,12 @@ on an MSDU report (token) or after 1 s; with 16 slots and reports missing (or un
 Now: ring 0 has 32 entries (descriptors at DMA +0x41000, 2 KiB buffers in ring 3's area), a slot without a report is
 reused after 100 ms, the ring-full case (DIDX not past the previous entry) is checked, and `wifi sta` prints the
 tx ring 0 counters (reports, reused, waits, ring full, cidx/didx, the first report's raw bytes). NOT tested.
+
+### 0153: WFDMA descriptors through an uncached mapping
+Measured on 0151 with traffic stalled (`peek`): TX ring 0 CIDX 0xe / DIDX 5, then CIDX 0 (the driver wrapped over
+entries the DMA had not taken: fixed by 0152's ring-full check); RX ring 0 CIDX 2 / DIDX 0xe = 11 frames written by
+the hardware and never read, `rx` frozen. Cause: descriptors are 16 bytes, four per cache line, in cached memory;
+giving RX entry i back (write + clean of its line) wrote the CPU's stale copy of entries i+1..i+3 over the DMA's
+"done + length", so the driver waited forever on an entry that looked empty. Now viva_wifi_dma_uncached()
+(VivaWiFi.cpp: the same memory mapped write-combined) is the only way descriptors are touched; wr() issues a DSB
+before every register write (CIDX after the descriptor writes). NOT tested.
