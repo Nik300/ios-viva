@@ -562,3 +562,6 @@ IOServiceMatching("AppleMobileFileIntegrity") + user client selector 6), so inst
 Patch 0140 (CI 41776680999, includes the other agent's 0139 vsync; image `out/xnu-ufs-rw-0140.img` with the MAC ADT,
 NOT tested): built-in AppleMobileFileIntegrity IOService on IOResources, sel 6 -> success, other selectors unsupported
 (logged once as `SWEET AMFI:`). After boot: full rebuild (`viva-tests/vlsr`), then `vwall lsext` / `vwall ext`.
+0140 on the phone (+ MAC ADT): full LS rebuild 143 s, LS DB 413 extension records (was 1), 9 com.apple.posterkit.provider
+appexes, PosterBoard `fetchExtensionIdentifiers` lists all 9 (Collections, Gradient, Emoji, Pride, Unity, Photos,
+Extragalactic, Aegir, LegacyPoster). Next (userland): create/select a poster configuration.
