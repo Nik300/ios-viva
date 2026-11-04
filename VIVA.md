@@ -511,6 +511,12 @@ On 0140 `wifi on` failed: "no contiguous 5 MiB below 4 GiB for the EMI window" (
 physically contiguous below 4 GiB and fragments that memory). Patch 0141 (NOT tested): VivaPwrap::start calls
 viva_wifi_reserve() and takes the EMI window (5 MiB) and the WFDMA memory (0x48000) at boot, log "VIVA WIFI: reserved ...";
 boot-arg vivawifi=0 skips it. Also 0020-stage-bearssl.sh falls back to GitHub mirrors (bearssl.org answered 502), SHA pinned.
+0141 on the phone: `wifi on/wmt/fw` OK again, `wifi cap` answered (17 TLVs, efuse MAC zero, A-die 0x6631 eco 1, HT/VHT/5 GHz);
+EID 0x07 = SLEEPY_INFO (ignored). Spec for init/NVRAM/scan: ~/Developer/ios-viva/wifi/docs/MT6781-WIFI-CMDS.md.
+Patch 0142 (NOT tested): `pull part:NAME` (read-only GPT partition of the UFS root LUN, e.g. nvdata), `wifi init` (basic
+config, NVRAM from /usr/share/firmware/wifi/viva/WIFI = nvdata APCFG/APRDEB/WIFI, else stWifiCfgDefault_6631.bin + random
+local MAC, domain x2, DBDC off, RX filter, BSS_ACTIVATE), `wifi scan [2g] [SSID]`; bsd/dev/viva_wpa.c (WPA2-PSK crypto +
+4-way, host-tested on IEEE/RFC vectors, not used yet). Join/association not written yet.
 
 Patch 0135 (2026-11-04, from the GPU side, NOT tested on the phone yet): **frame rate with scanout + SwapWait (0133)**.
 Measured on 0133 (Settings scrolls): ~12 fps shown, GPU idle 84-91%, the same with the GPU pinned at 950 MHz;
