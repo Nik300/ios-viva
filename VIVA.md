@@ -660,3 +660,11 @@ zone: /private/var/db/timezone/localtime -> zoneinfo/US/Pacific (the iPhone imag
 New tools/vivad/vln.c (built by CI next to vivad; iOS has no ln), pushed to /private/var/root/viva-tests/vln:
 `viva-link.py run -- /private/var/root/viva-tests/vln /var/db/timezone/zoneinfo/Europe/Rome /private/var/db/timezone/localtime`
 (set 2026-11-04, survives reboot). Settings > Date & Time hangs (no CRASH line in the console): not looked at yet.
+
+### 0152: data TX ring 0 without MSDU reports
+0151 on the phone (joined TIM-43248969 from Settings): pages stop at the first progress tick, Sileo "533 Time Out";
+`wifi sta`: data tx 1634 (76 drops), rx 1279 = traffic flows but crawls. Suspect: a TX ring 0 slot was only reused
+on an MSDU report (token) or after 1 s; with 16 slots and reports missing (or unparsed) that caps TX near 16 frames/s.
+Now: ring 0 has 32 entries (descriptors at DMA +0x41000, 2 KiB buffers in ring 3's area), a slot without a report is
+reused after 100 ms, the ring-full case (DIDX not past the previous entry) is checked, and `wifi sta` prints the
+tx ring 0 counters (reports, reused, waits, ring full, cidx/didx, the first report's raw bytes). NOT tested.

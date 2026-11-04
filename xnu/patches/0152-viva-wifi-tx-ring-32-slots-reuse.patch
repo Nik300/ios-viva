@@ -1,0 +1,122 @@
+diff --git a/bsd/dev/viva_wifi.c b/bsd/dev/viva_wifi.c
+index c4da1b4..74f77a6 100644
+--- a/bsd/dev/viva_wifi.c
++++ b/bsd/dev/viva_wifi.c
+@@ -910,7 +910,10 @@ wifi_wmt(char *out, size_t len, size_t o)
+ #define BUF_SZ                  0x1000
+ #define RX_BUF_LEN              3840
+ #define DMA_SIZE                0x48000
+-#define OFF_TX(n)               ((n) == 3 ? 0x0000u : (n) == 15 ? 0x0100u : (n) == 0 ? 0x0200u : 0x0300u)
++#define OFF_TX(n)               ((n) == 3 ? 0x0000u : (n) == 15 ? 0x0100u : (n) == 0 ? 0x41000u : 0x0300u)
++#define TX0_N                   32              /* data ring: 32 entries at 0x41000, 2 KiB buffers in ring 3's area */
++#define TX0_BUF                 0x800
++#define RING_LEN(n)             ((n) == 0 ? TX0_N : RING_N)
+ #define OFF_RX(n)               ((n) == 0 ? 0x0400u : 0x0500u)
+ #define OFF_TXBUF               0x01000u        /* ring 3 then ring 15 buffers: 16 x 4 KiB each */
+ #define OFF_RXBUF(n)            ((n) == 1 ? 0x21000u : 0x31000u)
+@@ -950,7 +953,7 @@ wfdma_setup(void)
+ 		uint32_t n = tx[k];
+ 		wr(WF_TX_RING(n) + 0, (uint32_t)(wd.pa + OFF_TX(n)));
+ 		wr(WF_TX_EXT(n), (uint32_t)(wd.pa >> 32));
+-		wr(WF_TX_RING(n) + 4, RING_N);
++		wr(WF_TX_RING(n) + 4, RING_LEN(n));
+ 		wr(WF_TX_RING(n) + 8, 0);
+ 		wd.txIdx[n] = 0;
+ 	}
+@@ -2440,11 +2443,13 @@ sta_leave(char *out, size_t len, size_t *po)
+ #define EID_ADD_PKEY_DONE       0x24
+ 
+ static struct {
+-	uint16_t busy;                  /* TX ring 0 slots whose token is out */
+-	uint64_t when[RING_N];
++	uint32_t busy;                  /* TX ring 0 slots whose token is out */
++	uint64_t when[TX0_N];
+ 	uint16_t sn;                    /* management frames' sequence numbers */
+ 	uint8_t  chToken;
+ 	bool     ptk;                   /* pairwise key in: data goes out protected */
++	uint32_t ringFull, reused;
++	uint8_t  firstReport[16];       /* raw bytes of the first MSDU report (wifi sta) */
+ 	uint32_t reports, lost, full;
+ } tx0;
+ 
+@@ -2544,36 +2549,47 @@ tx_report(const uint8_t *b, uint32_t n)
+ 	uint32_t cnt = (uint32_t)(b[2] | b[3] << 8) & 0x7f;
+ 	for (uint32_t i = 0; i < cnt && 8 + 4 * i + 2 <= n; i++) {
+ 		uint32_t tok = (uint32_t)(b[8 + 4 * i] | b[9 + 4 * i] << 8) & 0x7fff;
+-		if (tok < RING_N) {
+-			tx0.busy &= (uint16_t)~(1u << tok);
++		if (tok < TX0_N) {
++			tx0.busy &= ~(1u << tok);
+ 		}
+ 	}
+-	tx0.reports++;
++	if (tx0.reports++ == 0) {
++		memcpy(tx0.firstReport, b, MIN(n, (uint32_t)sizeof(tx0.firstReport)));
++	}
+ }
+ 
+ /* 802.3 frame on TX ring 0 (hardware 802.3 -> 802.11 translation and CCMP with the WTBL key). */
+ static int
+ tx_data(const uint8_t *eth, uint32_t len, bool protect, bool lowRate)
+ {
+-	if (len < 14 || len > 1532) {
++	if (len < 14 || len > TX0_BUF - 64) {
+ 		return -1;
+ 	}
+ 	uint32_t i = wd.txIdx[0];
++	/* the DMA has not taken the entry before this one round the ring yet: the ring itself is full */
++	for (int k = 0; k < 50 && (i + 1) % TX0_N == (rd(WF_TX_RING(0) + 12) & 0xfff); k++) {
++		delay(20);
++	}
++	if ((i + 1) % TX0_N == (rd(WF_TX_RING(0) + 12) & 0xfff)) {
++		tx0.ringFull++;
++		return -1;
++	}
+ 	if (tx0.busy & (1u << i)) {
+-		/* give the reports a moment, then reuse a slot whose report never came */
++		/* give the reports a moment, then reuse a slot whose report never came (100 ms: long past the fetch of
++		 * its frame; 0152: with 1 s and 16 slots, missing reports capped TX at ~16 frames/s, TCP stalled) */
+ 		for (int k = 0; k < 4 && (tx0.busy & (1u << i)); k++) {
+ 			int kind;
+ 			(void)rx_next(wcmd_ev, RX_BUF_LEN, 200, &kind);
+ 		}
+ 		if (tx0.busy & (1u << i)) {
+-			if (mach_absolute_time() - tx0.when[i] < ms_abs(1000)) {
++			if (mach_absolute_time() - tx0.when[i] < ms_abs(100)) {
+ 				tx0.full++;
+ 				return -1;
+ 			}
+-			tx0.lost++;
++			tx0.reused++;
+ 		}
+ 	}
+-	uint32_t boff = OFF_TXBUF + BUF_SZ * i;
++	uint32_t boff = OFF_TXBUF + TX0_BUF * i;
+ 	uint8_t *t = wd.va + boff;
+ 	uint64_t pa = wd.pa + boff, fpa = pa + 64;
+ 	uint16_t type = (uint16_t)(eth[12] << 8 | eth[13]);
+@@ -2600,9 +2616,9 @@ tx_data(const uint8_t *eth, uint32_t len, bool protect, bool lowRate)
+ 	d[2] = 0;
+ 	d[3] = (uint32_t)(pa >> 32) & 0xf;
+ 	viva_wifi_dma_flush(OFF_TX(0) + 16 * i, 16);
+-	tx0.busy |= (uint16_t)(1u << i);
++	tx0.busy |= 1u << i;
+ 	tx0.when[i] = mach_absolute_time();
+-	wd.txIdx[0] = (i + 1) % RING_N;
++	wd.txIdx[0] = (i + 1) % TX0_N;
+ 	wr(WF_TX_RING(0) + 8, wd.txIdx[0]);
+ 	return 0;
+ }
+@@ -3323,6 +3339,12 @@ wifi_sta(char *out, size_t len, size_t o)
+ 	say("sta: data tx %u (drops %u) rx %u (drops %u), EAPOL in %u out %u (wpa state %u, drops %u, mic failures %u), "
+ 	    "%u events, %u frames, %u data\n", sj.tx, sj.txDrops, sj.rx, sj.rxDrops, sj.eapolRx, sj.eapolTx, sj.wpa.state,
+ 	    sj.wpa.drops, sj.wpa.mic_fail, wl.events, wl.frames, wl.dataFrames);
++	say("sta: tx ring 0: %u MSDU reports, slots in use 0x%08x, %u reused without report, %u waits for a report, %u ring "
++	    "full, cidx %u didx %u; first report %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", tx0.reports,
++	    tx0.busy, tx0.reused, tx0.full, tx0.ringFull, rd(WF_TX_RING(0) + 8), rd(WF_TX_RING(0) + 12),
++	    tx0.firstReport[0], tx0.firstReport[1], tx0.firstReport[2], tx0.firstReport[3], tx0.firstReport[4],
++	    tx0.firstReport[5], tx0.firstReport[6], tx0.firstReport[7], tx0.firstReport[8], tx0.firstReport[9],
++	    tx0.firstReport[10], tx0.firstReport[11]);
+ 	if (o < len) {
+ 		o += viva_wlan_stats(out + o, len - o);
+ 	}
