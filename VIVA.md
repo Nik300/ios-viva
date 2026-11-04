@@ -482,3 +482,21 @@ Patches 0129-0130 (CI run 41757521920 = 0128 from the GPU session + 0129 + 0130,
   bytes), register read 0x80000008, query STP (11 00 00 00) / set STP (DB 0E 68 01) -> full mode (0x80|seq<<3|ack, header sum,
   CRC-16 IBM, every data frame acknowledged with the received seq), query STP again, set chip id 0x6781, query A-die, RF
   calibration (01 14 01 00 01), VCN28 off.
+
+0130 on the phone (2026-11-04): `wifi wmt`: BTIF clock on, the MCU ANSWERS over STP/BTIF (read 0x80000008 -> 02 08 0c 00 | 00 |
+00 00 01 | 08 00 00 80 | value) but the check expected another layout and stopped there; `wifi fw` then as 0127 (ready 0x4).
+Scanout test (runtime `disp scanout on`): 0 frames scanned out, every frame "surface not contiguous" (CA allocates its
+framebuffers at start) and, with scanout on, copies skipped the duty limit: slower.
+
+Patches 0131-0133 (CI runs 41759869436, 41761117709; image `out/xnu-ufs-rw-0133.img`, now built with vivascanout=1 by default;
+NOT tested):
+- 0131: WMT register read answer format; unexpected WMT answers are shown but no longer stop the sequence.
+- 0132: a scanout fallback keeps the copy duty limit (fScanLive = the last frame was really scanned out).
+- 0133: **SwapWait** (sel 6, [swap, options, timeout ms]) as Apple's swap_wait_gated: op 0 retired (not queued, not waiting
+  for the frame end, not the surface the layer reads), 1 displayed, 2 idle; bit 31 non-blocking -> kIOReturnBusy; blocking
+  re-checks every ms (5 s cap). CoreAnimation (IOMFBDisplay::can_update_) reuses a framebuffer page only when
+  SwapWait(page swap, 0x80000000) returns 0 (gpu/docs/ANALISI-SCANOUT-RE.md): before, it rendered into the surface the
+  panel was scanning out (tearing). Vsync notification args 4/5 = refresh period. **IOSurface use counts** (traps 0/1)
+  kept per client and published at state page +0x18/+0x1c (IOSurfaceIsInUse; CABackingStore reuse), released when the
+  client goes away. `disp` shows SwapWait busy/blocking counts and the swaps the layer reads / will read.
+  `tools/viva-mkboot.sh` default VIVA_EXTRA now "cpus=8 vivausb=3 vivagpu=2 vivascanout=1".
