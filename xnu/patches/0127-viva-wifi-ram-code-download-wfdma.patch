@@ -1,0 +1,420 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index 2a42f3a..d2fc8e8 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -909,7 +909,7 @@ vl_vivad_out(uint8_t *out, uint32_t max)
+  *   i2c8 BUS DEV REG N     read N (max 64) bytes from 8-bit register REG of device DEV on I2C bus BUS
+  *   i2c8w BUS DEV REG B..  write bytes (max 7) to 8-bit register REG of device DEV on I2C bus BUS
+  *   bat [poll|lpm on|off]  battery (VivaBattery.cpp): gauge, charger registers, Low Power Mode
+- *   wifi [status|detect|on|off]  CONNSYS (viva_wifi.c): state (read only), A-die detection, power on with RAM patches / off
++ *   wifi [status|detect|on|fw|off]  CONNSYS (viva_wifi.c): state (read only), A-die detection, power on with RAM patches / off
+  *   gpu [ARGS]        Mali driver (VivaGPU.cpp): status, mfg, on, off, regs, freq, selftest [fault], probe, publish
+  *   push SIZE MODE FNV PATH  receive a file (raw OUT data follows; written to PATH.vivapush, renamed when
+  *                     its FNV-1a matches; missing directories are created)
+@@ -1097,7 +1097,7 @@ vl_command(void)
+ 			delay(5000);
+ 		}
+ 	} else if (IS("help")) {
+-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|fw|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+ 	} else {
+ 		vl_reply("unknown command: %s (try help)\n", c);
+ 	}
+diff --git a/bsd/dev/viva_wifi.c b/bsd/dev/viva_wifi.c
+index 21ba22a..73af2e9 100644
+--- a/bsd/dev/viva_wifi.c
++++ b/bsd/dev/viva_wifi.c
+@@ -22,6 +22,12 @@
+  *                  pinmux, MTCMOS, bus protection, chip id, EMI HW mode, AFE, EMI entries, XO, A-die select, bus
+  *                  timeout, MCU mem delay, CPU reset released, then the MCU must reach its idle loop
+  *                  (0x18002600 == 0x1D1E). CONNSYS stays on (no WMT/STP yet, no EMI MPU SMC: tried without first).
++ *   wifi fw        step 3 (after "wifi on"), gen4m wlanDownloadFW without WMT: driver own (LPCTL), WFDMA rings
++ *                  (TX 0/1/3/15, RX 0/1, 16 entries) in contiguous memory, GLO_CFG with the FW-download bypass,
++ *                  WIFI_FW_DIR/WIFI_RAM_CODE_soc2_2_2_1.bin (CONNAC tailer format): DL_TO_EMI regions copied into
++ *                  the EMI window at Addr & 0xFFFFFF, the others sent on TX ring 3 (INIT_CMD DOWNLOAD_CONFIG, 2 KiB
++ *                  PDA chunks, result event on RX ring 1), then WIFI_START (override, RAM entry) and the ready bits
++ *                  0x180C1140 & 0x6. gen4m sources: chips/common/fw_dl.c, cmm_asic_connac.c, hif_pdma.h.
+  *   wifi off       CONN CPU back in reset, MTCMOS off, rails and pinmux as before "wifi on".
+  *
+  * PMIC writes go through VivaPwrap::writeRegulator (VCN18/VCN33/VCN28 enable/mode bits, VCN33 = 3.3 V only).
+@@ -41,6 +47,8 @@ extern int viva_pwrap_read(uint32_t addr, uint32_t *value);
+ extern int viva_pwrap_write_regulator(uint32_t addr, uint32_t mask, uint32_t value);
+ extern void *viva_wifi_emi_alloc(uint32_t size, uint64_t *pa);                                /* VivaWiFi.cpp */
+ extern void viva_wifi_emi_flush(uint32_t offset, uint32_t len);
++extern void *viva_wifi_dma_alloc(uint32_t size, uint64_t *pa);
++extern void viva_wifi_dma_flush(uint32_t offset, uint32_t len);
+ 
+ #define WIFI_FW_DIR             "/usr/share/firmware/wifi/viva/"
+ #define EMI_SIZE                0x500000
+@@ -584,6 +592,313 @@ fail:
+ 	return o;
+ }
+ 
++/* ---- step 3: WiFi RAM code over WFDMA ---- */
++
++#define WF_LPCTL                0x18007000      /* BIT0 HOST_SET_OWN (read: 1 = firmware own), BIT1 HOST_CLR_OWN */
++#define WF_INT_STA              0x18004200
++#define WF_INT_MSK              0x18004204
++#define WF_GLO_CFG              0x18004208
++#define WF_RST_PTR              0x1800420c
++#define WF_PAUSE_TX_Q           0x18004224
++#define WF_APSRC_SLPPROT        0x18004160
++#define WF_TX_RING(n)           (0x18004300 + 0x10 * (n))      /* +0 BASE +4 CNT +8 CIDX +C DIDX */
++#define WF_RX_RING(n)           (0x18004400 + 0x10 * (n))
++#define WF_TX_EXT(n)            (0x18004500 + 4 * (n))
++#define WF_RX_EXT(n)            (0x18004580 + 4 * (n))
++#define WF_READY                0x180c1140      /* (v & 0x6) == 0x6: WiFi firmware ready */
++#define GLO_TX_EN               (1u << 0)
++#define GLO_TX_BUSY             (1u << 1)
++#define GLO_RX_EN               (1u << 2)
++#define GLO_RX_BUSY             (1u << 3)
++#define GLO_ENABLE              (GLO_TX_EN | GLO_RX_EN | (3u << 4) | (1u << 6) | (2u << 10) | (1u << 12) | \
++	                         (1u << 26) | (1u << 30))      /* asicPdmaConfig */
++#define GLO_FWDL_BYPASS         (1u << 9)       /* bypass_dmashdl_txring3 while downloading */
++#define DESC_DMADONE            (1u << 31)
++#define DESC_LASTSEC0           (1u << 30)
++#define RING_N                  16
++#define BUF_SZ                  0x1000
++#define RX_BUF_LEN              3840
++#define DMA_SIZE                0x48000
++#define OFF_TX(n)               ((n) == 3 ? 0x0000u : (n) == 15 ? 0x0100u : (n) == 0 ? 0x0200u : 0x0300u)
++#define OFF_RX(n)               ((n) == 0 ? 0x0400u : 0x0500u)
++#define OFF_TXBUF               0x01000u        /* ring 3 then ring 15 buffers: 16 x 4 KiB each */
++#define OFF_RXBUF(n)            ((n) == 1 ? 0x21000u : 0x31000u)
++#define WIFI_RAM_CODE           "WIFI_RAM_CODE_soc2_2_2_1.bin"
++#define PDA_CHUNK               2048
++
++static struct {
++	uint8_t *va;
++	uint64_t pa;
++	uint32_t txIdx[16], rxIdx[2];
++	uint8_t  seq;
++} wd;
++
++static uint32_t *
++desc(uint32_t off, uint32_t i)
++{
++	return (uint32_t *)(void *)(wd.va + off + 16 * i);
++}
++
++static void
++wfdma_setup(void)
++{
++	bzero(wd.va, DMA_SIZE);
++	static const uint32_t tx[] = { 0, 1, 3, 15 };
++	for (unsigned r = 0; r < 2; r++) {
++		for (uint32_t i = 0; i < RING_N; i++) {
++			uint32_t *d = desc(OFF_RX(r), i);
++			d[0] = (uint32_t)(wd.pa + OFF_RXBUF(r) + BUF_SZ * i);
++			d[1] = (uint32_t)RX_BUF_LEN << 16;
++		}
++	}
++	viva_wifi_dma_flush(0, DMA_SIZE);
++	wr(WF_GLO_CFG, rd(WF_GLO_CFG) & ~(GLO_TX_EN | GLO_RX_EN));
++	(void)poll(WF_GLO_CFG, GLO_TX_BUSY | GLO_RX_BUSY, 0, 100000);
++	wr(WF_RST_PTR, 0xffffffff);
++	for (unsigned k = 0; k < 4; k++) {
++		uint32_t n = tx[k];
++		wr(WF_TX_RING(n) + 0, (uint32_t)(wd.pa + OFF_TX(n)));
++		wr(WF_TX_EXT(n), (uint32_t)(wd.pa >> 32));
++		wr(WF_TX_RING(n) + 4, RING_N);
++		wr(WF_TX_RING(n) + 8, 0);
++		wd.txIdx[n] = 0;
++	}
++	for (unsigned r = 0; r < 2; r++) {
++		wr(WF_RX_RING(r) + 0, (uint32_t)(wd.pa + OFF_RX(r)));
++		wr(WF_RX_EXT(r), (uint32_t)(wd.pa >> 32));
++		wr(WF_RX_RING(r) + 4, RING_N);
++		wr(WF_RX_RING(r) + 8, RING_N - 1);
++		wd.rxIdx[r] = 0;
++	}
++	wr(WF_INT_MSK, 0);
++	wr(WF_INT_STA, 0xffffffff);
++	wr(WF_PAUSE_TX_Q, 0);
++	rmw(WF_APSRC_SLPPROT, 1u << 4, 1u << 4);
++	wr(WF_GLO_CFG, rd(WF_GLO_CFG) | GLO_ENABLE | GLO_FWDL_BYPASS);
++	wd.seq = 0;
++}
++
++/* One packet on TX ring n (3 or 15): copied into its buffer, CIDX advanced, wait for the DMA to take it. */
++static bool
++wfdma_tx(uint32_t n, const void *pkt, uint32_t plen)
++{
++	uint32_t i = wd.txIdx[n], boff = OFF_TXBUF + (n == 15 ? RING_N * BUF_SZ : 0) + BUF_SZ * i;
++	if (plen > BUF_SZ) {
++		return false;
++	}
++	memcpy(wd.va + boff, pkt, plen);
++	viva_wifi_dma_flush(boff, plen);
++	uint32_t *d = desc(OFF_TX(n), i);
++	d[0] = (uint32_t)(wd.pa + boff);
++	d[1] = (plen << 16) | DESC_LASTSEC0;
++	d[2] = 0;
++	d[3] = (uint32_t)((wd.pa + boff) >> 32) & 0xf;
++	viva_wifi_dma_flush(OFF_TX(n) + 16 * i, 16);
++	wd.txIdx[n] = (i + 1) % RING_N;
++	wr(WF_TX_RING(n) + 8, wd.txIdx[n]);
++	return poll(WF_TX_RING(n) + 12, 0xfff, wd.txIdx[n], 200000);
++}
++
++/* Next received packet on RX ring r within `us`: copied to out (max), length returned, 0 = nothing. */
++static uint32_t
++wfdma_rx(uint32_t r, uint8_t *out, uint32_t max, uint32_t us)
++{
++	uint32_t i = wd.rxIdx[r], *d = desc(OFF_RX(r), i);
++	for (uint32_t t = 0; t <= us; t += 50) {
++		viva_wifi_dma_flush(OFF_RX(r) + 16 * i, 16);
++		if (d[1] & DESC_DMADONE) {
++			uint32_t n = (d[1] >> 16) & 0x3fff, boff = OFF_RXBUF(r) + BUF_SZ * i;
++			viva_wifi_dma_flush(boff, BUF_SZ);
++			memcpy(out, wd.va + boff, MIN(n, max));
++			d[1] = (uint32_t)RX_BUF_LEN << 16;
++			viva_wifi_dma_flush(OFF_RX(r) + 16 * i, 16);
++			wr(WF_RX_RING(r) + 8, i);              /* give the entry back */
++			wd.rxIdx[r] = (i + 1) % RING_N;
++			return n ? n : 1;
++		}
++		delay(50);
++	}
++	return 0;
++}
++
++/* INIT packet (cmm_asic_connac.c asicFillInitCmdTxdInfo): 32-byte TXD + 32-byte INIT_HIF_TX_HEADER + payload. */
++static uint32_t
++init_pkt(uint8_t *pkt, uint8_t cid, const void *payload, uint32_t plen, uint8_t *seqOut)
++{
++	uint32_t total = 64 + plen;
++	bzero(pkt, 64);
++	pkt[0] = (uint8_t)total;
++	pkt[1] = (uint8_t)(total >> 8);
++	uint16_t pq = cid ? 0x8000 : 0xf800;            /* INIT_CMD_PQ_ID / INIT_CMD_PDA_PQ_ID */
++	pkt[2] = (uint8_t)pq;
++	pkt[3] = (uint8_t)(pq >> 8);
++	pkt[5] = 0xa0;                                  /* header format */
++	pkt[7] = cid ? 2 : 3;                           /* PktFt: INIT_PKT_FT_CMD / INIT_PKT_FT_PDA_FWDL */
++	pkt[32] = (uint8_t)(total - 32);
++	pkt[33] = (uint8_t)((total - 32) >> 8);
++	pkt[36] = cid;
++	pkt[37] = 0xa0;
++	pkt[39] = ++wd.seq;
++	if (seqOut) {
++		*seqOut = wd.seq;
++	}
++	if (payload != pkt + 64) {
++		memmove(pkt + 64, payload, plen);
++	}
++	return total;
++}
++
++/* Send an init command, wait for its INIT_EVENT_ID_CMD_RESULT on RX ring 1 (20-byte RXD + 8-byte event head). */
++static int
++init_cmd(uint8_t cid, const void *payload, uint32_t plen, char *out, size_t len, size_t *po)
++{
++	size_t o = *po;
++	uint8_t pkt[128], ev[256], seq;
++	uint32_t n = init_pkt(pkt, cid, payload, plen, &seq);
++	int ret = -1;
++	if (!wfdma_tx(3, pkt, n)) {
++		say("fw: cmd 0x%02x: TX ring 3 did not take it (didx %u cidx %u)\n", cid, rd(WF_TX_RING(3) + 12),
++		    rd(WF_TX_RING(3) + 8));
++		goto done;
++	}
++	for (int tries = 0; tries < 4; tries++) {
++		uint32_t got = wfdma_rx(1, ev, sizeof(ev), 500000);
++		if (got == 0) {
++			uint32_t g0 = wfdma_rx(0, ev, sizeof(ev), 1000);
++			say("fw: cmd 0x%02x seq %u: no event on RX ring 1 (didx %u)%s\n", cid, seq, rd(WF_RX_RING(1) + 12),
++			    g0 ? ", but something on RX ring 0" : "");
++			goto done;
++		}
++		uint8_t *e = ev + 20;
++		if (got >= 32 && e[4] == 1 && e[5] == seq) {
++			ret = e[8];
++			if (ret != 0) {
++				say("fw: cmd 0x%02x seq %u: result status %u (1 params, 2 CRC, 3 decrypt)\n", cid, seq, e[8]);
++			}
++			goto done;
++		}
++		say("fw: cmd 0x%02x: other event (%u bytes, eid 0x%02x seq %u): %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    cid, got, e[4], e[5], ev[0], ev[1], ev[2], ev[3], e[0], e[1], e[2], e[3]);
++	}
++done:
++	*po = o;
++	return ret;
++}
++
++static size_t
++wifi_fw(char *out, size_t len, size_t o)
++{
++	if (!vw.on || rd(CONN_MCU_COM_REG0) != CONN_IDLE_MAGIC) {
++		say("fw: CONNSYS not on with the MCU idle (wifi on first)\n");
++		return o;
++	}
++	if ((rd(WF_READY) & 0x6) == 0x6) {
++		say("fw: WiFi firmware already running (ready 0x%08x)\n", rd(WF_READY));
++		return o;
++	}
++	wd.va = viva_wifi_dma_alloc(DMA_SIZE, &wd.pa);
++	if (wd.va == NULL) {
++		say("fw: no DMA memory\n");
++		return o;
++	}
++	/* driver own */
++	wr(WF_LPCTL, 1u << 1);
++	if (!poll(WF_LPCTL, 1u << 0, 0, 100000)) {
++		say("fw: driver own not granted (LPCTL 0x%08x)\n", rd(WF_LPCTL));
++		return o;
++	}
++	wfdma_setup();
++	say("fw: driver own, WFDMA at PA 0x%llx, GLO_CFG 0x%08x, ready bits 0x%08x\n", wd.pa, rd(WF_GLO_CFG), rd(WF_READY));
++
++	char path[160];
++	snprintf(path, sizeof(path), "%s%s", WIFI_FW_DIR, WIFI_RAM_CODE);
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (err != 0) {
++		say("fw: %s: open error %d (push it)\n", path, err);
++		return o;
++	}
++	off_t size = 0;
++	uint8_t tail[36], reg[40], pkt[64 + PDA_CHUNK];
++	int resid = 0;
++	(void)vnode_size(vp, &size, ctx);
++#define RD(buf, n, at) (vn_rdwr(UIO_READ, vp, (caddr_t)(buf), (int)(n), (off_t)(at), UIO_SYSSPACE, IO_NOAUTH | IO_UNIT, \
++	vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx)) == 0 && resid == 0)
++	if (size < 36 + 40 || !RD(tail, 36, size - 36) || tail[2] == 0 || tail[2] > 8) {
++		say("fw: bad tailer\n");
++		goto close;
++	}
++	uint32_t nreg = tail[2], fileOff = 0, entry = 0;
++	say("fw: %u regions, version %.10s built %.15s\n", nreg, (const char *)tail + 7, (const char *)tail + 17);
++	for (uint32_t r = 0; r < nreg; r++) {
++		if (!RD(reg, 40, size - 36 - 40 * (off_t)(nreg - r))) {
++			say("fw: region %u tailer unreadable\n", r);
++			goto close;
++		}
++		uint32_t addr, rlen;
++		memcpy(&addr, reg + 16, 4);
++		memcpy(&rlen, reg + 20, 4);
++		uint8_t feat = reg[24];
++		if ((feat & 0x20) && entry == 0) {
++			entry = addr;                           /* VALID_RAM_ENTRY */
++		}
++		if (feat & 0x40) {
++			say("fw: region %u not downloaded (feature 0x%02x)\n", r, feat);
++		} else if (feat & 0x80) {                       /* DL_TO_EMI */
++			uint32_t eoff = addr & 0xffffff;
++			if ((uint64_t)eoff + rlen > EMI_SIZE || !RD((uint8_t *)vw.emi + eoff, rlen, fileOff)) {
++				say("fw: region %u: EMI copy failed (offset 0x%x, %u bytes)\n", r, eoff, rlen);
++				goto close;
++			}
++			viva_wifi_emi_flush(eoff, rlen);
++			say("fw: region %u: %u bytes -> EMI +0x%06x\n", r, rlen, eoff);
++		} else {
++			uint32_t mode = 0;
++			if (feat & 0x01) {
++				mode = (1u << 3) | (feat & 0x6) | 1u | ((feat & 0x10) ? (1u << 6) : 0);
++			}
++			mode |= 1u << 31;                       /* ACK option */
++			uint32_t cfg[3] = { addr, rlen, mode };
++			int res = init_cmd(1, cfg, sizeof(cfg), out, len, &o);
++			if (res != 0) {
++				say("fw: region %u: DOWNLOAD_CONFIG (0x%08x, %u, 0x%08x) failed (%d)\n", r, addr, rlen, mode, res);
++				goto close;
++			}
++			for (uint32_t done = 0; done < rlen; done += PDA_CHUNK) {
++				uint32_t n = MIN((uint32_t)PDA_CHUNK, rlen - done);
++				if (!RD(pkt + 64, n, fileOff + done)) {
++					say("fw: region %u: read error\n", r);
++					goto close;
++				}
++				uint32_t total = init_pkt(pkt, 0, pkt + 64, n, NULL);
++				if (!wfdma_tx(3, pkt, total)) {
++					say("fw: region %u: chunk at %u not taken by the DMA\n", r, done);
++					goto close;
++				}
++			}
++			say("fw: region %u: %u bytes -> 0x%08x (mode 0x%08x)\n", r, rlen, addr, mode);
++		}
++		fileOff += rlen;
++	}
++	{
++		uint32_t start[2] = { entry ? 1u : 0u, entry };
++		int res = init_cmd(2, start, sizeof(start), out, len, &o);
++		if (res != 0) {
++			say("fw: WIFI_START 0x%08x failed (%d)\n", entry, res);
++			goto close;
++		}
++		bool ready = poll(WF_READY, 0x6, 0x6, 1000000);
++		wr(WF_GLO_CFG, rd(WF_GLO_CFG) & ~GLO_FWDL_BYPASS);
++		say("fw: WIFI_START 0x%08x ok; firmware %s (ready bits 0x%08x), MCU pc 0x%08x\n", entry,
++		    ready ? "READY" : "NOT READY after 1 s", rd(WF_READY), rd(CONN_MCU_PC));
++	}
++#undef RD
++close:
++	vnode_close(vp, FREAD, ctx);
++	return o;
++}
++
+ void
+ viva_wifi_link(const char *args, char *out, size_t len)
+ {
+@@ -599,6 +914,10 @@ viva_wifi_link(const char *args, char *out, size_t len)
+ 		printf("VIVA WIFI: power on\n");
+ 		o = wifi_on(out, len, o);
+ 		printf("%s", out);
++	} else if (strncmp(args, "fw", 2) == 0) {
++		printf("VIVA WIFI: firmware download\n");
++		o = wifi_fw(out, len, o);
++		printf("%s", out);
+ 	} else if (strncmp(args, "off", 3) == 0) {
+ 		o = wifi_off(out, len, o);
+ 		printf("%s", out);
+diff --git a/iokit/Kernel/arm/VivaWiFi.cpp b/iokit/Kernel/arm/VivaWiFi.cpp
+index ae57ece..7c6fdb7 100644
+--- a/iokit/Kernel/arm/VivaWiFi.cpp
++++ b/iokit/Kernel/arm/VivaWiFi.cpp
+@@ -5,6 +5,7 @@
+  * remap register infracfg_ao 0x10001380[19:0] = PA >> 16: one physically contiguous range, below 4 GiB (the DT's
+  * alloc-ranges keep it 32-bit), 16 MiB aligned like the DT asks (64 KiB, the remap granularity, as a fallback).
+  * Cacheable; viva_wifi_emi_flush() pushes the CPU's writes out before the MCU reads them.
++ * viva_wifi_dma_alloc(): the WFDMA rings and buffers (any contiguous range below 4 GiB; the WFDMA takes 36 bits).
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -36,6 +37,34 @@ viva_wifi_emi_alloc(uint32_t size, uint64_t *pa)
+ 	return gVivaWiFiEMI->getBytesNoCopy();
+ }
+ 
++static IOBufferMemoryDescriptor *gVivaWiFiDMA;
++
++extern "C" void *
++viva_wifi_dma_alloc(uint32_t size, uint64_t *pa)
++{
++	if (gVivaWiFiDMA == NULL) {
++		gVivaWiFiDMA = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000fffff000ull);
++		if (gVivaWiFiDMA == NULL) {
++			return NULL;
++		}
++	}
++	if (gVivaWiFiDMA->getLength() < size) {
++		return NULL;
++	}
++	*pa = gVivaWiFiDMA->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	return gVivaWiFiDMA->getBytesNoCopy();
++}
++
++/* Clean + invalidate a range of the DMA memory (before the device reads it, and before the CPU reads its writes). */
++extern "C" void
++viva_wifi_dma_flush(uint32_t offset, uint32_t len)
++{
++	if (gVivaWiFiDMA != NULL) {
++		gVivaWiFiDMA->performOperation(kIOMemoryIncoherentIOFlush, offset, len);
++	}
++}
++
+ /* CPU writes out to DRAM (clean + invalidate) before CONNSYS reads; also before the CPU reads what it wrote. */
+ extern "C" void
+ viva_wifi_emi_flush(uint32_t offset, uint32_t len)

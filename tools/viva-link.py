@@ -263,7 +263,19 @@ def main():
 
 
 if __name__ == '__main__':
+    # The log pump is a daemon thread blocked in libusb: a normal interpreter shutdown tears libusb down under it
+    # and segfaults on macOS (seen after "cmd wifi"). Leave with os._exit once the output is flushed.
+    code = 0
     try:
         main()
     except KeyboardInterrupt:
         pass
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            print(e.code, file=sys.stderr)
+            code = 1
+        else:
+            code = e.code or 0
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
