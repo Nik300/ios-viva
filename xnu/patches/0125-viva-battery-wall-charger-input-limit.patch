@@ -1,0 +1,98 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index bec6102..2a42f3a 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -232,6 +232,13 @@ extern void viva_gpu_link(const char *args, char *out, size_t outLen);       /*
+ extern void viva_disp_link(const char *args, char *out, size_t outLen);      /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+ extern int sweet_console_muted;                                             /* osfmk/console/serial_console.c */
+ 
++/* VivaBattery.cpp: a USB host has configured the link (the cable is a computer, not a charger). */
++int
++viva_usb_host_configured(void)
++{
++	return vl.configured ? 1 : 0;
++}
++
+ static void
+ vl_sleep_ms(unsigned ms)
+ {
+diff --git a/iokit/Kernel/arm/VivaBattery.cpp b/iokit/Kernel/arm/VivaBattery.cpp
+index 068f46b..0d44c5f 100644
+--- a/iokit/Kernel/arm/VivaBattery.cpp
++++ b/iokit/Kernel/arm/VivaBattery.cpp
+@@ -32,6 +32,9 @@
+  * defaults). Only REG03 (WD_RST, CHG_CONFIG), REG04 ICHG, REG06 VREG and REG07
+  * WATCHDOG are ever written, read-modify-write, each one read back. Gauge
+  * values outside 3800..4500 mV / 0..6000 mA, or an unknown PN: no writes.
++ * Input limit (boot-arg vivachargein, default 2000 mA, 0 = off): D+/D- are on the USB PHY, so BC1.2 says "unknown
++ * adapter" (500 mA); with no USB host on the link the cable is a wall charger and REG00 IINLIM goes to that value
++ * (VINDPM protects a weak adapter); a host configuring the link brings it back to 500 mA.
+  * Charge limit (boot-arg vivachargelimit=N, sysctl kern.viva_chargelimit,
+  * default 100 = off): CHG_CONFIG off at N %, back on below N - 5 %.
+  *
+@@ -81,6 +84,8 @@
+ #define FG_STATUS_INIT  (1u << 7)       /* initialization complete */
+ 
+ /* SYV690 / BQ25890 */
++#define CHG_REG00       0x00
++#define R00_IINLIM      0x3f            /* 100 + 50 mA per step */
+ #define CHG_REG03       0x03
+ #define CHG_REG04       0x04
+ #define CHG_REG06       0x06
+@@ -158,7 +163,7 @@ private:
+ 	IOInterruptEventSource *fInterrupt;
+ 	uint8_t               fFgAddr, fChgAddr;
+ 	uint32_t              fDesignDefault, fMaxMv, fMaxMa;
+-	uint32_t              fChargeMode;
++	uint32_t              fChargeMode, fInputMa;
+ 	bool                  fLimitHold;
+ 	uint32_t              fPolls, fFgErrors, fChgErrors, fIrqs, fWrites, fWriteFails;
+ 	uint32_t              fLastSoc, fLastVbus, fLastChrg;
+@@ -174,6 +179,7 @@ static int gVivaLowPower;               /* kern.viva_lowpower */
+ static int gVivaChargeLimit = 100;      /* kern.viva_chargelimit */
+ static uint32_t gVivaLPMGpuMHz = 550, gVivaLPMDuty = 10;
+ 
++extern "C" int viva_usb_host_configured(void);           /* bsd/dev/viva_usb.c */
+ extern "C" void viva_gpu_set_dvfs_cap(uint32_t mhz);      /* VivaGPU.cpp: 0 = no cap */
+ extern "C" void sweet_fb_set_duty_cap(uint32_t pct);      /* SweetFramebuffer.cpp: 0 = no cap */
+ 
+@@ -296,7 +302,7 @@ VivaBattery::chgRead(uint8_t reg, uint8_t *v, uint32_t n)
+ IOReturn
+ VivaBattery::chgUpdate(uint8_t reg, uint8_t mask, uint8_t value)
+ {
+-	if (reg != CHG_REG03 && reg != CHG_REG04 && reg != CHG_REG06 && reg != CHG_REG07) {
++	if (reg != CHG_REG00 && reg != CHG_REG03 && reg != CHG_REG04 && reg != CHG_REG06 && reg != CHG_REG07) {
+ 		return kIOReturnNotPermitted;
+ 	}
+ 	uint8_t old;
+@@ -399,6 +405,20 @@ VivaBattery::maintainCharger(VivaBatterySample *s)
+ 			chgUpdate(CHG_REG04, R04_ICHG, (uint8_t)ichg);
+ 		}
+ 	}
++	/*
++	 * Input limit. D+/D- go to the USB PHY (usb_switch GPIOs left as LK set them), so the charger's BC1.2 detection
++	 * sees an "unknown adapter" and stays at 500 mA. Without a USB host on the link it is a wall charger: 2000 mA
++	 * (fInputMa); the charger's VINDPM backs off if the adapter sags. With a host (or SDP/CDP detected): untouched.
++	 */
++	uint32_t vbusStat = s->r[CHG_REG0B] >> 5;
++	bool pg = (s->r[CHG_REG0B] & 0x04) != 0;
++	if (fInputMa != 0 && pg && !viva_usb_host_configured() &&
++	    (vbusStat == VBUS_UNKNOWN || vbusStat == VBUS_NONSTD || vbusStat == VBUS_DCP || vbusStat == VBUS_HVDCP)) {
++		uint32_t steps = MIN((fInputMa - 100) / 50, (uint32_t)R00_IINLIM);
++		chgUpdate(CHG_REG00, R00_IINLIM, (uint8_t)steps);
++	} else if (fInputMa != 0 && pg && viva_usb_host_configured() && (s->r[CHG_REG00] & R00_IINLIM) > 8) {
++		chgUpdate(CHG_REG00, R00_IINLIM, 8);            /* a computer after a charger: back to 500 mA */
++	}
+ 	/* charge limit with 5 % hysteresis */
+ 	bool hold = fLimitHold;
+ 	if (gVivaChargeLimit >= 100) {
+@@ -639,6 +659,9 @@ VivaBattery::start(IOService *provider)
+ 	fMaxMa = MIN(dtU32(provider, "charge-current-max", 3000), 3000u);
+ 	fChargeMode = 1;
+ 	PE_parse_boot_argn("vivacharge", &fChargeMode, sizeof(fChargeMode));
++	fInputMa = 2000;
++	PE_parse_boot_argn("vivachargein", &fInputMa, sizeof(fInputMa));      /* wall charger input limit, 0 = never set */
++	fInputMa = fInputMa != 0 ? MIN(MAX(fInputMa, 500u), 3000u) : 0;
+ 	PE_parse_boot_argn("vivachargelimit", &gVivaChargeLimit, sizeof(gVivaChargeLimit));
+ 	gVivaChargeLimit = MIN(MAX(gVivaChargeLimit, 50), 100);
+ 	PE_parse_boot_argn("vivalpmgpu", &gVivaLPMGpuMHz, sizeof(gVivaLPMGpuMHz));
