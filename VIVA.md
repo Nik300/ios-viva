@@ -604,3 +604,11 @@ Patch 0144 (NOT tested), the iOS pipeline as hakios-xnu-kernel / ios-sapphire do
   record (no reorder buffer).
 - Link: `wifi up`, `wifi join SSID [PASSPHRASE]` (SSID without spaces), `wifi leave`, `wifi sta` (counters + what
   wifid asked), `wifi off`.
+
+### 0146: Viva Manager sysctls (KA1 kern.viva_link, KA2 kern.viva_nextbootargs)
+Spec and behaviour: gpu/docs/RICHIESTE-KERNEL.md (KA1, KA2, "Stato KA1/KA2"). New bsd/dev/viva_sysctl.c; `gpu kv` /
+`disp kv` in VivaGPU.cpp / SweetFramebuffer.cpp (also on the USB link); `stat` moved to viva_link_stat() in
+viva_usb.c; sweet_ufs.c sweet_ufs_bootargs(): the only UFS write outside the root partition, limited to the one 4 KiB
+block of boot_a/boot_b holding the SWEETXNU cmdline (checked header/offset/magic/version, read back). NOT tested.
+Check on the phone: `sysctl kern.viva_link` style calls from the app, `sysctl kern.viva_nextbootargs` (read), then a
+root write and `fastboot`-free reboot to see the new kern.bootargs. If boot_b is not on the root's LUN: ENOENT.

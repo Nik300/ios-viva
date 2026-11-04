@@ -1,0 +1,555 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 059f136..0271605 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@ bsd/dev/viva_usb.c			standard
+ bsd/dev/viva_wifi.c			standard
+ bsd/dev/viva_wpa.c			standard
+ bsd/dev/viva_wlan.c			standard
++bsd/dev/viva_sysctl.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index fdafda4..427dae7 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -409,6 +409,138 @@ sweet_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len, uin
+ 	return error;
+ }
+ 
++/*
++ * KA2 (gpu/docs/RICHIESTE-KERNEL.md): the boot-args of the next boot = cmdline[608] at +0x48 of the SWEETXNU
++ * payload that tools/viva-mkboot.sh puts at the start of the ramdisk of boot_a / boot_b (header v2, ramdisk at
++ * page_size * (1 + ceil(kernel_size / page_size))). The one write outside the root partition this driver does:
++ * only to a GPT partition named exactly "boot_a" or "boot_b" on the root's LUN, only the one 4 KiB block that holds
++ * +0x48..+0x2a8 (read-modify-write, the rest of the block unchanged), after checking the Android header, the
++ * offset, the magic and the version; then the block is read back and compared. Boot-arg vivanobootargswrite=1
++ * refuses writes. Errors: EINVAL (string), ENOENT (partition, header, magic), EIO.
++ */
++#define PAYLOAD_CMDLINE         0x48
++#define PAYLOAD_CMDLINE_LEN     608
++
++int sweet_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len);
++
++/* WRITE(10) of the bounce buffer's first block to lba, which must lie inside [first, first + nblocks). */
++static int
++ufs_write_block_in(uint64_t first, uint64_t nblocks, uint64_t lba)
++{
++	if (nblocks == 0 || lba < first || lba - first >= nblocks || lba > UINT32_MAX) {
++		printf("SWEET UFS: refusing boot-args write at 0x%llx (partition 0x%llx + 0x%llx)\n", lba, first, nblocks);
++		return EPERM;
++	}
++	uint8_t cdb[10] = {
++		0x2a, 0,
++		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
++		0, 0, 1, 0
++	};
++	return ufs_scsi(cdb, sizeof(cdb), UFS_BLOCK, true);
++}
++
++int
++sweet_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len)
++{
++	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
++	static uint8_t blk[UFS_BLOCK];
++	uint64_t first = 0, nblocks = 0;
++	int error;
++
++	if (strcmp(part, "boot_a") != 0 && strcmp(part, "boot_b") != 0) {
++		return ENOENT;
++	}
++	if (!su.ready) {
++		return ENXIO;
++	}
++	if (write) {
++		uint32_t no = 0;
++		PE_parse_boot_argn("vivanobootargswrite", &no, sizeof(no));
++		size_t n = strnlen(cmdline, len);
++		if (no || n == len || n >= PAYLOAD_CMDLINE_LEN) {
++			return no ? EPERM : EINVAL;
++		}
++		for (size_t i = 0; i < n; i++) {
++			if (cmdline[i] < 0x20 || cmdline[i] > 0x7e) {
++				return EINVAL;
++			}
++		}
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_lookup_partition(part, &first, &nblocks);
++	if (error) {
++		error = ENOENT;
++		goto out;
++	}
++	/* Android boot header v2 */
++	if ((error = ufs_read_blocks(first, 1)) != 0) {
++		error = EIO;
++		goto out;
++	}
++	uint32_t ksize, rsize, page, version;
++	memcpy(&ksize, b + 8, 4);
++	memcpy(&rsize, b + 16, 4);
++	memcpy(&page, b + 36, 4);
++	memcpy(&version, b + 40, 4);
++	if (memcmp(b, "ANDROID!", 8) != 0 || version != 2 || (page != 2048 && page != 4096) ||
++	    rsize < PAYLOAD_CMDLINE + PAYLOAD_CMDLINE_LEN) {
++		printf("SWEET UFS: %s: not a v2 boot image with a payload (version %u, page %u, ramdisk %u)\n", part, version,
++		    page, rsize);
++		error = ENOENT;
++		goto out;
++	}
++	uint64_t roff = (uint64_t)page * (1 + (ksize + page - 1) / page);
++	uint64_t at = roff + PAYLOAD_CMDLINE, lba = first + at / UFS_BLOCK;
++	uint32_t in = (uint32_t)(at % UFS_BLOCK);
++	if (in + PAYLOAD_CMDLINE_LEN > UFS_BLOCK || roff / UFS_BLOCK != at / UFS_BLOCK ||
++	    lba - first >= nblocks) {
++		printf("SWEET UFS: %s: payload at 0x%llx spans blocks\n", part, roff);
++		error = ENOENT;
++		goto out;
++	}
++	if ((error = ufs_read_blocks(lba, 1)) != 0) {
++		error = EIO;
++		goto out;
++	}
++	uint32_t pver;
++	uint32_t pin = (uint32_t)(roff % UFS_BLOCK);
++	memcpy(&pver, b + pin + 8, 4);
++	if (memcmp(b + pin, "SWEETXNU", 8) != 0 || pver != 1) {
++		printf("SWEET UFS: %s: no SWEETXNU v1 payload in the ramdisk\n", part);
++		error = ENOENT;
++		goto out;
++	}
++	if (!write) {
++		size_t n = MIN(len - 1, (size_t)PAYLOAD_CMDLINE_LEN);
++		memcpy(cmdline, b + in, n);
++		cmdline[n] = 0;
++		cmdline[strnlen(cmdline, n)] = 0;
++		goto out;
++	}
++	memcpy(blk, b, UFS_BLOCK);
++	bzero(blk + in, PAYLOAD_CMDLINE_LEN);
++	memcpy(blk + in, cmdline, strlen(cmdline));
++	memcpy(b, blk, UFS_BLOCK);
++	error = ufs_write_block_in(first, nblocks, lba);
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	if (!error) {
++		error = ufs_read_blocks(lba, 1);
++	}
++	if (!error && memcmp(b, blk, UFS_BLOCK) != 0) {
++		error = EIO;
++	}
++	printf("SWEET UFS: %s: next boot-args %s (block 0x%llx): \"%s\"\n", part, error ? "NOT written" : "written", lba,
++	    cmdline);
++	if (error && error != EPERM) {
++		error = EIO;
++	}
++out:
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+diff --git a/bsd/dev/viva_sysctl.c b/bsd/dev/viva_sysctl.c
+new file mode 100644
+index 0000000..b102c54
+--- /dev/null
++++ b/bsd/dev/viva_sysctl.c
+@@ -0,0 +1,221 @@
++/*
++ * viva: sysctls for Viva Manager (gpu/app, requests KA1/KA2 in gpu/docs/RICHIESTE-KERNEL.md).
++ *
++ * kern.viva_link (KA1): the USB link's status commands from userspace. One call: newp = the command text (as after
++ *   "cmd" on the link), oldp = the reply (the same text the link gets, at most 8 KiB, cut with "...\n"). Everybody
++ *   may run the read-only ones: stat, gpu [status|freq|dvfs|lat|calls|clocks|kv], disp [kv], bat, cpu,
++ *   wifi [status|sta]. Root (the app's setuid helper) may also run the other gpu/disp/bat/cpu/wifi subcommands
++ *   ("gpu freq 800", "gpu dvfs off", "bat lpm on", ...). Never peek/poke/pmic/i2c, push/pull/run, panic, reboot.
++ *   "gpu kv" / "disp kv": stable key=value lines (VivaGPU.cpp, SweetFramebuffer.cpp).
++ * kern.viva_nextbootargs (KA2): the boot-args of the next boot, i.e. the cmdline in the SWEETXNU payload of the
++ *   active slot's boot partition (androidboot.slot_suffix, else boot_b): read by everybody, written by root
++ *   (bsd/dev/sweet_ufs.c sweet_ufs_bootargs: one 4 KiB block, checked, read back).
++ * kern.viva_nextbootargs_orig: what that partition held the first time either sysctl was used (for "restore").
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/errno.h>
++#include <sys/kauth.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++
++extern void viva_link_stat(char *out, size_t len);                          /* bsd/dev/viva_usb.c */
++extern void viva_battery_link(const char *args, char *out, size_t len);     /* iokit/Kernel/arm/VivaBattery.cpp */
++extern void viva_wifi_link(const char *args, char *out, size_t len);        /* bsd/dev/viva_wifi.c */
++extern void viva_gpu_link(const char *args, char *out, size_t len);         /* iokit/Kernel/arm/VivaGPU.cpp */
++extern void viva_cpufreq_link(const char *args, char *out, size_t len);     /* osfmk/arm64/viva_cpufreq.c */
++extern void viva_disp_link(const char *args, char *out, size_t len);        /* iokit/Kernel/arm/SweetFramebuffer.cpp */
++extern int sweet_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len); /* bsd/dev/sweet_ufs.c */
++
++#define VL_CMD_MAX      256
++#define VL_REPLY_MAX    8192
++#define BOOTARGS_MAX    608
++
++LCK_GRP_DECLARE(viva_sysctl_grp, "viva_sysctl");
++LCK_MTX_DECLARE(viva_sysctl_mtx, &viva_sysctl_grp);
++
++typedef void (*viva_link_fn)(const char *args, char *out, size_t len);
++
++static const struct {
++	const char   *word;
++	viva_link_fn  fn;
++	const char   *ro[8];        /* subcommands everybody may run ("" = the word alone) */
++} viva_link_cmds[] = {
++	{ "gpu", viva_gpu_link, { "", "status", "freq", "dvfs", "lat", "calls", "clocks", "kv" } },
++	{ "disp", viva_disp_link, { "", "kv" } },
++	{ "bat", viva_battery_link, { "" } },
++	{ "cpu", viva_cpufreq_link, { "" } },
++	{ "wifi", viva_wifi_link, { "", "status", "sta" } },
++};
++
++static int
++viva_link_run(const char *cmd, bool root, char *out, size_t len)
++{
++	const char *c = cmd, *rest;
++	while (*c == ' ') {
++		c++;
++	}
++	for (rest = c; *rest && *rest != ' '; rest++) {
++	}
++	size_t wl = (size_t)(rest - c);
++	while (*rest == ' ') {
++		rest++;
++	}
++	/* the arguments without trailing blanks, for the read-only match */
++	char args[VL_CMD_MAX];
++	strlcpy(args, rest, sizeof(args));
++	for (size_t n = strlen(args); n > 0 && (args[n - 1] == ' ' || args[n - 1] == '\n'); n--) {
++		args[n - 1] = 0;
++	}
++	if (wl == 4 && strncmp(c, "stat", 4) == 0) {
++		viva_link_stat(out, len);
++		return 0;
++	}
++	for (unsigned i = 0; i < sizeof(viva_link_cmds) / sizeof(viva_link_cmds[0]); i++) {
++		if (strlen(viva_link_cmds[i].word) != wl || strncmp(c, viva_link_cmds[i].word, wl) != 0) {
++			continue;
++		}
++		bool ro = false;
++		for (unsigned k = 0; k < 8 && viva_link_cmds[i].ro[k] != NULL; k++) {
++			ro |= strcmp(args, viva_link_cmds[i].ro[k]) == 0;
++		}
++		if (!ro && !root) {
++			snprintf(out, len, "%s %s: needs root\n", viva_link_cmds[i].word, args);
++			return EPERM;
++		}
++		viva_link_cmds[i].fn(args, out, len);
++		return 0;
++	}
++	snprintf(out, len, "usage: stat | gpu [status|freq|dvfs|lat|calls|clocks|kv] | disp [kv] | bat | cpu | "
++	    "wifi [status|sta] (root: their other subcommands)\n");
++	return *c ? ENOTSUP : 0;
++}
++
++static int
++sysctl_viva_link SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char cmd[VL_CMD_MAX];
++	int error = 0;
++
++	bzero(cmd, sizeof(cmd));
++	if (req->newptr != USER_ADDR_NULL) {
++		if (req->newlen >= sizeof(cmd)) {
++			return EINVAL;
++		}
++		error = SYSCTL_IN(req, cmd, req->newlen);
++		if (error) {
++			return error;
++		}
++		cmd[req->newlen] = 0;
++	}
++	char *out = kalloc_data(VL_REPLY_MAX, Z_WAITOK | Z_ZERO);
++	if (out == NULL) {
++		return ENOMEM;
++	}
++	bool root = kauth_cred_issuser(kauth_cred_get());
++	lck_mtx_lock(&viva_sysctl_mtx);
++	int run = viva_link_run(cmd, root, out, VL_REPLY_MAX);
++	lck_mtx_unlock(&viva_sysctl_mtx);
++	size_t n = strnlen(out, VL_REPLY_MAX);
++	if (n >= VL_REPLY_MAX - 1) {
++		strlcpy(out + VL_REPLY_MAX - 5, "...\n", 5);     /* cut */
++		n = VL_REPLY_MAX - 1;
++	}
++	error = SYSCTL_OUT(req, out, n + 1);
++	kfree_data(out, VL_REPLY_MAX);
++	return error ? error : run;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, viva_link, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, sysctl_viva_link, "-", "viva link commands (KA1)");
++
++/* ---- KA2 ---- */
++
++static char viva_bootargs_orig[BOOTARGS_MAX + 1];
++static bool viva_bootargs_have_orig;
++
++static const char *
++viva_boot_part(void)
++{
++	char slot[8];
++	bzero(slot, sizeof(slot));
++	if (PE_parse_boot_argn("androidboot.slot_suffix", slot, sizeof(slot)) && strcmp(slot, "_a") == 0) {
++		return "boot_a";
++	}
++	return "boot_b";
++}
++
++/* viva_sysctl_mtx held */
++static void
++viva_bootargs_remember(void)
++{
++	if (!viva_bootargs_have_orig &&
++	    sweet_ufs_bootargs(viva_boot_part(), false, viva_bootargs_orig, sizeof(viva_bootargs_orig)) == 0) {
++		viva_bootargs_have_orig = true;
++	}
++}
++
++static int
++sysctl_viva_nextbootargs SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char cur[BOOTARGS_MAX + 1], want[BOOTARGS_MAX + 1];
++	int error;
++
++	bzero(cur, sizeof(cur));
++	lck_mtx_lock(&viva_sysctl_mtx);
++	viva_bootargs_remember();
++	error = sweet_ufs_bootargs(viva_boot_part(), false, cur, sizeof(cur));
++	lck_mtx_unlock(&viva_sysctl_mtx);
++	if (error) {
++		return error;
++	}
++	error = SYSCTL_OUT(req, cur, strlen(cur) + 1);
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (!kauth_cred_issuser(kauth_cred_get())) {
++		return EPERM;
++	}
++	if (req->newlen >= sizeof(want)) {
++		return EINVAL;
++	}
++	bzero(want, sizeof(want));
++	error = SYSCTL_IN(req, want, req->newlen);
++	if (error) {
++		return error;
++	}
++	want[req->newlen] = 0;
++	size_t n = strlen(want);
++	while (n > 0 && (want[n - 1] == '\n' || want[n - 1] == ' ')) {
++		want[--n] = 0;
++	}
++	lck_mtx_lock(&viva_sysctl_mtx);
++	error = sweet_ufs_bootargs(viva_boot_part(), true, want, sizeof(want));
++	lck_mtx_unlock(&viva_sysctl_mtx);
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, viva_nextbootargs, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, sysctl_viva_nextbootargs, "A", "boot-args of the next boot (KA2)");
++
++static int
++sysctl_viva_nextbootargs_orig SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	lck_mtx_lock(&viva_sysctl_mtx);
++	viva_bootargs_remember();
++	bool have = viva_bootargs_have_orig;
++	lck_mtx_unlock(&viva_sysctl_mtx);
++	if (!have) {
++		return ENOENT;
++	}
++	return SYSCTL_OUT(req, viva_bootargs_orig, strlen(viva_bootargs_orig) + 1);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, viva_nextbootargs_orig, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_viva_nextbootargs_orig, "A", "boot-args of the next boot as first seen (KA2)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index 0714dca..17944bd 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -948,6 +948,31 @@ vl_vivad_out(uint8_t *out, uint32_t max)
+  *   reboot            watchdog software reset (back through preloader/LK)
+  * peek/poke have no guard: an address in a gated block can hang the bus.
+  */
++/* "stat" (also kern.viva_link, bsd/dev/viva_sysctl.c): uptime, link and log counters. */
++void viva_link_stat(char *out, size_t len);
++
++void
++viva_link_stat(char *out, size_t len)
++{
++	uint64_t ns;
++	size_t o = 0;
++	if (len == 0) {
++		return;
++	}
++	out[0] = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++#define ST(...) do { if (o < len) o += (size_t)snprintf(out + o, len - o, __VA_ARGS__); } while (0)
++	ST("uptime %llu ms, %s speed, address %u\n", ns / NSEC_PER_MSEC, vl.hs ? "high" : "full",
++	    vl.musb ? rd8(vl.musb, MUSB_FADDR) : 0);
++	ST("log: total %llu bytes, sent up to %llu (%llu bytes this link)\n", sweet_log_position(), vl.log_pos,
++	    vl.log_bytes);
++	ST("usb: %llu resets, %llu setups, %llu commands, %llu IN packets, %llu OUT packets\n", vl.resets, vl.setups,
++	    vl.cmds, vl.tx_pkts, vl.rx_pkts);
++	ST("vivad: %s (last opener pid %d), %llu output bytes dropped%s\n", vd_readers ? "waiting for commands" :
++	    "not reading", vd_pid, vd_out_dropped, vd_node ? "" : ", /dev/vivalink not created yet");
++#undef ST
++}
++
+ static void
+ vl_command(void)
+ {
+@@ -967,16 +992,9 @@ vl_command(void)
+ 	if (IS("ping")) {
+ 		vl_reply("pong\n");
+ 	} else if (IS("stat")) {
+-		uint64_t ns;
+-		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+-		vl_reply("uptime %llu ms, %s speed, address %u\n", ns / NSEC_PER_MSEC,
+-		    vl.hs ? "high" : "full", rd8(vl.musb, MUSB_FADDR));
+-		vl_reply("log: total %llu bytes, sent up to %llu (%llu bytes this link)\n",
+-		    sweet_log_position(), vl.log_pos, vl.log_bytes);
+-		vl_reply("usb: %llu resets, %llu setups, %llu commands, %llu IN packets, %llu OUT packets\n",
+-		    vl.resets, vl.setups, vl.cmds, vl.tx_pkts, vl.rx_pkts);
+-		vl_reply("vivad: %s (last opener pid %d), %llu output bytes dropped%s\n", vd_readers ? "waiting for commands" :
+-		    "not reading", vd_pid, vd_out_dropped, vd_node ? "" : ", /dev/vivalink not created yet");
++		static char stat_reply[1024];
++		viva_link_stat(stat_reply, sizeof(stat_reply));
++		vl_reply("%s", stat_reply);
+ 	} else if (IS("peek") && vl_arg(&rest, &a)) {
+ 		uint64_t words = 1;
+ 		(void)vl_arg(&rest, &words);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 59ba0bf..e7a31c1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1693,6 +1693,20 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
+ 		}
+ 		fDirty = true;
+ 		disp_say(&p, end, "double buffer off: copies go to LK's buffer on screen\n");
++	} else if (strncmp(args, "kv", 2) == 0) {
++		/* KA1 (gpu/docs/RICHIESTE-KERNEL.md): stable key=value lines for Viva Manager */
++		IOLockLock(fLock);
++		uint64_t r = absUsFB(fLatReady.n ? fLatReady.sum / fLatReady.n : 0);
++		uint64_t f = absUsFB(fLatFlip.n ? fLatFlip.sum / fLatFlip.n : 0);
++		uint64_t swaps = fLatSwap.n;
++		IOLockUnlock(fLock);
++		disp_say(&p, end, "width=%u\nheight=%u\nlogical_width=%u\nlogical_height=%u\nscanout=%d\nscanout_live=%d\n",
++		    fWidth, fHeight, fLogicalW, fLogicalH, fScanOn ? 1 : 0, fShown.buf < 0 ? 1 : 0);
++		disp_say(&p, end, "frames_scanned=%llu\nframes_copied=%llu\nswaps=%llu\ngpu_waits=%llu\nframes_forced=%llu\n"
++		    "copies=%llu\ncopy_avg_us=%llu\n", fScanFrames, fScanFallbacks, swaps, fGpuWaits, fGpuForced, fCopies,
++		    fCopies ? fCopyNs / fCopies / 1000 : 0);
++		disp_say(&p, end, "lat_swap_gpu_avg_us=%llu\nlat_chosen_screen_avg_us=%llu\nearly_shown=%llu\nflip=%d\n"
++		    "swapwait_busy=%llu\n", r, f, fEarlyShown, fFlipReady ? 1 : 0, fSwapWaitBusy);
+ 	} else {
+ 		disp_say(&p, end, "display %ux%u (shown as %ux%u), scanout %s%s, layer %s, %llu frames scanned out, "
+ 		    "%llu copied%s%s\n", fWidth, fHeight, fLogicalW, fLogicalH, fScanOn ? "on" : "off",
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index de65a74..c02d45c 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -2612,6 +2612,7 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status,
+ 	job->vm->running--;
+ 	if (fRunning[0] == NULL && fRunning[1] == NULL && fBusyStart != 0) {
+ 		fBusyNs += at > fBusyStart ? at - fBusyStart : 0;       /* absolute-time units */
++		fBusyTotal += at > fBusyStart ? at - fBusyStart : 0;
+ 		fBusyStart = 0;
+ 	}
+ 	if (error == kIOReturnSuccess && at > job->startAt) {
+@@ -3256,6 +3257,7 @@ VivaGPUAccelerator::dvfsSample(void)
+ 	uint64_t now = mach_absolute_time(), busy = fBusyNs, window = now - fWindowStart;
+ 	if (fBusyStart != 0) {
+ 		busy += now - fBusyStart;
++		fBusyTotal += now - fBusyStart;
+ 		fBusyStart = now;
+ 	}
+ 	fBusyNs = 0;
+@@ -4007,6 +4009,46 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
+ 			}
+ 		} else if (strncmp(args, "clocks", 6) == 0) {
+ 			clocksDump(o, end);
++		} else if (strncmp(args, "kv", 2) == 0) {
++			/* KA1 (gpu/docs/RICHIESTE-KERNEL.md): stable key=value lines for Viva Manager */
++			uint32_t cur = fPowered ? fClockOpp : fOpp, tvg, tvs;
++			oppSels(cur, &tvg, &tvs);
++			uint64_t busy = fBusyTotal, bns;
++			if (fBusyStart != 0) {
++				busy += mach_absolute_time() - fBusyStart;
++			}
++			absolutetime_to_nanoseconds(busy, &bns);
++			say(o, end, "powered=%d\nmode=%d\ngpu_id=0x%08x\nmhz=%u\nopp_min_mhz=%u\nopp_max_mhz=%u\ndvfs=%d\n",
++			    fPowered ? 1 : 0, fMode, fGpuId, gVivaOpp[cur].khz / 1000, gVivaOpp[fOpp].khz / 1000,
++			    gVivaOpp[MIN(fDvfsFast, fOpp)].khz / 1000, fDvfs ? 1 : 0);
++			say(o, end, "load_pct=%u\ndvfs_ups=%llu\ndvfs_downs=%llu\ndvfs_boosts=%llu\njobs=%llu\nrunning=%d\n"
++			    "queued=%d\n", fLoadPct, fDvfsUps, fDvfsDowns, fDvfsBoosts, fJobs,
++			    (fRunning[0] != NULL) + (fRunning[1] != NULL), (fQueue[0] != NULL) + (fQueue[1] != NULL));
++			say(o, end, "job_faults=%llu\nmmu_faults=%llu\ngpu_faults=%llu\ntimeouts=%llu\nresets=%llu\nheap_grows=%llu\n",
++			    fJobFaults, fMmuFaults, fGpuFaults, fTimeouts, fResets, fHeapGrows);
++			say(o, end, "mem_kib=%lld\nmem_peak_kib=%lld\nmem_limit_mib=%lld\nmem_proc_mib=%lld\nmem_refusals=%llu\n"
++			    "busy_ns=%llu\nvgpu_mv=%u\nvsram_mv=%u\n", fMemory >> 10, fMemPeak >> 10, fMemLimit >> 20,
++			    fProcLimit >> 20, fMemRefused, bns, UV(tvg) / 1000, UV(tvs) / 1000);
++			for (VivaGPUVM *v = fVMs; v != NULL; v = v->nextVM) {
++				bool seen = false;
++				for (VivaGPUVM *w = fVMs; w != v; w = w->nextVM) {
++					seen = seen || w->pid == v->pid;
++				}
++				if (seen) {
++					continue;
++				}
++				int64_t bytes = 0, imported = 0;
++				uint32_t bos = 0;
++				for (VivaGPUVM *w = v; w != NULL; w = w->nextVM) {
++					if (w->pid == v->pid) {
++						bytes += w->bytes;
++						imported += w->imported;
++						bos += w->bos;
++					}
++				}
++				say(o, end, "proc.%d.name=%s\nproc.%d.kib=%lld\nproc.%d.bos=%u\nproc.%d.imported_kib=%lld\n", v->pid,
++				    v->proc, v->pid, bytes >> 10, v->pid, bos, v->pid, imported >> 10);
++			}
+ 		} else if (strncmp(args, "fastkick", 8) == 0) {
+ 			if (strncmp(args, "fastkick on", 11) == 0) {
+ 				fFastKick = true;
+@@ -4133,7 +4175,11 @@ extern "C" void
+ viva_gpu_link(const char *args, char *out, size_t outLen)
+ {
+ 	if (gVivaGPU == NULL) {
+-		snprintf(out, outLen, "gpu: driver not running (boot-arg vivagpu=1 or 2)\n");
++		while (*args == ' ') {
++			args++;
++		}
++		snprintf(out, outLen, strncmp(args, "kv", 2) == 0 ? "powered=0\nmode=0\n" :
++		    "gpu: driver not running (boot-arg vivagpu=1 or 2)\n");
+ 		return;
+ 	}
+ 	gVivaGPU->linkCommand(args, out, outLen);
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+index a590fac..e2ff4e1 100644
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -413,6 +413,7 @@ private:
+ 	bool     fDvfs, fDvfsArmed;
+ 	uint32_t fDvfsFast, fLoadPct;
+ 	uint64_t fBusyStart, fBusyNs, fWindowStart, fDvfsUpMs, fDvfsUps, fDvfsDowns;
++	uint64_t fBusyTotal;            /* KA1 busy_ns: absolute time with a job running, since boot */
+ 	bool     fDvfsBoost;                /* 0137 vivagpuboost: fastest OPP while the display waits for frames */
+ 	uint32_t fDvfsSeenWaits;
+ 	uint64_t fDvfsBoosts;
