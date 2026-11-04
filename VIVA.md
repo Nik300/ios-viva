@@ -500,3 +500,10 @@ NOT tested):
   kept per client and published at state page +0x18/+0x1c (IOSurfaceIsInUse; CABackingStore reuse), released when the
   client goes away. `disp` shows SwapWait busy/blocking counts and the swaps the layer reads / will read.
   `tools/viva-mkboot.sh` default VIVA_EXTRA now "cpus=8 vivausb=3 vivagpu=2 vivascanout=1".
+
+0133 on the phone (2026-11-04): **WiFi firmware RUNNING.** `wifi wmt`: register read OK, STP mand -> full (DB 0E 68 01), set chip
+id 0x6781 OK, A-die 0x6631 (02 02 05 00 00 01 8b 31 66), RF calibration answered with status 0 + 0x22a bytes of calibration
+data; then `wifi fw`: WIFI_START OK, ready bits 0x6, MCU PC in the EMI RAM code (0xf031052a). WMT was the missing piece.
+
+Patch 0134 (NOT tested): `wifi cap` = CMD_ID_GET_NIC_CAPABILITY_V2 (0x8A) on TX ring 15 (first normal command), event 0xEC
+parsed (HW/SW version, efuse MAC, PHY caps, A-die version); calibration answer check relaxed.

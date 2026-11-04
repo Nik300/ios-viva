@@ -1,0 +1,176 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index d847f9e..8702d57 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -909,7 +909,7 @@ vl_vivad_out(uint8_t *out, uint32_t max)
+  *   i2c8 BUS DEV REG N     read N (max 64) bytes from 8-bit register REG of device DEV on I2C bus BUS
+  *   i2c8w BUS DEV REG B..  write bytes (max 7) to 8-bit register REG of device DEV on I2C bus BUS
+  *   bat [poll|lpm on|off]  battery (VivaBattery.cpp): gauge, charger registers, Low Power Mode
+- *   wifi [status|detect|on|wmt|fw|off]  CONNSYS (viva_wifi.c): state (read only), A-die detection, power on with RAM patches / off
++ *   wifi [status|detect|on|wmt|fw|cap|off]  CONNSYS (viva_wifi.c): state (read only), A-die detection, power on with RAM patches / off
+  *   gpu [ARGS]        Mali driver (VivaGPU.cpp): status, mfg, on, off, regs, freq, selftest [fault], probe, publish
+  *   push SIZE MODE FNV PATH  receive a file (raw OUT data follows; written to PATH.vivapush, renamed when
+  *                     its FNV-1a matches; missing directories are created)
+@@ -1097,7 +1097,7 @@ vl_command(void)
+ 			delay(5000);
+ 		}
+ 	} else if (IS("help")) {
+-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+ 	} else {
+ 		vl_reply("unknown command: %s (try help)\n", c);
+ 	}
+diff --git a/bsd/dev/viva_wifi.c b/bsd/dev/viva_wifi.c
+index 3f38533..a4c5463 100644
+--- a/bsd/dev/viva_wifi.c
++++ b/bsd/dev/viva_wifi.c
+@@ -34,6 +34,9 @@
+  *                  the EMI window at Addr & 0xFFFFFF, the others sent on TX ring 3 (INIT_CMD DOWNLOAD_CONFIG, 2 KiB
+  *                  PDA chunks, result event on RX ring 1), then WIFI_START (override, RAM entry) and the ready bits
+  *                  0x180C1140 & 0x6. gen4m sources: chips/common/fw_dl.c, cmm_asic_connac.c, hif_pdma.h.
++ *   wifi cap       step 4 (firmware ready): CMD_ID_GET_NIC_CAPABILITY_V2 (0x8A) on TX ring 15 (WIFI_CMD: 32-byte TXD +
++ *                  32-byte command header, wlan_lib.c wlanQueryNicCapabilityV2), event 0xEC on RX ring 1 (20-byte RXD +
++ *                  12-byte event header + {u16 count, rsv, TLVs (u32 tag, u32 len, body)}): HW/SW version, MAC, PHY caps.
+  *   wifi off       CONN CPU back in reset, MTCMOS off, rails and pinmux as before "wifi on".
+  *
+  * PMIC writes go through VivaPwrap::writeRegulator (VCN18/VCN33/VCN28 enable/mode bits, VCN33 = 3.3 V only).
+@@ -866,7 +869,8 @@ wifi_wmt(char *out, size_t len, size_t o)
+ 	static const uint8_t adieEv[] = { 0x02, 0x02, 0x05, 0x00, 0x00 };
+ 	(void)wmt_cmd("query a-die", adie, sizeof(adie), adieEv, sizeof(adieEv), 1000, ev, sizeof(ev), out, len, &o);
+ 	static const uint8_t cal[] = { 0x01, 0x14, 0x01, 0x00, 0x01 };
+-	static const uint8_t calEv[] = { 0x02, 0x14, 0x02, 0x00, 0x00, 0x01 };
++	/* MT6781: 02 14 <len 0x22a> 00 01 + calibration data (0130 on the phone) */
++	static const uint8_t calEv[] = { 0x02, 0x14 };
+ 	int c = wmt_cmd("rf calibration", cal, sizeof(cal), calEv, sizeof(calEv), 5000, ev, sizeof(ev), out, len, &o);
+ 	/* wmt_ic_soc.c: the efuse PALDO (VCN28) goes off after the calibration */
+ 	viva_pwrap_write_regulator(PMIC_VCN28_CON0, 0x1, 0x0);
+@@ -1177,6 +1181,119 @@ close:
+ 	return o;
+ }
+ 
++/* ---- step 4: normal commands (firmware running) ---- */
++
++/* WIFI_CMD (nic_cmd_event.h, asicFillCmdTxdInfo) on TX ring 15; the matching event (same seq) into ev. */
++static int
++wifi_cmd(uint8_t cid, bool set, const void *payload, uint32_t plen, uint8_t eid, uint8_t *ev, uint32_t evmax,
++    uint32_t ms, char *out, size_t len, size_t *po)
++{
++	size_t o = *po;
++	uint8_t pkt[64 + 512];
++	uint32_t total = 64 + plen;
++	if (plen > 512) {
++		return -1;
++	}
++	bzero(pkt, 64);
++	pkt[0] = (uint8_t)total;
++	pkt[1] = (uint8_t)(total >> 8);
++	pkt[2] = 0x00;                                  /* CMD_PQ_ID 0x8000 */
++	pkt[3] = 0x80;
++	pkt[5] = 0xa0;                                  /* header format */
++	pkt[7] = 2;                                     /* TXD_PKT_FT_CMD */
++	pkt[32] = (uint8_t)(total - 32);                /* u2Length */
++	pkt[33] = (uint8_t)((total - 32) >> 8);
++	pkt[36] = cid;
++	pkt[37] = 0xa0;                                 /* CMD_PACKET_TYPE_ID */
++	pkt[38] = set ? 1 : 0;
++	pkt[39] = ++wd.seq;
++	pkt[42] = 3;                                    /* S2D_INDEX_CMD_H2N_H2C */
++	memcpy(pkt + 64, payload, plen);
++	uint8_t seq = wd.seq;
++	int ret = -1;
++	if (!wfdma_tx(15, pkt, total)) {
++		say("cmd 0x%02x: TX ring 15 did not take it (cidx %u didx %u)\n", cid, rd(WF_TX_RING(15) + 8),
++		    rd(WF_TX_RING(15) + 12));
++		goto done;
++	}
++	for (int k = 0; k < 16; k++) {
++		uint32_t got = 0;
++		for (uint32_t t = 0; t < ms && got == 0; t += 10) {
++			if ((got = wfdma_rx(1, ev, evmax, 5000)) == 0) {
++				got = wfdma_rx(0, ev, evmax, 5000);
++			}
++		}
++		if (got == 0) {
++			say("cmd 0x%02x seq %u: no event in %u ms (rx1 didx %u)\n", cid, seq, ms, rd(WF_RX_RING(1) + 12));
++			goto done;
++		}
++		uint16_t ptype = (uint16_t)(ev[2] | ev[3] << 8);
++		uint8_t *e = ev + 20;
++		if ((ptype & 0xe00f) == 0xe000 && e[4] == eid) {
++			ret = (int)got;
++			goto done;
++		}
++		say("cmd 0x%02x: other packet (%u bytes, type 0x%04x, eid 0x%02x seq %u)\n", cid, got, ptype, e[4], e[5]);
++	}
++done:
++	*po = o;
++	return ret;
++}
++
++static size_t
++wifi_cap(char *out, size_t len, size_t o)
++{
++	if (!vw.on || (rd(WF_READY) & 0x6) != 0x6) {
++		say("cap: WiFi firmware not running (wifi on, wifi wmt, wifi fw)\n");
++		return o;
++	}
++	static uint8_t ev[2048];
++	int n = wifi_cmd(0x8a, false, NULL, 0, 0xec, ev, sizeof(ev), 3000, out, len, &o);
++	if (n < 36) {
++		say("cap: no NIC_CAPABILITY_V2 event\n");
++		return o;
++	}
++	uint8_t *b = ev + 20 + 12;
++	uint32_t count = b[0] | b[1] << 8, off = 4, end = (uint32_t)MIN(n, (int)sizeof(ev)) - 32;
++	say("cap: %u elements (%d bytes)\n", count, n);
++	for (uint32_t i = 0; i < count && off + 8 <= end; i++) {
++		uint32_t tag, blen;
++		memcpy(&tag, b + off, 4);
++		memcpy(&blen, b + off + 4, 4);
++		const uint8_t *d = b + off + 8;
++		if (off + 8 + blen > end) {
++			break;
++		}
++		switch (tag) {
++		case 0x5:
++			say("cap: hw: product 0x%04x eco %u, mac ip 0x%08x, bb ip 0x%08x, top ip 0x%08x, config %u\n",
++			    d[0] | d[1] << 8, d[2], d[4] | d[5] << 8 | d[6] << 16 | (uint32_t)d[7] << 24,
++			    d[8] | d[9] << 8 | d[10] << 16 | (uint32_t)d[11] << 24,
++			    d[12] | d[13] << 8 | d[14] << 16 | (uint32_t)d[15] << 24, d[16]);
++			break;
++		case 0x6:
++			say("cap: fw: version %u.%u build %u, branch %.4s, date %.16s\n", d[1], d[0], d[2] | d[3] << 8,
++			    (const char *)d + 4, (const char *)d + 8);
++			break;
++		case 0x7:
++			say("cap: MAC %02x:%02x:%02x:%02x:%02x:%02x (efuse)\n", d[0], d[1], d[2], d[3], d[4], d[5]);
++			break;
++		case 0x8:
++			say("cap: phy: HT %u VHT %u 5 GHz %u max bandwidth %u (0=20 1=40 2=80), nss %u, LDPC %u\n", d[0], d[1],
++			    d[2], d[3], blen > 4 ? d[4] : 0, blen > 5 ? d[5] : 0);
++			break;
++		case 0x14:
++			say("cap: a-die version: chip 0x%04x eco %u\n", d[0] | d[1] << 8, d[2]);
++			break;
++		default:
++			say("cap: tag 0x%02x, %u bytes\n", tag, blen);
++			break;
++		}
++		off += 8 + blen;
++	}
++	return o;
++}
++
+ void
+ viva_wifi_link(const char *args, char *out, size_t len)
+ {
+@@ -1196,6 +1313,9 @@ viva_wifi_link(const char *args, char *out, size_t len)
+ 		printf("VIVA WIFI: WMT over STP/BTIF\n");
+ 		o = wifi_wmt(out, len, o);
+ 		printf("%s", out);
++	} else if (strncmp(args, "cap", 3) == 0) {
++		o = wifi_cap(out, len, o);
++		printf("%s", out);
+ 	} else if (strncmp(args, "fw", 2) == 0) {
+ 		printf("VIVA WIFI: firmware download\n");
+ 		o = wifi_fw(out, len, o);
