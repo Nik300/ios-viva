@@ -1,0 +1,266 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 37377d1..74801b5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -110,6 +110,7 @@ enum {
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_QUEUE                  4       /* swaps waiting for the GPU (K0c) */
++#define SWEET_FB_LK_BUFFERS             3       /* panel buffers LK reserves (K0d uses one besides its own) */
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+@@ -212,7 +213,7 @@ public:
+ 	Target        fShown, fNext;
+ 	bool          fNextValid;
+ 	/* K0d double buffer and frame end (see the top) */
+-	uintptr_t     fBufKVA[2];     /* 0 = LK's buffer (fPixels), 1 = the next one in LK's memory */
++	uintptr_t     fBufKVA[2];     /* 0 = LK's buffer (fPixels), 1 = another one in LK's memory (flipSetup) */
+ 	uint64_t      fBufPA[2];
+ 	IOMemoryMap  *fBuf1Map;
+ 	bool          fFlipAllowed;   /* sweetfb_flip */
+@@ -1223,32 +1224,51 @@ AppleCLCD::layerReads(uint64_t lo, uint64_t hi)
+ }
+ 
+ /*
+- * fScanLock. Double buffering: LK's layer must read LK's buffer (fPhys), LK's next buffer must be read by no other
+- * layer, and the OVL must report frame ends. Otherwise fFlipWhy says why and everything stays as before.
++ * fScanLock. Double buffering: LK's layer must read LK's buffer (fPhys), one of LK's other buffers must be read by no
++ * other layer, and the OVL must report frame ends. Otherwise fFlipWhy says why and everything stays as before.
++ * LK reserves SWEET_FB_LK_BUFFERS panel buffers back to back (live DT mblock-18-framebuffer: 0x7bc10000, 0x1df0000
++ * bytes = 3 x 1088 x 2400 x 4). 0128: some boots LK leaves OVL0 L1 enabled on its second buffer (seen after a panic
++ * reboot: L1 1080x2400 pitch 4320 at 0x7c606000); the double buffer was then off and every copy went to the buffer on
++ * screen (tearing bands while scrolling). The third buffer is used instead.
+  */
+ bool
+ AppleCLCD::flipSetup(char **out, char *end)
+ {
+ 	fFlipReady = false;
+ 	dropNext();
+-	uint64_t size = (uint64_t)fRowBytes * fHeight, pa1 = fPhys + size;
++	uint64_t size = (uint64_t)fRowBytes * fHeight, pa1 = 0;
+ 	const char *why = NULL;
+ 	if (fScanOvl < 0 && !findLKLayer(out, end)) {
+ 		why = "LK's layer not found";
+ 	} else if (fLkAddr != fPhys) {
+ 		why = "LK's layer does not read the boot framebuffer";
+-	} else if (pa1 + size > (1ull << 32)) {
+-		why = "LK's next buffer above 4 GiB";
+-	} else if (layerReads(pa1, pa1 + size)) {
+-		why = "another OVL layer reads LK's next buffer";
+ 	} else {
++		why = "another OVL layer reads each of LK's other buffers";
++		for (uint32_t k = 1; k < SWEET_FB_LK_BUFFERS; k++) {
++			uint64_t pa = fPhys + size * k;
++			if (pa + size > (1ull << 32)) {
++				why = "LK's other buffers above 4 GiB";
++				break;
++			}
++			if (!layerReads(pa, pa + size)) {
++				pa1 = pa;
++				why = NULL;
++				break;
++			}
++		}
++	}
++	if (why == NULL) {
++		if (fBuf1Map != NULL && fBufPA[1] != pa1) {
++			fBuf1Map->release();    /* "disp flip on" after LK's layers changed: another buffer now */
++			fBuf1Map = NULL;
++		}
+ 		if (fBuf1Map == NULL) {
+ 			IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa1, size, kIODirectionInOut);
+ 			fBuf1Map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
+ 			OSSafeReleaseNULL(md);
+ 		}
+ 		if (fBuf1Map == NULL) {
+-			why = "LK's next buffer not mappable";
++			why = "LK's other buffer not mappable";
+ 		} else {
+ 			fBufKVA[1] = (uintptr_t)fBuf1Map->getVirtualAddress();
+ 			fBufPA[1] = pa1;
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index 83821a3..0b115fc 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -420,6 +420,8 @@ VivaGPUFence::create(bool isSignalled)
+ 		f->k0jEpoch = 0;
+ 		f->k0jVM = NULL;
+ 		f->k0jDep = false;
++		f->k0jWalk = 0;
++		f->k0jCollect = 0;
+ 	}
+ 	return f;
+ }
+@@ -1035,6 +1037,9 @@ VivaGPUAccelerator::free(void)
+ 		fCallLock = NULL;
+ 	}
+ 	OSSafeReleaseNULL(fPromises);
++	if (fK0jStack != NULL) {
++		IODelete(fK0jStack, K0jFrame, kVivaK0jDepth);
++	}
+ 	if (fProbeLock != NULL) {
+ 		IOLockFree(fProbeLock);
+ 	}
+@@ -3125,8 +3130,9 @@ VivaGPUAccelerator::callStats(char **out, char *end)
+ 	    "waiters now\n", any ? "" : " none yet", fSleeps, fSleepsSpurious, fWakeFence, fWakeGeneric, fGenericWaiters);
+ 	say(out, end, "surface promises (K0i): %llu made, %u pending, %llu timed out; K0j: %llu waits past an own "
+ 	    "promise, %llu jobs started ahead of another connection's, %llu queued jobs dropped at close, dependency walk "
+-	    "%llu nodes + %llu cached\n", fPromisesMade, fPromises != NULL ? fPromises->getCount() : 0, fPromisesTimedOut,
+-	    fPromiseBypass, fQueueBypass, fJobsDiscarded, fK0jVisits, fK0jCached);
++	    "%llu nodes + %llu cached in %llu walks (%llu cut short)\n", fPromisesMade,
++	    fPromises != NULL ? fPromises->getCount() : 0, fPromisesTimedOut, fPromiseBypass, fQueueBypass, fJobsDiscarded,
++	    fK0jVisits, fK0jCached, fK0jWalk, fK0jCut);
+ }
+ 
+ /*
+@@ -3473,7 +3479,13 @@ VivaGPUAccelerator::vmHasPromise(VivaGPUVM *vm)
+ 	return false;
+ }
+ 
+-/* Gated: does unsignalled `f` wait, through job dependencies and resolved promises, for a pending promise of vm? */
++/*
++ * Gated: does unsignalled `f` wait, through job dependencies and resolved promises, for a pending promise of vm?
++ * 0128: depth-first with an explicit stack. The recursive version went one 64-byte kernel frame per fence, and with
++ * the asynchronous replay the chains of unfinished jobs passed 250 fences: "Invalid kernel stack pointer (probable
++ * overflow)" with dependsOnPromiseOf all down the backtrace. Each node is entered once per walk (a DAG with shared
++ * dependencies used to be walked once per path; a cycle, until the budget ran out). The budget counts distinct nodes.
++ */
+ bool
+ VivaGPUAccelerator::dependsOnPromiseOf(VivaGPUFence *f, VivaGPUVM *vm, uint32_t *budget)
+ {
+@@ -3488,18 +3500,79 @@ VivaGPUAccelerator::dependsOnPromiseOf(VivaGPUFence *f, VivaGPUVM *vm, uint32_t
+ 		return f->k0jDep;       /* nothing about promises changed since it was worked out */
+ 	}
+ 	if (*budget == 0) {
++		fK0jCut++;
+ 		return false;           /* too deep to tell: wait as before (the promise timeout is the backstop) */
+ 	}
++	if (fK0jStack == NULL && (fK0jStack = IONew(K0jFrame, kVivaK0jDepth)) == NULL) {
++		return false;
++	}
++	uint64_t walk = ++fK0jWalk;
++	uint32_t sp = 0;
++	bool dep = false, cut = false;
+ 	(*budget)--;
+ 	fK0jVisits++;
+-	bool dep = false;
+-	for (unsigned int i = 0; !dep && f->deps != NULL && i < f->deps->getCount(); i++) {
+-		dep = dependsOnPromiseOf((VivaGPUFence *)f->deps->getObject(i), vm, budget);
+-	}
+-	if (dep || *budget != 0) {      /* a "no" cut short by the budget is not cached */
+-		f->k0jEpoch = fK0jEpoch;
+-		f->k0jVM = vm;
+-		f->k0jDep = dep;
++	f->k0jWalk = walk;
++	fK0jStack[0].f = f;
++	fK0jStack[0].next = 0;
++	fK0jStack[0].cond = false;
++	sp = 1;
++	while (sp != 0) {
++		K0jFrame *top = &fK0jStack[sp - 1];
++		VivaGPUFence *n = top->f;
++		if (n->deps == NULL || top->next >= n->deps->getCount()) {
++			/* all of n's dependencies said no */
++			if (!top->cond) {
++				n->k0jEpoch = fK0jEpoch;
++				n->k0jVM = vm;
++				n->k0jDep = false;
++			}
++			sp--;
++			if (top->cond && sp != 0) {
++				fK0jStack[sp - 1].cond = true;
++			}
++			continue;
++		}
++		VivaGPUFence *d = (VivaGPUFence *)n->deps->getObject(top->next++);
++		if (d == NULL || d->signalled) {
++			continue;
++		}
++		if (d->promise && d->owner == vm) {
++			dep = true;
++			break;
++		}
++		if (d->k0jEpoch == fK0jEpoch && d->k0jVM == vm) {
++			fK0jCached++;
++			if (d->k0jDep) {
++				dep = true;
++				break;
++			}
++			continue;
++		}
++		if (d->k0jWalk == walk) {
++			top->cond = true;       /* on the path (a cycle) or already seen without a final answer */
++			continue;
++		}
++		if (*budget == 0 || sp == kVivaK0jDepth) {
++			top->cond = true;
++			cut = true;
++			continue;
++		}
++		(*budget)--;
++		fK0jVisits++;
++		d->k0jWalk = walk;
++		fK0jStack[sp].f = d;
++		fK0jStack[sp].next = 0;
++		fK0jStack[sp].cond = false;
++		sp++;
++	}
++	if (dep) {
++		for (uint32_t i = 0; i < sp; i++) {     /* the path to the promise: all of it depends on it */
++			fK0jStack[i].f->k0jEpoch = fK0jEpoch;
++			fK0jStack[i].f->k0jVM = vm;
++			fK0jStack[i].f->k0jDep = true;
++		}
++	} else if (cut) {
++		fK0jCut++;
+ 	}
+ 	return dep;
+ }
+@@ -3515,6 +3588,12 @@ VivaGPUAccelerator::collectWait(VivaGPUFence *f, VivaGPUVM *vm, OSArray *out, ui
+ 	if (f == NULL || f->signalled || (f->promise && f->owner == vm)) {
+ 		return;
+ 	}
++	if (depth == 0) {
++		fK0jCollect++;
++	} else if (f->k0jCollect == fK0jCollect) {
++		return;                 /* 0128: reached already through another dependency (a diamond, not a new path) */
++	}
++	f->k0jCollect = fK0jCollect;
+ 	uint32_t budget = 512;
+ 	if (depth >= 16 || !dependsOnPromiseOf(f, vm, &budget)) {
+ 		if (out->getNextIndexOfObject(f, 0) == (unsigned int)-1) {
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+index 316800e..604951e 100644
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -47,6 +47,7 @@ class VivaPwrap;
+  * uses it runs, and dropping those dirty lines loses its writes (stale job descriptors: GPU faults, missing tiles).
+  */
+ enum { kVivaCacheClean, kVivaCacheFlush };
++enum { kVivaK0jDepth = 512 };          /* dependsOnPromiseOf stack frames (= its largest budget) */
+ /*
+  * Userspace's CLOCK_MONOTONIC in ns, the clock of every absolute timeout of the UAPI (Mesa: os_time_get_nano). On
+  * Darwin it is NOT mach_continuous_time: Libc computes it as gettimeofday - kern.boottime, so it follows the calendar
+@@ -88,6 +89,8 @@ public:
+ 	uint64_t   k0jEpoch;
+ 	VivaGPUVM *k0jVM;
+ 	bool       k0jDep;
++	uint64_t   k0jWalk;     /* last dependsOnPromiseOf walk that reached it (0128: each node once per walk) */
++	uint64_t   k0jCollect;  /* last collectWait that reached it */
+ };
+ 
+ /* A GPU address space: AArch64 4K page tables plus the VA allocator for [VGPU_VA_START, VGPU_VA_END). */
+@@ -454,6 +457,12 @@ private:
+ 	uint32_t fArmWait;
+ 	uint64_t fK0jEpoch;                 /* bumped when a promise is made, resolved or signalled, or a job dropped */
+ 	uint64_t fK0jVisits, fK0jCached;    /* graph nodes walked / answered from the cache */                  /* nextStartable(forArm): the slots the armed job waits for */
++	uint64_t fK0jWalk, fK0jCut, fK0jCollect;       /* 0128: walks / cut short by the budget; collectWait */
++	struct K0jFrame {
++		VivaGPUFence *f;
++		uint32_t      next;     /* next index in f->deps */
++		bool          cond;     /* its "no" leaned on a node still on the path or cut short: not cached */
++	} *fK0jStack;                       /* 0128: dependsOnPromiseOf's explicit stack (was recursion: stack overflow) */
+ 	void promiseTimeouts(void);
+ 	uint32_t fGenericWaiters;
+ 	uint64_t fWakeFence, fWakeGeneric, fSleeps, fSleepsSpurious;

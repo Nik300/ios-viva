@@ -456,3 +456,17 @@ to EMI +0x2F0000/+0x386000, regions 0-2 (encrypted, 0x77000/0x02013400/0x4010000
 0x8000000F) + 2 KiB PDA packets on TX ring 3 (32-byte TXD + 32-byte INIT header), result events on RX ring 1 (20-byte RXD),
 then WIFI_START (override, 0x77000) and the ready bits 0x180C1140 & 0x6. If the firmware does not come up: WMT over
 STP/BTIF (set chip id, RF calibration) is the next suspect.
+
+Patch 0128 (2026-11-04, from the GPU side, NOT tested on the phone yet):
+- **Panic fix** (photo of the panic: "Invalid kernel stack pointer (probable overflow)", the same lr all down the
+  backtrace, frames 0x40 apart = `dependsOnPromiseOf`, whose frame is 0x40): 0122/0126 walked the K0j dependency graph
+  recursively with a budget of 512 nodes = up to 512 nested calls (32 KiB) on a 16 KiB kernel stack, and with the
+  asynchronous replay the chains of unfinished jobs passed ~250. Now depth-first with an explicit heap stack (512
+  frames, allocated once), each node entered once per walk (stamp `k0jWalk`: cycles and shared dependencies no
+  longer re-walked), answers cached as before ("no" only when not leaning on a node still on the path or a cut).
+  collectWait skips nodes already reached in the same call. Host test: 180k random graph queries (cycles, diamonds,
+  epoch changes) = plain reachability, a 100k-fence chain without crash. `gpu calls`: "... in N walks (M cut short)".
+- **K0d double buffer off on some boots**: `disp` said "another OVL layer reads LK's next buffer": LK had left OVL0 L1
+  enabled on 0x7c606000 (1080x2400, pitch 4320), so every copy went to the buffer on screen (tearing bands while
+  scrolling). LK reserves 3 buffers (mblock-18-framebuffer 0x7bc10000 + 0x1df0000): flipSetup now takes the first of
+  buffers 1-2 that no layer reads (0x7cffc000 that boot).
