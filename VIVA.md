@@ -442,3 +442,17 @@ Patches 0124-0126 (2026-11-04, CI run 41750485668, image `out/xnu-ufs-rw-0126.im
   GPU gate, plus an OSArray per BO and a scan of every promise not yet pruned. Now: answers cached per fence until a
   promise is made/resolved/signalled or a job is dropped (epoch), the common "no promise involved" case allocates
   nothing, fPromises holds pending promises only. `gpu calls` shows "dependency walk N nodes + M cached".
+
+0126 on the phone (2026-11-04): `wifi on` WORKS: EMI window PA 0xe7000000 (16 MiB aligned), the three MT6631 RAM patches
+loaded, rails on (VCN33 now 3.3 V), **MCU idle loop after ~78 ms** (com_reg0 0x1d1e, PC moving: 0x2966 -> 0x21f66),
+host csr hclk/osc on; `wifi off` clean. (viva-link.py segfaulted at exit after the reply: libusb torn down under the
+daemon pump thread; fixed with os._exit.)
+
+Patch 0127 (2026-11-04, CI run 41752917837, image `out/xnu-ufs-rw-0127.img`, NOT tested on the phone yet): **WiFi step 3**,
+`wifi fw` (after `wifi on`): gen4m wlanDownloadFW without WMT. Driver own (LPCTL BIT1, wait BIT0 = 0), WFDMA rings
+TX 0/1/3/15 and RX 0/1 (16 entries, contiguous memory below 4 GiB, VivaWiFi.cpp), GLO_CFG as asicPdmaConfig + the TX ring 3
+DMASHDL bypass; `/usr/share/firmware/wifi/viva/WIFI_RAM_CODE_soc2_2_2_1.bin` (CONNAC tailer): regions 3/4 (DL_TO_EMI) copied
+to EMI +0x2F0000/+0x386000, regions 0-2 (encrypted, 0x77000/0x02013400/0x40100000) as INIT_CMD DOWNLOAD_CONFIG (mode
+0x8000000F) + 2 KiB PDA packets on TX ring 3 (32-byte TXD + 32-byte INIT header), result events on RX ring 1 (20-byte RXD),
+then WIFI_START (override, 0x77000) and the ready bits 0x180C1140 & 0x6. If the firmware does not come up: WMT over
+STP/BTIF (set chip id, RF calibration) is the next suspect.
