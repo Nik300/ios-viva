@@ -1,0 +1,198 @@
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index bf25f58..83821a3 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -417,6 +417,9 @@ VivaGPUFence::create(bool isSignalled)
+ 		f->deadline = 0;
+ 		f->followers = NULL;
+ 		f->deps = NULL;
++		f->k0jEpoch = 0;
++		f->k0jVM = NULL;
++		f->k0jDep = false;
+ 	}
+ 	return f;
+ }
+@@ -3121,8 +3124,9 @@ VivaGPUAccelerator::callStats(char **out, char *end)
+ 	say(out, end, "%s\nwaits: %llu sleeps (%llu woke with nothing done), %llu fence wakeups, %llu generic wakeups, %u generic "
+ 	    "waiters now\n", any ? "" : " none yet", fSleeps, fSleepsSpurious, fWakeFence, fWakeGeneric, fGenericWaiters);
+ 	say(out, end, "surface promises (K0i): %llu made, %u pending, %llu timed out; K0j: %llu waits past an own "
+-	    "promise, %llu jobs started ahead of another connection's, %llu queued jobs dropped at close\n", fPromisesMade,
+-	    fPromises != NULL ? fPromises->getCount() : 0, fPromisesTimedOut, fPromiseBypass, fQueueBypass, fJobsDiscarded);
++	    "promise, %llu jobs started ahead of another connection's, %llu queued jobs dropped at close, dependency walk "
++	    "%llu nodes + %llu cached\n", fPromisesMade, fPromises != NULL ? fPromises->getCount() : 0, fPromisesTimedOut,
++	    fPromiseBypass, fQueueBypass, fJobsDiscarded, fK0jVisits, fK0jCached);
+ }
+ 
+ /*
+@@ -3342,6 +3346,13 @@ VivaGPUAccelerator::signalFence(VivaGPUFence *fence, IOReturn error, uint64_t at
+ 	fence->error = error;
+ 	fence->signalAt = at;
+ 	OSSafeReleaseNULL(fence->deps);         /* K0j: only unsignalled fences keep what they waited for */
++	if (fence->promise) {
++		fK0jEpoch++;
++		unsigned int idx = fPromises != NULL ? fPromises->getNextIndexOfObject(fence, 0) : (unsigned int)-1;
++		if (idx != (unsigned int)-1) {
++			fPromises->removeObject(idx);   /* fPromises = pending promises only (vmHasPromise stays short) */
++		}
++	}
+ 	fenceWake(fence);
+ 	OSArray *followers = fence->followers;
+ 	fence->followers = NULL;
+@@ -3377,6 +3388,7 @@ VivaGPUAccelerator::resolvePromise(VivaGPUFence *p, VivaGPUFence *to)
+ 	}
+ 	OSSafeReleaseNULL(p->deps);
+ 	p->deps = OSArray::withObjects((const OSObject **)&to, 1);     /* K0j: it now waits for `to` */
++	fK0jEpoch++;
+ }
+ 
+ VivaGPUFence *
+@@ -3389,6 +3401,7 @@ VivaGPUAccelerator::makePromise(VivaGPUVM *vm, uint32_t timeoutMs, SweetSurface
+ 	}
+ 	p->promise = true;
+ 	p->owner = vm;
++	fK0jEpoch++;
+ 	clock_interval_to_deadline(timeoutMs, kMillisecondScale, &p->deadline);
+ 	for (uint32_t i = 0; i < count; i++) {
+ 		SweetSurface *s = surfaces[i];
+@@ -3424,19 +3437,22 @@ VivaGPUAccelerator::promiseTimeouts(void)
+ 	bool kicked = false;
+ 	for (unsigned int i = 0; fPromises != NULL && i < fPromises->getCount();) {
+ 		VivaGPUFence *p = (VivaGPUFence *)fPromises->getObject(i);
+-		if (!p->signalled && now >= p->deadline) {
++		if (p->signalled) {
++			fPromises->removeObject(i);
++			continue;
++		}
++		if (now >= p->deadline) {
+ 			fPromisesTimedOut++;
+ 			if (fPromisesTimedOut <= 8) {
+ 				IOLog("VIVA GPU: surface promise not resolved in time, signalled (readers may see it unfinished)\n");
+ 			}
+-			signalFence(p, kIOReturnTimeout, now);
++			p->retain();
++			signalFence(p, kIOReturnTimeout, now);  /* takes it out of fPromises */
++			p->release();
+ 			kicked = true;
++			continue;
+ 		}
+-		if (p->signalled) {
+-			fPromises->removeObject(i);
+-		} else {
+-			i++;
+-		}
++		i++;
+ 	}
+ 	if (kicked) {
+ 		kick();                 /* K0j: the jobs that waited for them start now (they used to stay queued) */
+@@ -3467,16 +3483,25 @@ VivaGPUAccelerator::dependsOnPromiseOf(VivaGPUFence *f, VivaGPUVM *vm, uint32_t
+ 	if (f->promise && f->owner == vm) {
+ 		return true;
+ 	}
++	if (f->k0jEpoch == fK0jEpoch && f->k0jVM == vm) {
++		fK0jCached++;
++		return f->k0jDep;       /* nothing about promises changed since it was worked out */
++	}
+ 	if (*budget == 0) {
+ 		return false;           /* too deep to tell: wait as before (the promise timeout is the backstop) */
+ 	}
+ 	(*budget)--;
+-	for (unsigned int i = 0; f->deps != NULL && i < f->deps->getCount(); i++) {
+-		if (dependsOnPromiseOf((VivaGPUFence *)f->deps->getObject(i), vm, budget)) {
+-			return true;
+-		}
++	fK0jVisits++;
++	bool dep = false;
++	for (unsigned int i = 0; !dep && f->deps != NULL && i < f->deps->getCount(); i++) {
++		dep = dependsOnPromiseOf((VivaGPUFence *)f->deps->getObject(i), vm, budget);
+ 	}
+-	return false;
++	if (dep || *budget != 0) {      /* a "no" cut short by the budget is not cached */
++		f->k0jEpoch = fK0jEpoch;
++		f->k0jVM = vm;
++		f->k0jDep = dep;
++	}
++	return dep;
+ }
+ 
+ /*
+@@ -3490,7 +3515,7 @@ VivaGPUAccelerator::collectWait(VivaGPUFence *f, VivaGPUVM *vm, OSArray *out, ui
+ 	if (f == NULL || f->signalled || (f->promise && f->owner == vm)) {
+ 		return;
+ 	}
+-	uint32_t budget = 128;
++	uint32_t budget = 512;
+ 	if (depth >= 16 || !dependsOnPromiseOf(f, vm, &budget)) {
+ 		if (out->getNextIndexOfObject(f, 0) == (unsigned int)-1) {
+ 			out->setObject(f);
+@@ -3509,9 +3534,10 @@ VivaGPUAccelerator::addImplicitDepFor(OSArray *deps, VivaGPUFence *f, VivaGPUFen
+ 	if (f == NULL || f->signalled) {
+ 		return;
+ 	}
+-	OSArray *list = vmHasPromise(vm) ? OSArray::withCapacity(4) : NULL;
++	uint32_t budget = 512;
++	OSArray *list = (vmHasPromise(vm) && dependsOnPromiseOf(f, vm, &budget)) ? OSArray::withCapacity(4) : NULL;
+ 	if (list == NULL) {
+-		addImplicitDep(deps, f, self);
++		addImplicitDep(deps, f, self);  /* the common case: nothing to look past, no allocation */
+ 		return;
+ 	}
+ 	collectWait(f, vm, list, 0);
+@@ -3528,7 +3554,23 @@ VivaGPUAccelerator::boWaitFence(VivaGPUBO *bo)
+ 	if (first == NULL) {
+ 		return NULL;
+ 	}
+-	OSArray *list = vmHasPromise(bo->vm) ? OSArray::withCapacity(4) : NULL;
++	if (!vmHasPromise(bo->vm)) {
++		first->retain();
++		return first;
++	}
++	VivaGPUFence *sf0 = NULL;
++	if (bo->kind == kVivaBOSurface && bo->surface != NULL) {
++		sf0 = OSDynamicCast(VivaGPUFence, bo->surface->gpuFence);
++		if (sf0 != NULL && sf0->promise && !sf0->signalled && sf0->owner == bo->vm) {
++			sf0 = OSDynamicCast(VivaGPUFence, bo->surface->gpuPrev);
++		}
++	}
++	uint32_t budget = 512;
++	if (!dependsOnPromiseOf(bo->busy, bo->vm, &budget) && !dependsOnPromiseOf(sf0, bo->vm, &budget)) {
++		first->retain();        /* nothing to look past: as before */
++		return first;
++	}
++	OSArray *list = OSArray::withCapacity(4);
+ 	if (list == NULL) {
+ 		first->retain();
+ 		return first;
+@@ -3570,6 +3612,7 @@ VivaGPUAccelerator::discardJob(VivaGPUJob *job, IOReturn error)
+ 		vm->jobTail = job->vmPrev;
+ 	}
+ 	vm->seqUpdate();
++	fK0jEpoch++;
+ 	signalFence(job->fence, error, mach_absolute_time());
+ 	OSSafeReleaseNULL(job->deps);
+ 	OSSafeReleaseNULL(job->bos);
+diff --git a/iokit/Kernel/arm/VivaGPU.h b/iokit/Kernel/arm/VivaGPU.h
+index 1471afa..316800e 100644
+--- a/iokit/Kernel/arm/VivaGPU.h
++++ b/iokit/Kernel/arm/VivaGPU.h
+@@ -84,6 +84,10 @@ public:
+ 	OSArray   *followers;   /* promises linked to this fence: signalled with it */
+ 	/* K0j: what it waits for while unsignalled (its job's dependencies; a resolved promise: the fence it follows) */
+ 	OSArray   *deps;
++	/* K0j cache: "depends on a pending promise of k0jVM", valid while k0jEpoch == the accelerator's fK0jEpoch */
++	uint64_t   k0jEpoch;
++	VivaGPUVM *k0jVM;
++	bool       k0jDep;
+ };
+ 
+ /* A GPU address space: AArch64 4K page tables plus the VA allocator for [VGPU_VA_START, VGPU_VA_END). */
+@@ -447,7 +451,9 @@ private:
+ 	OSArray *fPromises;                 /* K0i: pending promises (their timeout, in jobTimer) */
+ 	uint64_t fPromisesMade, fPromisesTimedOut;
+ 	uint64_t fPromiseBypass, fQueueBypass, fJobsDiscarded;      /* K0j */
+-	uint32_t fArmWait;                  /* nextStartable(forArm): the slots the armed job waits for */
++	uint32_t fArmWait;
++	uint64_t fK0jEpoch;                 /* bumped when a promise is made, resolved or signalled, or a job dropped */
++	uint64_t fK0jVisits, fK0jCached;    /* graph nodes walked / answered from the cache */                  /* nextStartable(forArm): the slots the armed job waits for */
+ 	void promiseTimeouts(void);
+ 	uint32_t fGenericWaiters;
+ 	uint64_t fWakeFence, fWakeGeneric, fSleeps, fSleepsSpurious;
