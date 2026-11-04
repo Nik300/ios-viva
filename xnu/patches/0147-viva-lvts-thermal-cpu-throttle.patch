@@ -1,0 +1,234 @@
+diff --git a/osfmk/arm64/viva_cpufreq.c b/osfmk/arm64/viva_cpufreq.c
+index 3b4ec66..e70be69 100644
+--- a/osfmk/arm64/viva_cpufreq.c
++++ b/osfmk/arm64/viva_cpufreq.c
+@@ -28,6 +28,15 @@
+  * Boot-args: vivacpufreq=0 (never touch clocks/rails), 1 (governor, default), 2 (manual: link only);
+  *   vivacpubig=MHz / vivacpull=MHz / vivacpucci=MHz ceilings (default 2050/2000/1400); vivalpmcpu=MHz big ceiling
+  *   in Low Power Mode (1530; LL 1500, CCI 1050); vivacpufast=0 no scheduler preference for the A76s.
++ * Thermal (0147): the SoC's LVTS sensors (thermal controller 0x1100b000, 3 controllers at +0/+0x100/+0x200:
++ *   LL x3 + CAM, big x2, MD + GPU x2), brought up as Linux's mtk_ts_cpu_noBank probe (mt6781 mtk_lvts_tc.c,
++ *   AUTO-RCK): thermal clock on (INFRA_AO CG bit 10), controller reset, device id 0x81+n, device init, efuse
++ *   calibration (devinfo of this phone: golden 60, count_r per sensor below), 20 ms periodic sampling.
++ *   T = -204.65 * raw / 16384 + golden / 2 + 204.65 (degrees). Read every 256 ms by the governor. Policy on the
++ *   hottest sensor: >= vivathermtrip (85 C) one OPP lower for both clusters every sample, below trip - 5 C one OPP
++ *   up every second, >= 105 C straight to the floor. Without valid readings the clusters are capped at opp 6
++ *   (LL 1618, big 1670). The controller's hardware reset protection (TOPRGU thermal mode) is NOT armed.
++ *   vivatherm=0 = no LVTS (cap at opp 6).
+  * USB link: cpu [status] | cpu gov on|off | cpu set ll|big|cci MHz (governor off first) | cpu max ll|big|cci MHz |
+  *   cpu fast on|off | cpu reset (counters).
+  */
+@@ -111,6 +120,7 @@ static const char *gWhy = "not started";
+ static thread_call_t gCall;
+ 
+ static inline uint32_t rd(uint64_t pa) { return ml_phys_read_word_64(pa); }
++static void therm_tick(void);
+ static inline void wr(uint64_t pa, uint32_t v) { ml_phys_write_word_64(pa, v); }
+ 
+ static unsigned
+@@ -329,6 +339,7 @@ gov_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ 	if (gGov && gReady) {
+ 		int want[NDOM];
+ 		gSamples++;
++		therm_tick();
+ 		gBusy[DOM_LL] = cluster_busy(LL_FIRST, LL_LAST);
+ 		gBusy[DOM_BIG] = cluster_busy(BIG_FIRST, BIG_LAST);
+ 		for (int d = DOM_LL; d <= DOM_BIG; d++) {
+@@ -426,6 +437,159 @@ init_checks(void)
+ 	return true;
+ }
+ 
++
++/* ---- LVTS thermal sensors (0147) ---- */
++#define THERM_BASE      0x1100b000ull
++#define INFRA_CG_CLR    0x10001084
++#define INFRA_RST0_SET  0x10001120
++#define INFRA_RST0_CLR  0x10001124
++#define LVTSMONCTL0     0x000
++#define LVTSMONCTL1     0x004
++#define LVTSMONCTL2     0x008
++#define LVTSMSRCTL0     0x038
++#define LVTSTSSEL       0x040
++#define LVTSCALSCALE    0x048
++#define LVTS_ID         0x04c
++#define LVTS_CONFIG     0x050
++#define LVTSEDATA00     0x054
++#define LVTSMSR0        0x090
++#define LVTSCLKEN       0x0e4
++#define NTC             3
++#define NSENS           9
++#define THERM_NOVALID_CAP 6
++
++static const int kTcSensors[NTC] = { 4, 2, 3 };
++static const int kTcFirst[NTC] = { 0, 4, 6 };
++static const char *const kSensName[NSENS] = { "ll0", "ll1", "ll2", "cam", "big0", "big1", "md", "gpu0", "gpu1" };
++/* devinfo (atag,devinfo) of this phone: index 112 golden temp, 118.. count_r */
++static const uint32_t kGolden = 60;
++static const uint32_t kCountR[NSENS] = { 19553, 19526, 19549, 19554, 19520, 19497, 19489, 19494, 19500 };
++
++static bool gTherm;             /* sensors initialised and valid */
++static int gTempMC[NSENS];
++static int gTempMax = -1000000, gTempPeak = -1000000;
++static int gTrip = 85;
++static unsigned gThermTicks;
++static uint64_t gThermStepsDown, gThermStepsUp;
++static const char *gThermWhy = "not started";
++
++static void
++lvts_dev_write(int tc, uint32_t reg, uint32_t data)
++{
++	wr(THERM_BASE + 0x100 * tc + LVTS_CONFIG, 0xC1030000u | ((reg & 0xff) << 8) | (data & 0xff));
++	delay(3);
++}
++
++static int
++lvts_raw_to_mc(uint32_t raw)
++{
++	return (int)((-204650ll * (int64_t)raw) / 16384) + (int)kGolden * 500 + 204650;
++}
++
++static bool
++lvts_init(void)
++{
++	wr(INFRA_CG_CLR, 1u << 10);
++	wr(INFRA_RST0_SET, rd(INFRA_RST0_SET) | 1);
++	delay(10);
++	wr(INFRA_RST0_CLR, rd(INFRA_RST0_CLR) | 1);
++	delay(10);
++	for (int tc = 0; tc < NTC; tc++) {
++		uint64_t b = THERM_BASE + 0x100 * tc;
++		wr(b + LVTSCLKEN, 1);
++		lvts_dev_write(tc, 0xff, 0xff);                         /* reset all devices */
++		wr(b + LVTS_CONFIG, 0xC5020000u | (0xfc << 8) | 0x55);  /* read back the id */
++		delay(3);
++		if ((rd(b + LVTS_ID) & 0xff) != 0x81u + (uint32_t)tc) {
++			gThermWhy = "LVTS device id mismatch";
++			return false;
++		}
++	}
++	for (int tc = 0; tc < NTC; tc++) {
++		static const uint8_t init[][2] = {
++			{ 0x03, 0x00 }, { 0x0e, 0x01 }, { 0x06, 0xb8 }, { 0x07, 0xa6 }, { 0x05, 0x00 }, { 0x04, 0x20 },
++			{ 0x0a, 0xac }, { 0x0c, 0xfc }, { 0x09, 0x8d }, { 0x08, 0xf7 }, { 0x0b, 0x04 },
++		};
++		for (unsigned i = 0; i < sizeof(init) / sizeof(init[0]); i++) {
++			lvts_dev_write(tc, init[i][0], init[i][1]);
++		}
++		lvts_dev_write(tc, 0x0e, 0x01);                         /* auto RCK */
++		uint64_t b = THERM_BASE + 0x100 * tc;
++		for (int j = 0; j < kTcSensors[tc]; j++) {
++			wr(b + LVTSEDATA00 + 4 * j, kCountR[kTcFirst[tc] + j]);
++		}
++		wr(b + LVTSMONCTL0, 0);                                 /* sensing off while configuring */
++		wr(b + LVTSTSSEL, 0x13121110);
++		wr(b + LVTSCALSCALE, 0x300);
++		lvts_dev_write(tc, 0x06, 0xb8);
++		wr(b + LVTSMONCTL1, (1u << 20) | 0x00c);
++		wr(b + LVTSMONCTL2, (1u << 16) | 0x001);
++		wr(b + LVTSMSRCTL0, 0x492);
++		delay(1);
++		wr(b + LVTSMONCTL0, 0x200 | ((1u << kTcSensors[tc]) - 1));
++	}
++	gThermWhy = "waiting for the first samples";
++	return true;
++}
++
++/* Reads every sensor; false while none is valid yet or a value is out of range. */
++static bool
++lvts_read(void)
++{
++	int max = -1000000, valid = 0;
++	for (int tc = 0; tc < NTC; tc++) {
++		for (int j = 0; j < kTcSensors[tc]; j++) {
++			uint32_t v = rd(THERM_BASE + 0x100 * tc + LVTSMSR0 + 4 * j);
++			int s = kTcFirst[tc] + j;
++			if ((v & 0xffff) == 0) {
++				continue;
++			}
++			gTempMC[s] = lvts_raw_to_mc(v & 0xffff);
++			if (gTempMC[s] < -20000 || gTempMC[s] > 150000) {
++				gThermWhy = "LVTS reading out of range";
++				return false;
++			}
++			valid++;
++			max = gTempMC[s] > max ? gTempMC[s] : max;
++		}
++	}
++	if (valid < NSENS) {
++		return false;
++	}
++	gTempMax = max;
++	gTempPeak = max > gTempPeak ? max : gTempPeak;
++	gThermWhy = "ok";
++	return true;
++}
++
++/* Every 16 governor samples (~256 ms). Caller holds the lock. */
++static void
++therm_tick(void)
++{
++	if (++gThermTicks % 16 != 0) {
++		return;
++	}
++	bool ok = gTherm && lvts_read();
++	if (!ok) {
++		gThermIdx = gThermIdx > THERM_NOVALID_CAP ? gThermIdx : THERM_NOVALID_CAP;
++		return;
++	}
++	int t = gTempMax / 1000;
++	if (t >= 105) {
++		gThermIdx = FLOOR_IDX;
++		gThermStepsDown++;
++	} else if (t >= gTrip) {
++		if (gThermIdx < FLOOR_IDX) {
++			gThermIdx = gThermIdx == 0 ? (gIdx[DOM_BIG] < gIdx[DOM_LL] ? gIdx[DOM_BIG] : gIdx[DOM_LL]) + 1 : gThermIdx + 1;
++			gThermIdx = gThermIdx > FLOOR_IDX ? FLOOR_IDX : gThermIdx;
++			gThermStepsDown++;
++		}
++	} else if (t < gTrip - 5 && gThermIdx > 0 && gThermTicks % 64 == 0) {
++		gThermIdx--;
++		gThermStepsUp++;
++	}
++}
++
+ /* Called from VivaPwrap::start (the PMIC is reachable from then on). */
+ void
+ viva_cpufreq_start(void)
+@@ -462,6 +626,15 @@ viva_cpufreq_start(void)
+ 		printf("VIVA CPUFREQ: off (vivacpufreq=0), clocks left as LK set them\n");
+ 		return;
+ 	}
++	unsigned th = 1;
++	(void)PE_parse_boot_argn("vivatherm", &th, sizeof(th));
++	(void)PE_parse_boot_argn("vivathermtrip", &gTrip, sizeof(gTrip));
++	gTrip = gTrip < 60 ? 60 : gTrip > 100 ? 100 : gTrip;
++	gTherm = th != 0 && lvts_init();
++	if (th == 0) {
++		gThermWhy = "off (vivatherm=0)";
++	}
++	gThermIdx = THERM_NOVALID_CAP;          /* until the first valid reading */
+ 	gCall = thread_call_allocate_with_options(gov_tick, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+ 	lck_mtx_lock(&viva_cpufreq_lock);
+ 	gReady = init_checks();
+@@ -473,6 +646,7 @@ viva_cpufreq_start(void)
+ 		}
+ 	}
+ 	lck_mtx_unlock(&viva_cpufreq_lock);
++	printf("VIVA THERMAL: LVTS %s\n", gThermWhy);
+ 	printf("VIVA CPUFREQ: %s; boot ll %u MHz big %u MHz cci %u MHz; %s\n", gWhy, pll_mhz(DOM_LL), pll_mhz(DOM_BIG),
+ 	    pll_mhz(DOM_CCI), !gReady ? "disabled" : gMode == 1 ? "governor on" : "manual (link)");
+ }
+@@ -595,6 +769,13 @@ viva_cpufreq_link(const char *args, char *out, size_t len)
+ 		SAY("cpufreq: %s, governor %s, mode %d, low power %s, thermal cap opp %d, A76 preference %s (0x%llx)\n",
+ 		    gWhy, gGov ? "on" : "off", gMode, gLowPower ? "on" : "off", gThermIdx, gFast ? "on" : "off",
+ 		    sched_viva_fast_cpus);
++		SAY("  thermal: %s, trip %d C, hottest %d.%d C (peak %d.%d C), cap opp %d, %llu steps down, %llu up\n  ",
++		    gThermWhy, gTrip, gTempMax / 1000, (gTempMax % 1000 + 1000) % 1000 / 100, gTempPeak / 1000,
++		    (gTempPeak % 1000 + 1000) % 1000 / 100, gThermIdx, gThermStepsDown, gThermStepsUp);
++		for (int i = 0; i < NSENS; i++) {
++			SAY(" %s %d.%d", kSensName[i], gTempMC[i] / 1000, (gTempMC[i] % 1000 + 1000) % 1000 / 100);
++		}
++		SAY("\n");
+ 		for (int d = 0; d < NDOM; d++) {
+ 			SAY("  %-3s %4u MHz (opp %2d, table %4u, boot %4u), ceiling %4u, busy %3u.%u %%\n", kDomName[d],
+ 			    pll_mhz(d), gIdx[d], kOpp[d][gIdx[d]].mhz, kOpp[d][gBootIdx[d]].mhz, kOpp[d][ceiling(d)].mhz,
