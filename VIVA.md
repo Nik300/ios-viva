@@ -530,3 +530,13 @@ Patch 0137 (NOT tested): **DVFS display boost**. The governor aims at 70% busy o
 and with SwapWait CA drew fewer frames: a loop toward low fps. Now a vsync tick at which the display had a frame queued
 that the GPU had not finished (K0c wait, counter `sweet_fb_gpu_waits`) sends the next DVFS sample to the fastest OPP
 (Low Power Mode ceiling still applies). `vivagpuboost=0` = off; `gpu status` shows "N display boosts".
+
+Patch 0138 (CI 41771551139, image `out/xnu-ufs-rw-0138.img`, NOT tested on the phone yet): **no IOKit daemon**.
+lsd hung on every plugin registration (LS DB kept 1 extension, PosterBoard had no poster providers). Chain
+(spindump + probes `vmg`/`vbusy` in viva-tests): lsd -> InstalledContentLibrary `__GenerateBuiltInAppInstallSessionID`
+-> MGCopyAnswer("re6Zb+zwFKJNlkQTUeT+/w") -> `_MGWaitForDevices` ("IOKit is busy, waiting 5s") forever; from root
+`MGCopyAnswer(WifiAddress)` and `UniqueDeviceID` also hang. IOKit busy state was 1: only `IOService:/`
+(IOPlatformExpertDevice) busy, no busy child = the +1 that `StartIOKitMatching` adds until the IOKit daemon
+(kernelmanagerd) checks in, which never happens on iOS. 0138: `OSKext::iokitDaemonAvailable()` returns false
+(like `-restore`): no root busy hold, no deferred-match list. Boot-arg `sweetiokitd=1` restores the old wait.
+Check after boot: `viva-tests/vbusy` must print `IOKit busy state 0`, `viva-tests/vmg WifiAddress` must not hang.
