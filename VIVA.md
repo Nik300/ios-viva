@@ -540,3 +540,8 @@ lsd hung on every plugin registration (LS DB kept 1 extension, PosterBoard had n
 (kernelmanagerd) checks in, which never happens on iOS. 0138: `OSKext::iokitDaemonAvailable()` returns false
 (like `-restore`): no root busy hold, no deferred-match list. Boot-arg `sweetiokitd=1` restores the old wait.
 Check after boot: `viva-tests/vbusy` must print `IOKit busy state 0`, `viva-tests/vmg WifiAddress` must not hang.
+0138 on the phone: `vbusy` = IOKit busy state 0 (fix works), but `MGCopyAnswer(WifiAddress/UniqueDeviceID)` still
+hung and lsd with it. Second wait: MobileGestalt's WifiAddress reads `IODeviceTree:/chosen mac-address-wifi0`
+and without it waits for an IOService named sdio/wlan/marconi-wifi. mkadt (commit 8a985d5) now adds synthetic
+`mac-address-wifi0` 02:41:00:00:00:01 and `mac-address-bluetooth0` ..:02. Image `out/xnu-ufs-rw-0138-mac.img`
+(kernel 0138 + that ADT), NOT tested yet.
