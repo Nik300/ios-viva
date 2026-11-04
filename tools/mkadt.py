@@ -101,7 +101,12 @@ def spi(n, flags):
     return u32(32 + n, flags)
 
 
-def viva_devices(ph, phandle, gic_ph):
+def wifi_mac(ecid):
+    """Synthetic, locally administered WiFi MAC (/chosen mac-address-wifi0, the wlan node, en0)."""
+    return bytes([0x02]) + struct.pack('>Q', ecid)[3:7] + b'\x01'
+
+
+def viva_devices(ph, phandle, gic_ph, ecid):
     """viva /arm-io devices with their own IOKit drivers (addresses and SPIs from the viva DTB)."""
     io = lambda pa, size: u64(pa - SOC_BASE, size)
     eint_ph = next(phandle)
@@ -230,6 +235,15 @@ def viva_devices(ph, phandle, gic_ph):
             ('interrupt-parent', u32(gic_ph)),
             ('interrupts', spi(0x112, IRQ_LEVEL_HIGH) + spi(0x113, IRQ_LEVEL_HIGH) + spi(0x114, IRQ_LEVEL_HIGH)),
         ]),
+        # CONNSYS WiFi (MT6781 + MT6631): iokit/Kernel/arm/VivaWLAN.cpp (registry for configd / wifid) on top of
+        # bsd/dev/viva_wifi.c + viva_wlan.c (the station, en0). launchd starts wifid only when a node named "wlan"
+        # exists (_LimitLoadToDeviceTree); MobileGestalt reads local-mac-address here.
+        node('wlan', [
+            ph(),
+            ('device_type', cstr('wlan')),
+            ('compatible', cstr('mediatek,mt6781-wlan')),
+            ('local-mac-address', wifi_mac(ecid)),
+        ]),
     ]
 
 
@@ -295,7 +309,7 @@ def build(seed=None, qemu=False, highmem=False, viva=False, viva_ufs=False):
         # sdio/wlan/marconi-wifi IOService that never appears, which hung lsd
         # in every plugin registration. Synthetic, locally administered MACs
         # from the synthetic ECID.
-        ('mac-address-wifi0', bytes([0x02]) + struct.pack('>Q', ecid)[3:7] + b'\x01'),
+        ('mac-address-wifi0', wifi_mac(ecid)),
         ('mac-address-bluetooth0', bytes([0x02]) + struct.pack('>Q', ecid)[3:7] + b'\x02'),
     ], [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
@@ -367,7 +381,7 @@ def build(seed=None, qemu=False, highmem=False, viva=False, viva_ufs=False):
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
-        ])] + (viva_devices(ph, phandle, gic_ph) if viva else []))
+        ])] + (viva_devices(ph, phandle, gic_ph, ecid) if viva else []))
 
     fbcon = node('sweet-fbcon', [
         ph(),

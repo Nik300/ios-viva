@@ -575,3 +575,32 @@ NOT tested): built-in AppleMobileFileIntegrity IOService on IOResources, sel 6 -
 0140 on the phone (+ MAC ADT): full LS rebuild 143 s, LS DB 413 extension records (was 1), 9 com.apple.posterkit.provider
 appexes, PosterBoard `fetchExtensionIdentifiers` lists all 9 (Collections, Gradient, Emoji, Pride, Unity, Photos,
 Extragalactic, Aegir, LegacyPoster). Next (userland): create/select a poster configuration.
+
+### 0143-0144: WiFi for iOS (wifid / Settings), join WPA2-PSK
+
+0142 on the phone: `wifi init` + `wifi scan` work (4 networks, RSSI/channel/security right).
+Patch 0143: AppleKeyStore `aks_wrap_key` / `aks_unwrap_key` (sel 10/11), ported from ios-sapphire 0160 + 0293 (class =
+second scalar): without them securityd cannot write keychain items and wifid never keeps a WiFi password.
+Patch 0144 (NOT tested), the iOS pipeline as hakios-xnu-kernel / ios-sapphire do it on the same 20H392 userland
+(~/Developer/ios-viva/wifi/docs/IOS16-WIFI-HAKIOS.md), chip side from gen4m (wifi/docs/MT6781-WIFI-JOIN.md):
+- ADT `/arm-io/wlan` (device_type wlan, compatible mediatek,mt6781-wlan, local-mac-address = /chosen mac-address-wifi0):
+  launchd now starts wifid (`_LimitLoadToDeviceTree`), MobileGestalt reads the MAC there.
+- iokit/Kernel/arm/VivaWLAN.cpp: properties-only classes with Apple's names (IONetworkController <- IOEthernetController
+  <- IO80211Controller <- VivaWLAN on the wlan nub; IONetworkInterface <- VivaWLANInterface "en0" with
+  IO80211InterfaceRole Infrastructure; newUserClient refused -> IO80211.framework uses the ioctls), IONetworkStack
+  stand-in on IOResources. Boot-arg `vivawlan=0` = none of it (en0 not created).
+- bsd/dev/viva_wlan.c: en0 (IFT_ETHER, SUBFAMILY_WIFI, legacy + NX_NOAUTO, BPF, KEV_DL_LINK_ON/OFF, SIOCGIFMEDIA
+  IFM_IEEE80211), SIOCGA80211/SIOCSA80211 (hakios answers + RSSI_BOUNDS {1,-95,-20,-85} and NOISE -95 for auto-join,
+  CHANNELS_INFO), events without payload (POWER_CHANGED, SCAN_DONE, ASSOC_DONE; join: LINK_ON, ASSOC_DONE, SSID, BSSID,
+  LINK_CHANGED). Unknown requests logged once: `VIVA WLAN: GET|SET type N len L not supported`.
+- bsd/dev/viva_wifi.c: a worker thread + locks (vw_mtx hardware, vs_mtx snapshots), radio up on demand (on, wmt, fw,
+  init; GET POWER says on from boot like hakios, the first scan/join brings it up, ~2 s), async scan, host MLME join:
+  CH_PRIVILEGE (0x1C, grant 0x10) -> STA record WTBL 5 state 0 -> Auth on TX ring 15 (TXD + frame) -> Assoc (SSID, AP
+  rates, RSN PSK/CCMP with the AP's group cipher, HT cap if HT, WMM info if WMM) -> WMM params, BSS_INFO connected (auth 7
+  enc 6, BMC 4), STA record state 2 (event 0x0C), PM connected + CAM -> 4-way (viva_wpa.c, PMK from the passphrase in
+  the kernel) -> PTK (WTBL 5, event 0x24), GTK (WTBL 4) -> channel released -> link up. Data: TX ring 0, TXD + append
+  pointing at the frame in the same buffer, token = slot, freed by MSDU reports (RX type 6; a slot whose report never
+  came is reused after 1 s, counted as "lost"). Wrong password -> ASSOCIATE_RESULT 21. RX block ack refused in the STA
+  record (no reorder buffer).
+- Link: `wifi up`, `wifi join SSID [PASSPHRASE]` (SSID without spaces), `wifi leave`, `wifi sta` (counters + what
+  wifid asked), `wifi off`.

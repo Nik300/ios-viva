@@ -1,0 +1,3133 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index f6a1f1b..059f136 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/viva_usb.c			standard
+ bsd/dev/viva_wifi.c			standard
+ bsd/dev/viva_wpa.c			standard
++bsd/dev/viva_wlan.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/viva_wifi.c b/bsd/dev/viva_wifi.c
+index 96220a6..e8d8d61 100644
+--- a/bsd/dev/viva_wifi.c
++++ b/bsd/dev/viva_wifi.c
+@@ -56,6 +56,14 @@
+ #include <sys/fcntl.h>
+ #include <sys/uio.h>
+ #include <sys/random.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/proc.h>
++#include <pexpert/device_tree.h>
++
++#include "viva_wpa.h"
++#include "viva_wlan.h"
+ 
+ extern int viva_pwrap_read(uint32_t addr, uint32_t *value);                                  /* VivaPwrap.cpp */
+ extern int viva_pwrap_write_regulator(uint32_t addr, uint32_t mask, uint32_t value);
+@@ -386,7 +394,7 @@ struct wmt_rom_patch {                  /* common_main/core/include/wmt_core.h:
+ };
+ 
+ static struct {
+-	bool     on;
++	bool     on, wmt;
+ 	void    *emi;
+ 	uint64_t emiPA;
+ 	uint32_t old18, old18Op, old18Cfg, old33, old33Op, old33Cfg, old28, old28Op, old28Cfg;
+@@ -470,6 +478,8 @@ pinmux_restore(void)
+ 	wr(IOCFG_LT_DRV, (rd(IOCFG_LT_DRV) & ~0x07ffffffu) | (vw.oldDrv & 0x07ffffffu));
+ }
+ 
++static void wl_reset(void);      /* station state, defined with it */
++
+ static size_t
+ wifi_off(char *out, size_t len, size_t o)
+ {
+@@ -482,6 +492,7 @@ wifi_off(char *out, size_t len, size_t o)
+ 	pinmux_restore();
+ 	rails_restore();
+ 	vw.on = false;
++	wl_reset();
+ 	say("off: rails and pinmux restored; the EMI window stays allocated for the next \"wifi on\"\n");
+ 	return o;
+ }
+@@ -879,6 +890,7 @@ wifi_wmt(char *out, size_t len, size_t o)
+ 	int c = wmt_cmd("rf calibration", cal, sizeof(cal), calEv, sizeof(calEv), 5000, ev, sizeof(ev), out, len, &o);
+ 	/* wmt_ic_soc.c: the efuse PALDO (VCN28) goes off after the calibration */
+ 	viva_pwrap_write_regulator(PMIC_VCN28_CON0, 0x1, 0x0);
++	vw.wmt = c >= 0;
+ 	say("wmt: %s; VCN28 off. Next: wifi fw\n", c >= 0 ? "done" : "calibration FAILED");
+ 	return o;
+ }
+@@ -1188,9 +1200,9 @@ close:
+ 
+ /* ---- step 4: normal commands (firmware running) ---- */
+ 
+-/* Station state after "wifi init" (bsd/dev/viva_wifi.c is still driven from the USB link). */
++/* Station state after "wifi init" (under vw_mtx: the worker thread and the USB link). */
+ #define WL_MAX_BSS              48
+-#define WL_IE_MAX               512
++#define WL_IE_MAX               VWL_IE_MAX
+ 
+ struct wl_bss {
+ 	uint8_t  bssid[6], ssid[32], ssid_len, ch;
+@@ -1199,13 +1211,17 @@ struct wl_bss {
+ 	uint16_t ie_len;
+ 	uint8_t  ie[WL_IE_MAX];
+ 	uint32_t seen;                  /* scan generation */
++	uint64_t when;                  /* mach_absolute_time of the last beacon / probe response */
+ };
+ 
+ static struct {
+ 	bool     cap, init;
++	bool     scanBusy;              /* SCAN_REQ_V2 sent, SCAN_DONE not seen yet */
++	int      scanStatus;
+ 	uint8_t  mac[6];
+ 	uint8_t  scanSeq, scanGen;
+-	uint32_t nbss, frames, dataFrames;
++	uint64_t scanDeadline;
++	uint32_t nbss, frames, dataFrames, events;
+ 	struct wl_bss bss[WL_MAX_BSS];
+ } wl;
+ 
+@@ -1218,10 +1234,14 @@ static struct {
+ #define PKT_EVENT               1
+ #define PKT_FRAME               2
+ #define PKT_DATA                3
++#define PKT_MSDU                4               /* MSDU report: TX ring 0 tokens back */
+ 
+ static int
+ rx_classify(const uint8_t *b, uint32_t n, uint32_t *foff)
+ {
++	if (n >= 8 && (b[3] >> 5) == 6) {
++		return PKT_MSDU;                        /* short: header 8 + 4 per token */
++	}
+ 	if (n < 20) {
+ 		return 0;
+ 	}
+@@ -1266,6 +1286,8 @@ rx_rssi(const uint8_t *b)
+ }
+ 
+ static void wifi_frame(const uint8_t *b, uint32_t n, uint32_t foff, int kind);     /* scan table, join, EAPOL */
++static void wifi_event(const uint8_t *ev, uint32_t got);                            /* scan done, beacon loss */
++static void tx_report(const uint8_t *b, uint32_t n);                                /* TX ring 0 tokens */
+ 
+ /* Next packet from RX ring 1, then RX ring 0, within us microseconds; frames and data go to wifi_frame(). */
+ static uint32_t
+@@ -1281,12 +1303,17 @@ rx_next(uint8_t *buf, uint32_t max, uint32_t us, int *kind)
+ 		*kind = rx_classify(buf, MIN(got, max), &foff);
+ 		if (*kind == PKT_FRAME || *kind == PKT_DATA) {
+ 			wifi_frame(buf, MIN(got, max), foff, *kind);
++		} else if (*kind == PKT_EVENT) {
++			wifi_event(buf, MIN(got, max));
++		} else if (*kind == PKT_MSDU) {
++			tx_report(buf, MIN(got, max));
+ 		}
+ 	}
+ 	return got;
+ }
+ 
+ static uint8_t wcmd_pkt[64 + 2048];
++static uint8_t wcmd_ev[RX_BUF_LEN];                     /* RX for the worker's polls and the join's waits */
+ 
+ /*
+  * WIFI_CMD (nic_cmd_event.h, asicFillCmdTxdInfo) on TX ring 15. eid != 0: wait for that event into ev (returns its
+@@ -1432,6 +1459,7 @@ wifi_cap(char *out, size_t len, size_t o)
+ #define CID_SET_DBDC_PARMS      0x28
+ #define CID_SET_NVRAM_SETTINGS  0x48
+ #define EID_SCAN_DONE           0x0d
++#define EID_BSS_BEACON_TIMEOUT  0x13
+ #define NVRAM_SIZE              2048
+ #define NVRAM_FILE              "WIFI"                          /* nvdata APCFG/APRDEB/WIFI, copied by hand */
+ #define NVRAM_DEFAULT           "stWifiCfgDefault_6631.bin"     /* vendor default (MAC zero) */
+@@ -1496,17 +1524,13 @@ wifi_init(char *out, size_t len, size_t o)
+ 		say("init: no NVRAM (%s%s or %s: %d); push one\n", WIFI_FW_DIR, NVRAM_FILE, NVRAM_DEFAULT, n);
+ 		return o;
+ 	}
+-	if (mac_valid(nv + 4)) {
+-		memcpy(wl.mac, nv + 4, 6);
+-	} else {
+-		/* no factory MAC: a locally administered one, the same until the next "wifi init" */
+-		read_random(wl.mac, 6);
+-		wl.mac[0] = (uint8_t)((wl.mac[0] & 0xfc) | 0x02);
+-		memcpy(nv + 4, wl.mac, 6);                     /* as Android's wlan_assistant patches it in */
+-	}
++	/* en0's address (the ADT's mac-address-wifi0, what MobileGestalt reports), as wlan_assistant patches it in */
++	bool factory = mac_valid(nv + 4);
++	viva_wifi_mac(wl.mac);
++	memcpy(nv + 4, wl.mac, 6);
+ 	uint16_t cc = (uint16_t)(nv[10] << 8 | nv[11]);
+ 	say("init: NVRAM %s (version 0x%04x), MAC %02x:%02x:%02x:%02x:%02x:%02x%s, country %c%c\n", src, nv[0] | nv[1] << 8,
+-	    wl.mac[0], wl.mac[1], wl.mac[2], wl.mac[3], wl.mac[4], wl.mac[5], src == NVRAM_FILE ? " (factory)" : " (random)",
++	    wl.mac[0], wl.mac[1], wl.mac[2], wl.mac[3], wl.mac[4], wl.mac[5], factory ? " (factory MAC replaced by en0's)" : "",
+ 	    nv[10] ? nv[10] : '0', nv[11] ? nv[11] : '0');
+ 
+ 	int err = 0;
+@@ -1579,6 +1603,7 @@ scan_frame(const uint8_t *b, const uint8_t *f, uint32_t flen)
+ 		memcpy(e->bssid, bssid, 6);
+ 	}
+ 	e->seen = wl.scanGen;
++	e->when = mach_absolute_time();
+ 	e->rssi = (int8_t)rx_rssi(b);
+ 	e->ch = b[5] > 241 ? (uint8_t)(b[5] - 241) : b[5];
+ 	e->bintval = (uint16_t)(f[32] | f[33] << 8);
+@@ -1591,23 +1616,220 @@ scan_frame(const uint8_t *b, const uint8_t *f, uint32_t flen)
+ 		e->ssid_len = ssid[1];
+ 		memcpy(e->ssid, ssid + 2, ssid[1]);
+ 	}
+-	e->ie_len = (uint16_t)MIN(ielen, (uint32_t)WL_IE_MAX);
+-	memcpy(e->ie, ie, e->ie_len);
++	/* whole IEs only (the framework parses them; a cut one would be garbage) */
++	uint32_t keep = 0;
++	while (keep + 2 <= ielen && keep + 2 + ie[keep + 1] <= ielen && keep + 2 + ie[keep + 1] <= WL_IE_MAX) {
++		keep += 2 + ie[keep + 1];
++	}
++	e->ie_len = (uint16_t)keep;
++	memcpy(e->ie, ie, keep);
++}
++
++/* ---- step 6: the station (join, WPA2-PSK, data) driven by en0 / wifid (bsd/dev/viva_wlan.c) ---- */
++
++/*
++ * Locks: vw_mtx = the hardware, wl and sj (the worker thread, the USB link, SET POWER); vs_mtx = requests, the TX
++ * queue and the snapshots the ioctls read (never held while waiting on the hardware). Order: vw_mtx, then vs_mtx.
++ * Calls into viva_wlan.c (events, ifnet_input) happen after vw_mtx is dropped (vw_unlock()).
++ */
++LCK_GRP_DECLARE(vw_lck_grp, "viva_wifi");
++LCK_MTX_DECLARE(vw_mtx, &vw_lck_grp);
++LCK_MTX_DECLARE(vs_mtx, &vw_lck_grp);
++static int vw_chan;                             /* the worker's wait channel */
++
++#define REQ_POWER               0x1
++#define REQ_SCAN                0x2
++#define REQ_JOIN                0x4
++#define REQ_LEAVE               0x8
++#define REQ_POWER_EVENT         0x10            /* SET POWER: POWER_CHANGED even when nothing changes */
++
++static struct {
++	uint32_t req;
++	bool     want;                  /* radio asked on (GET POWER answers this) */
++	bool     worker;
++	struct vwl_scan scan;
++	struct vwl_join join;
++	mbuf_t   txHead, txTail;
++	uint32_t txn;
++	struct vwl_status st;
++	uint32_t nres;
++	struct vwl_bss res[WL_MAX_BSS];
++	struct vwl_bss cur;
++} vs = { .want = true };
++
++/* what to tell viva_wlan.c once vw_mtx is dropped */
++#define NOTE_SCAN               0x1
++#define NOTE_ASSOC              0x2
++#define NOTE_DOWN               0x4
++#define NOTE_POWER              0x8
++static struct {
++	uint32_t bits;
++	int      assoc;
++	uint32_t reason;
++	bool     power;
++	mbuf_t   rxHead, rxTail;
++} vn;
++
++/* the join / the association */
++#define EAPOL_MS                8000
++static struct {
++	uint8_t  state;                 /* APPLE80211_S_* */
++	uint8_t  result;                /* ASSOCIATE_RESULT */
++	bool     link, rsn, ht, wmm, chHeld, staRec, sentMsg2;
++	struct wl_bss ap;
++	uint8_t  pmk[32];
++	uint16_t aid, seq;
++	uint8_t  rsnie[64], rsnie_len;
++	uint8_t  rates[16], nrates;     /* the AP's (supported + extended), 500 kb/s units with the basic bit */
++	struct viva_wpa wpa;
++	uint64_t deadline;              /* EAPOL handshake */
++	uint8_t  mgmt[1024];            /* last auth / assoc response from the AP */
++	uint32_t mgmtLen;
++	int8_t   rssi;
++	uint32_t tx, rx, txDrops, rxDrops, eapolRx, eapolTx;
++} sj;
++
++static inline uint64_t
++ms_abs(uint32_t ms)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &t);
++	return t;
++}
++
++/* ADT /chosen mac-address-wifi0 (mkadt: locally administered, from the synthetic ECID), else a random one */
++void
++viva_wifi_mac(uint8_t mac[6])
++{
++	static uint8_t m[6];
++	static bool have;
++	if (!have) {
++		DTEntry e;
++		void const *p = NULL;
++		unsigned int sz = 0;
++		if (SecureDTLookupEntry(NULL, "/chosen", &e) == kSuccess &&
++		    SecureDTGetProperty(e, "mac-address-wifi0", &p, &sz) == kSuccess && sz >= 6) {
++			memcpy(m, p, 6);
++		} else {
++			read_random(m, 6);
++			m[0] = (uint8_t)((m[0] & 0xfc) | 0x02);
++		}
++		have = true;
++	}
++	memcpy(mac, m, 6);
++}
++
++static void hw_reset(void);                     /* the chip-specific join part, below */
++
++static void
++wl_reset(void)
++{
++	hw_reset();
++	wl.cap = wl.init = wl.scanBusy = false;
++	vw.wmt = false;
++	st.full = false;
++	if (sj.link || sj.state != 0) {
++		vn.bits |= NOTE_DOWN;
++		vn.reason = 0;
++	}
++	bzero(&sj, sizeof(sj));
++}
++
++/* ---- transmit (TX ring 0: data and management) ---- */
++
++static int hw_tx(const uint8_t *frame, uint32_t len, bool mgmt, bool protect);         /* below, chip specific */
++
++static void
++mgmt_hdr(uint8_t *f, uint8_t fc)
++{
++	bzero(f, 24);
++	f[0] = fc;
++	memcpy(f + 4, sj.ap.bssid, 6);
++	memcpy(f + 10, wl.mac, 6);
++	memcpy(f + 16, sj.ap.bssid, 6);
++	f[22] = (uint8_t)(sj.seq << 4);
++	f[23] = (uint8_t)(sj.seq >> 4);
++	sj.seq = (sj.seq + 1) & 0xfff;
++}
++
++static int
++tx_eapol(const uint8_t *body, uint32_t len)
++{
++	uint8_t eth[14 + 256];
++	if (len > 256) {
++		return -1;
++	}
++	memcpy(eth, sj.ap.bssid, 6);
++	memcpy(eth + 6, wl.mac, 6);
++	eth[12] = 0x88;
++	eth[13] = 0x8e;
++	memcpy(eth + 14, body, len);
++	sj.eapolTx++;
++	return hw_tx(eth, 14 + len, false, false);
+ }
+ 
+-/* Other management frames and EAPOL: only counted for now (no join yet). */
+-static uint32_t wl_otherMgmt, wl_eapol;
++/* ---- the AP's frames ---- */
+ 
+ static void
+-join_frame(__unused const uint8_t *b, __unused const uint8_t *f, __unused uint32_t flen)
++join_frame(__unused const uint8_t *b, const uint8_t *f, uint32_t flen)
+ {
+-	wl_otherMgmt++;
++	uint8_t fc = f[0];
++	if (sj.state == 0 || memcmp(f + 16, sj.ap.bssid, 6) != 0 || memcmp(f + 4, wl.mac, 6) != 0) {
++		return;
++	}
++	if (fc == 0xc0 || fc == 0xa0) {                 /* deauthentication / disassociation */
++		uint16_t reason = flen >= 26 ? (uint16_t)(f[24] | f[25] << 8) : 0;
++		if (sj.link) {
++			vn.bits |= NOTE_DOWN;
++			vn.reason = reason;
++		}
++		printf("VIVA WIFI: %s from the AP, reason %u\n", fc == 0xc0 ? "deauthentication" : "disassociation", reason);
++		sj.link = false;
++		sj.state = 0;                           /* the worker cleans up the firmware side */
++		sj.mgmtLen = 0;
++		return;
++	}
++	if ((fc == 0xb0 || fc == 0x10 || fc == 0x30) && flen <= sizeof(sj.mgmt)) {
++		memcpy(sj.mgmt, f, flen);
++		sj.mgmtLen = flen;
++	}
+ }
+ 
++static void sta_eapol(const uint8_t *eth, uint32_t len);
++
++/* An 802.3 data frame from the AP: EAPOL to the supplicant, the rest to en0 (after vw_unlock()). */
+ static void
+-eapol_rx(__unused const uint8_t *eth, __unused uint32_t len)
++data_rx(const uint8_t *eth, uint32_t len)
+ {
+-	wl_eapol++;
++	if (len < 14) {
++		return;
++	}
++	if (eth[12] == 0x88 && eth[13] == 0x8e) {
++		sta_eapol(eth, len);
++		return;
++	}
++	if (!sj.link || len > 2048) {
++		sj.rxDrops++;
++		return;
++	}
++	mbuf_t m = NULL;
++	if (mbuf_allocpacket(MBUF_DONTWAIT, len, NULL, &m) != 0) {
++		sj.rxDrops++;
++		return;
++	}
++	if (mbuf_copyback(m, 0, len, eth, MBUF_DONTWAIT) != 0) {
++		mbuf_freem(m);
++		sj.rxDrops++;
++		return;
++	}
++	mbuf_pkthdr_setlen(m, len);
++	if (vn.rxTail) {
++		mbuf_setnextpkt(vn.rxTail, m);
++	} else {
++		vn.rxHead = m;
++	}
++	vn.rxTail = m;
++	sj.rx++;
+ }
+ 
+ /* RX dispatch for frames and data (called from rx_next). */
+@@ -1618,34 +1840,40 @@ wifi_frame(const uint8_t *b, uint32_t n, uint32_t foff, int kind)
+ 	uint32_t total = MIN((uint32_t)(b[0] | b[1] << 8), n), flen = total - foff;
+ 	if (b[6] & 0x80) {                              /* translated to 802.3: DA, SA, type */
+ 		wl.dataFrames++;
+-		if (flen >= 14 && f[12] == 0x88 && f[13] == 0x8e) {
+-			eapol_rx(f, flen);
+-		}
++		data_rx(f, flen);
+ 		return;
+ 	}
+-	if (kind != PKT_FRAME || flen < 24) {
+-		wl.dataFrames++;
++	if (kind != PKT_FRAME && kind != PKT_DATA) {
++		return;
++	}
++	if (flen < 24) {
+ 		return;
+ 	}
+ 	wl.frames++;
+ 	uint8_t fc = f[0];
+ 	if (fc == 0x80 || fc == 0x50) {
+ 		scan_frame(b, f, flen);
++		if (sj.state && memcmp(f + 16, sj.ap.bssid, 6) == 0) {
++			int r = rx_rssi(b);
++			if (r) {
++				sj.rssi = (int8_t)r;
++			}
++		}
+ 	} else if ((fc & 0x0c) == 0) {
+ 		join_frame(b, f, flen);
+-	} else if ((fc & 0x0c) == 0x08 && flen >= 24 + 8 + 4) {
+-		/* 802.11 data (not translated): LLC/SNAP AA AA 03 00 00 00, type 0x888E = EAPOL */
++	} else if ((fc & 0x0c) == 0x08 && flen >= 24 + 8) {
++		/* 802.11 data not translated: LLC/SNAP AA AA 03 00 00 00 + type -> 802.3 (from the AP: to-DS 0) */
+ 		uint32_t h = 24 + ((fc & 0x80) ? 2 : 0);
+ 		const uint8_t *l = f + h;
+-		if (flen >= h + 8 && l[0] == 0xaa && l[1] == 0xaa && l[6] == 0x88 && l[7] == 0x8e) {
+-			uint8_t eth[14 + 512];
+-			uint32_t plen = MIN(flen - h - 8, (uint32_t)512);
++		if (flen >= h + 8 && l[0] == 0xaa && l[1] == 0xaa && l[2] == 0x03) {
++			static uint8_t eth[14 + 2048];
++			uint32_t plen = MIN(flen - h - 8, (uint32_t)2048);
+ 			memcpy(eth, f + 4, 6);                  /* DA = addr1 */
+-			memcpy(eth + 6, f + 10, 6);             /* SA = addr2 (from the AP, to-DS 0) */
+-			eth[12] = 0x88;
+-			eth[13] = 0x8e;
++			memcpy(eth + 6, f + 16, 6);             /* SA = addr3 */
++			eth[12] = l[6];
++			eth[13] = l[7];
+ 			memcpy(eth + 14, l + 8, plen);
+-			eapol_rx(eth, 14 + plen);
++			data_rx(eth, 14 + plen);
+ 		}
+ 	}
+ }
+@@ -1676,89 +1904,123 @@ bss_security(const struct wl_bss *e)
+ 	return (e->capinfo & 0x10) ? "WEP" : "open";
+ }
+ 
++/* ---- events not awaited by a command ---- */
++
++static void sta_scan_done_locked(void);
++
++static void
++wifi_event(const uint8_t *ev, uint32_t got)
++{
++	const uint8_t *e = ev + 20, *d = ev + 32;
++	wl.events++;
++	switch (e[4]) {
++	case EID_SCAN_DONE:
++		if (wl.scanBusy && got >= 38 && d[0] == wl.scanSeq) {
++			wl.scanBusy = false;
++			wl.scanStatus = 0;
++			sta_scan_done_locked();
++		}
++		break;
++	case EID_BSS_BEACON_TIMEOUT:
++		if (sj.link || sj.state) {
++			printf("VIVA WIFI: beacon timeout (bss %u, reason %u)\n", d[0], d[1]);
++			if (sj.link) {
++				vn.bits |= NOTE_DOWN;
++				vn.reason = 4;
++			}
++			sj.link = false;
++			sj.state = 0;
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++/* ---- scan ---- */
++
++/* SCAN_REQ_V2 (1188 B, MT6781-WIFI-CMDS.md §4.1); completion: wifi_event(EID_SCAN_DONE). */
+ static int
+-wifi_do_scan(const char *ssid, bool only2g, char *out, size_t len, size_t *po)
++scan_send(const uint8_t *ssid, uint32_t ssid_len, const uint8_t *chans, uint32_t nch, bool passive, char *out,
++    size_t len, size_t *po)
+ {
+ 	static uint8_t req[1188];
+-	static uint8_t ev[RX_BUF_LEN];
+-	size_t o = *po;
+ 	bzero(req, sizeof(req));
+ 	req[0] = ++wl.scanSeq;
+ 	req[1] = 0;                                     /* BSS 0 */
+-	req[2] = 1;                                     /* active */
++	req[2] = passive ? 0 : 1;
+ 	req[3] = 1;                                     /* wildcard SSID */
+-	if (ssid && *ssid) {
+-		uint32_t sl = (uint32_t)MIN(strlen(ssid), (size_t)32);
+-		req[3] = 4;                                 /* specified + wildcard */
++	if (ssid_len) {
++		uint32_t sl = MIN(ssid_len, 32u);
++		req[3] = 4;                             /* specified + wildcard */
+ 		req[4] = 1;
+ 		memcpy(req + 8, &sl, 4);
+ 		memcpy(req + 12, ssid, sl);
+ 	}
+ 	req[6] = 0x02;                                  /* DBDC scan disabled */
+ 	req[7] = 1;                                     /* auVersion */
+-	if (only2g) {
+-		req[158] = 4;                           /* specified channels 1-13 */
+-		req[159] = 13;
+-		for (int c = 1; c <= 13; c++) {
+-			req[160 + 2 * (c - 1)] = 1;
+-			req[161 + 2 * (c - 1)] = (uint8_t)c;
++	if (nch > 0 && nch <= 32) {
++		req[158] = 4;                           /* specified channels: {band, channel} */
++		req[159] = (uint8_t)nch;
++		for (uint32_t i = 0; i < nch; i++) {
++			req[160 + 2 * i] = chans[i] <= 14 ? 1 : 2;
++			req[161 + 2 * i] = chans[i];
+ 		}
+ 	}
+ 	memset(req + 1112, 0xff, 6);                    /* aucBSSID */
+ 	wl.scanGen++;
+-	uint32_t frames0 = wl.frames;
+-	int ret = -1;
+-	if (wifi_cmd(CID_SCAN_REQ_V2, true, req, sizeof(req), 0, NULL, 0, 0, out, len, &o) != 0) {
+-		goto done;
+-	}
+-	for (uint32_t t = 0; t < 15000;) {
+-		int kind;
+-		uint32_t got = rx_next(ev, sizeof(ev), 10000, &kind);
+-		if (got == 0) {
+-			t += 10;
+-			continue;
+-		}
+-		if (kind == PKT_EVENT) {
+-			uint8_t *e = ev + 20, *d = ev + 32;
+-			if (e[4] == EID_SCAN_DONE && d[0] == wl.scanSeq) {
+-				say("scan: done (state %u, %u channels, %u beacons/responses received)\n", d[5], d[4],
+-				    wl.frames - frames0);
+-				ret = 0;
+-				goto done;
+-			}
+-			if (e[4] != 0x07) {
+-				say("scan: event 0x%02x (%u bytes)\n", e[4], got);
+-			}
+-		}
++	if (wifi_cmd(CID_SCAN_REQ_V2, true, req, sizeof(req), 0, NULL, 0, 0, out, len, po) != 0) {
++		return -1;
+ 	}
+-	say("scan: no SCAN_DONE in 15 s (%u frames received)\n", wl.frames - frames0);
+-done:
+-	*po = o;
+-	return ret;
++	wl.scanBusy = true;
++	wl.scanDeadline = mach_absolute_time() + ms_abs(12000);
++	return 0;
+ }
+ 
+-static size_t
+-wifi_scan(const char *args, char *out, size_t len, size_t o)
++/* Pump RX until the scan is done (USB link and joins). */
++static int
++scan_wait(uint32_t ms)
+ {
+-	if (!wl.init) {
+-		say("scan: wifi init first\n");
+-		return o;
+-	}
+-	while (*args == ' ') {
+-		args++;
++	uint8_t *ev = wcmd_ev;
++	uint64_t end = mach_absolute_time() + ms_abs(ms);
++	while (wl.scanBusy && mach_absolute_time() < end) {
++		int kind;
++		(void)rx_next(ev, RX_BUF_LEN, 10000, &kind);
+ 	}
+-	bool only2g = strncmp(args, "2g", 2) == 0;
+-	if (only2g) {
+-		args += 2;
+-		while (*args == ' ') {
+-			args++;
+-		}
++	if (wl.scanBusy) {
++		wl.scanBusy = false;
++		wl.scanStatus = -1;
++		sta_scan_done_locked();
++		return -1;
+ 	}
+-	(void)wifi_do_scan(args, only2g, out, len, &o);
+-	/* strongest first */
++	return 0;
++}
++
++static void
++bss_to_vwl(const struct wl_bss *e, struct vwl_bss *v, uint64_t now)
++{
++	memcpy(v->bssid, e->bssid, 6);
++	memcpy(v->ssid, e->ssid, 32);
++	v->ssid_len = e->ssid_len;
++	v->ch = e->ch;
++	v->rssi = e->rssi;
++	v->capinfo = e->capinfo;
++	v->bintval = e->bintval;
++	v->ie_len = e->ie_len;
++	memcpy(v->ie, e->ie, e->ie_len);
++	uint64_t ns;
++	absolutetime_to_nanoseconds(now - e->when, &ns);
++	v->age_ms = (uint32_t)MIN(ns / NSEC_PER_MSEC, (uint64_t)UINT32_MAX);
++}
++
++/* Results for SCAN_RESULT: what was heard in the last 30 s (strongest first). */
++static void
++sta_scan_done_locked(void)
++{
++	uint64_t now = mach_absolute_time(), old = ms_abs(30000);
+ 	uint8_t order[WL_MAX_BSS], m = 0;
+ 	for (uint32_t i = 0; i < wl.nbss; i++) {
+-		if (wl.bss[i].seen == wl.scanGen) {
++		if (wl.bss[i].ssid_len > 0 && now - wl.bss[i].when < old) {
+ 			order[m++] = (uint8_t)i;
+ 		}
+ 	}
+@@ -1769,62 +2031,1361 @@ wifi_scan(const char *args, char *out, size_t len, size_t o)
+ 			order[j - 1] = t;
+ 		}
+ 	}
+-	say("scan: %u networks\n", m);
++	lck_mtx_lock(&vs_mtx);
+ 	for (uint32_t i = 0; i < m; i++) {
+-		const struct wl_bss *e = &wl.bss[order[i]];
+-		say("%4d dBm ch %3u %02x:%02x:%02x:%02x:%02x:%02x %-9s %.*s\n", e->rssi, e->ch, e->bssid[0], e->bssid[1],
+-		    e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5], bss_security(e), e->ssid_len, e->ssid);
++		bss_to_vwl(&wl.bss[order[i]], &vs.res[i], now);
+ 	}
+-	return o;
++	vs.nres = m;
++	lck_mtx_unlock(&vs_mtx);
++	vn.bits |= NOTE_SCAN;
+ }
+ 
+-void
+-viva_wifi_link(const char *args, char *out, size_t len)
++/* ---- join ---- */
++
++static int  hw_ch_privilege(bool get);                 /* below, chip specific */
++static int  hw_sta_rec(uint8_t state);
++static void hw_sta_remove(void);
++static int  hw_bss_info(bool connected);
++static void hw_pm_connected(bool connected);
++static int  hw_key(bool pairwise, uint8_t keyid, const uint8_t *key, uint32_t klen, const uint8_t *rsc);
++static void hw_wmm(void);
++
++static const uint8_t rsn_psk_ccmp[] = { 0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
++	                                0x01, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x00, 0x00 };
++
++/* The AP's RSN IE allows WPA2-PSK with CCMP pairwise: our IE = PSK, CCMP, the AP's group cipher. */
++static bool
++rsn_choose(const struct wl_bss *e)
+ {
+-	size_t o = 0;
+-	if (len == 0) {
+-		return;
++	const uint8_t *r = ie_find(e->ie, e->ie_len, 48, NULL);
++	if (r == NULL || r[1] < 18) {
++		return false;
+ 	}
+-	out[0] = 0;
+-	while (*args == ' ') {
+-		args++;
++	uint32_t end = 2 + r[1], pc = r[8] | r[9] << 8, a = 10 + 4 * pc;
++	bool ccmp = false, psk = false;
++	for (uint32_t i = 0; i < pc && 10 + 4 * i + 4 <= end; i++) {
++		ccmp |= memcmp(r + 10 + 4 * i, "\x00\x0f\xac\x04", 4) == 0;
+ 	}
+-	if (strncmp(args, "on", 2) == 0) {
+-		printf("VIVA WIFI: power on\n");
+-		o = wifi_on(out, len, o);
+-		printf("%s", out);
+-	} else if (strncmp(args, "wmt", 3) == 0) {
+-		printf("VIVA WIFI: WMT over STP/BTIF\n");
+-		o = wifi_wmt(out, len, o);
+-		printf("%s", out);
+-	} else if (strncmp(args, "init", 4) == 0) {
+-		printf("VIVA WIFI: station init\n");
+-		o = wifi_init(out, len, o);
+-		printf("%s", out);
+-	} else if (strncmp(args, "scan", 4) == 0) {
+-		o = wifi_scan(args + 4, out, len, o);
+-		printf("%s", out);
+-	} else if (strncmp(args, "cap", 3) == 0) {
+-		o = wifi_cap(out, len, o);
+-		printf("%s", out);
+-	} else if (strncmp(args, "fw", 2) == 0) {
+-		printf("VIVA WIFI: firmware download\n");
+-		o = wifi_fw(out, len, o);
+-		printf("%s", out);
+-	} else if (strncmp(args, "off", 3) == 0) {
+-		o = wifi_off(out, len, o);
+-		printf("%s", out);
+-	} else if (strncmp(args, "detect", 6) == 0) {
+-		if (vw.on) {
+-			snprintf(out, len, "detect: CONN is on (wifi off first)\n");
+-			return;
++	if (a + 2 > end) {
++		return false;
++	}
++	uint32_t ac = r[a] | r[a + 1] << 8;
++	for (uint32_t i = 0; i < ac && a + 2 + 4 * i + 4 <= end; i++) {
++		psk |= memcmp(r + a + 2 + 4 * i, "\x00\x0f\xac\x02", 4) == 0;
++	}
++	if (!ccmp || !psk) {
++		return false;
++	}
++	memcpy(sj.rsnie, rsn_psk_ccmp, sizeof(rsn_psk_ccmp));
++	memcpy(sj.rsnie + 4, r + 4, 4);                 /* group cipher as the AP says (CCMP or TKIP) */
++	sj.rsnie_len = sizeof(rsn_psk_ccmp);
++	return true;
++}
++
++static struct wl_bss *
++bss_pick(const struct vwl_join *j)
++{
++	static const uint8_t zero[6];
++	struct wl_bss *best = NULL;
++	uint64_t now = mach_absolute_time(), old = ms_abs(60000);
++	for (uint32_t i = 0; i < wl.nbss; i++) {
++		struct wl_bss *e = &wl.bss[i];
++		if (now - e->when > old || e->ssid_len != j->ssid_len || memcmp(e->ssid, j->ssid, j->ssid_len) != 0) {
++			continue;
+ 		}
+-		printf("VIVA WIFI: a-die detection\n");
+-		o = wifi_detect(out, len, o);
+-		printf("%s", out);
+-	} else {
+-		o = wifi_status(out, len, o);
++		if (memcmp(j->bssid, zero, 6) != 0 && memcmp(j->bssid, e->bssid, 6) != 0) {
++			continue;
++		}
++		if (best == NULL || e->rssi > best->rssi) {
++			best = e;
++		}
++	}
++	return best;
++}
++
++/* Wait for the AP's management frame fc (pumping RX); its length, 0 on timeout. */
++static uint32_t
++wait_mgmt(uint8_t fc, uint32_t ms)
++{
++	uint8_t *ev = wcmd_ev;
++	uint64_t end = mach_absolute_time() + ms_abs(ms);
++	sj.mgmtLen = 0;
++	while (mach_absolute_time() < end && sj.state != 0) {
++		int kind;
++		(void)rx_next(ev, RX_BUF_LEN, 5000, &kind);
++		if (sj.mgmtLen && sj.mgmt[0] == fc) {
++			return sj.mgmtLen;
++		}
++	}
++	return 0;
++}
++
++static void
++sta_teardown(void)
++{
++	if (sj.staRec) {
++		hw_pm_connected(false);
++		(void)hw_bss_info(false);
++		hw_sta_remove();
++		sj.staRec = false;
++	}
++	if (sj.chHeld) {
++		(void)hw_ch_privilege(false);
++		sj.chHeld = false;
++	}
++}
++
++static void
++sta_fail(uint8_t result, const char *why, char *out, size_t len, size_t *po)
++{
++	size_t o = *po;
++	say("join: FAILED (%s), result %u\n", why, result);
++	sta_teardown();
++	sj.state = 0;
++	sj.link = false;
++	sj.result = result;
++	vn.bits |= NOTE_ASSOC;
++	vn.assoc = result;
++	*po = o;
++}
++
++static void
++sta_up(char *out, size_t len, size_t *po)
++{
++	size_t o = *po;
++	if (sj.chHeld) {
++		(void)hw_ch_privilege(false);           /* gen4m keeps it ~4 s after the grant; done once keyed */
++		sj.chHeld = false;
++	}
++	sj.state = 4;
++	sj.link = true;
++	sj.result = 1;
++	vn.bits |= NOTE_ASSOC;
++	vn.assoc = 1;
++	say("join: CONNECTED to \"%.*s\" %02x:%02x:%02x:%02x:%02x:%02x ch %u aid %u%s\n", sj.ap.ssid_len, sj.ap.ssid,
++	    sj.ap.bssid[0], sj.ap.bssid[1], sj.ap.bssid[2], sj.ap.bssid[3], sj.ap.bssid[4], sj.ap.bssid[5], sj.ap.ch,
++	    sj.aid, sj.rsn ? ", WPA2 keys installed" : " (open)");
++	*po = o;
++}
++
++/* Association request body: capability, listen interval, SSID, rates, RSN, HT capabilities, WMM. */
++static uint32_t
++assoc_req(uint8_t *f)
++{
++	mgmt_hdr(f, 0x00);
++	uint8_t *p = f + 24;
++	uint16_t cap = (uint16_t)(0x0001 | (sj.ap.capinfo & (0x0010 | 0x0020 | 0x0400)));   /* ESS, privacy, short */
++	*p++ = (uint8_t)cap;
++	*p++ = (uint8_t)(cap >> 8);
++	*p++ = 10;                                      /* listen interval */
++	*p++ = 0;
++	*p++ = 0;
++	*p++ = sj.ap.ssid_len;
++	memcpy(p, sj.ap.ssid, sj.ap.ssid_len);
++	p += sj.ap.ssid_len;
++	uint32_t n1 = MIN(sj.nrates, 8u);
++	*p++ = 1;
++	*p++ = (uint8_t)n1;
++	memcpy(p, sj.rates, n1);
++	p += n1;
++	if (sj.nrates > 8) {
++		*p++ = 50;
++		*p++ = (uint8_t)(sj.nrates - 8);
++		memcpy(p, sj.rates + 8, sj.nrates - 8);
++		p += sj.nrates - 8;
++	}
++	if (sj.rsn) {
++		memcpy(p, sj.rsnie, sj.rsnie_len);
++		p += sj.rsnie_len;
++	}
++	if (sj.ht) {
++		/* HT capabilities (gen4m rlmFillHtCapIE on 1x1, 20 MHz): SM power save disabled, SGI-20, RX STBC 1,
++		 * A-MPDU 64 KiB, MCS 0-7 */
++		static const uint8_t htcap[28] = { 45, 26, 0x2c, 0x01, 0x03, 0xff };
++		memcpy(p, htcap, sizeof(htcap));
++		p += sizeof(htcap);
++	}
++	if (sj.wmm) {
++		static const uint8_t wmm[9] = { 0xdd, 0x07, 0x00, 0x50, 0xf2, 0x02, 0x00, 0x01, 0x00 };
++		memcpy(p, wmm, sizeof(wmm));
++		p += sizeof(wmm);
++	}
++	return (uint32_t)(p - f);
++}
++
++/*
++ * The host MLME (gen4m saa_fsm / ais_fsm, MT6781-WIFI-JOIN.md): channel privilege, STA record, open-system
++ * authentication, association, STA record connected + BSS info + PM connected, then (WPA2) the 4-way handshake in
++ * sta_eapol() and keys, finished by sta_poll(). Runs on the worker with vw_mtx held.
++ */
++static void
++sta_join(const struct vwl_join *j, char *out, size_t len, size_t *po)
++{
++	size_t o = *po;
++	static uint8_t f[512];
++	if (sj.state != 0 || sj.link) {
++		sta_teardown();
++		sj.link = false;
++		vn.bits |= NOTE_DOWN;
++		vn.reason = 0;
++	}
++	bzero(&sj, sizeof(sj));
++	hw_reset();
++	sj.state = 2;
++	struct wl_bss *e = bss_pick(j);
++	for (int k = 0; e == NULL && k < 2; k++) {
++		say("join: \"%.*s\" not heard recently, scanning for it\n", j->ssid_len, j->ssid);
++		if (scan_send(j->ssid, j->ssid_len, NULL, 0, false, out, len, &o) == 0) {
++			(void)scan_wait(10000);
++		}
++		e = bss_pick(j);
++	}
++	if (e == NULL) {
++		sta_fail(2, "network not found", out, len, &o);
++		goto done;
++	}
++	sj.ap = *e;
++	sj.state = 2;
++	sj.rssi = e->rssi;
++	memcpy(sj.pmk, j->pmk, 32);
++	bool privacy = (e->capinfo & 0x10) != 0;
++	if (j->has_pmk) {
++		if (!rsn_choose(e)) {
++			sta_fail(2, "the AP does not offer WPA2-PSK with CCMP", out, len, &o);
++			goto done;
++		}
++		sj.rsn = true;
++	} else if (privacy) {
++		sta_fail(2, "the network needs a key", out, len, &o);
++		goto done;
++	}
++	static const uint8_t wmm_oui[4] = { 0x00, 0x50, 0xf2, 0x02 };
++	sj.ht = ie_find(e->ie, e->ie_len, 45, NULL) != NULL;
++	sj.wmm = ie_find(e->ie, e->ie_len, 0xdd, wmm_oui) != NULL;
++	for (int k = 0; k < 2; k++) {
++		const uint8_t *r = ie_find(e->ie, e->ie_len, k ? 50 : 1, NULL);
++		for (uint32_t i = 0; r && i < r[1] && sj.nrates < sizeof(sj.rates); i++) {
++			sj.rates[sj.nrates++] = r[2 + i];
++		}
++	}
++	say("join: \"%.*s\" %02x:%02x:%02x:%02x:%02x:%02x ch %u %d dBm, %s%s%s\n", e->ssid_len, e->ssid, e->bssid[0],
++	    e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5], e->ch, e->rssi, sj.rsn ? "WPA2-PSK" : "open",
++	    sj.ht ? ", HT" : "", sj.wmm ? ", WMM" : "");
++
++	if (hw_ch_privilege(true) != 0) {
++		sta_fail(2, "no channel privilege", out, len, &o);
++		goto done;
++	}
++	sj.chHeld = true;
++	if (hw_sta_rec(1) != 0) {
++		sta_fail(2, "STA record not taken", out, len, &o);
++		goto done;
++	}
++	sj.staRec = true;
++
++	/* open-system authentication: 3 tries, 300 ms each */
++	uint32_t n = 0;
++	for (int k = 0; k < 3 && n == 0; k++) {
++		mgmt_hdr(f, 0xb0);
++		bzero(f + 24, 6);
++		f[26] = 1;                              /* transaction 1 */
++		if (hw_tx(f, 30, true, false) != 0) {
++			say("join: auth frame not taken by TX ring 0\n");
++		}
++		n = wait_mgmt(0xb0, 300);
++		if (n >= 30 && (sj.mgmt[26] != 2 || sj.mgmt[24] != 0)) {
++			n = 0;                          /* not our transaction 2 */
++		}
++	}
++	if (n == 0) {
++		sta_fail(9, "no authentication response", out, len, &o);
++		goto done;
++	}
++	uint16_t status = (uint16_t)(sj.mgmt[28] | sj.mgmt[29] << 8);
++	if (status != 0) {
++		say("join: authentication refused, status %u\n", status);
++		sta_fail(2, "authentication refused", out, len, &o);
++		goto done;
++	}
++	sj.state = 3;
++
++	/* association: 3 tries, 500 ms each */
++	n = 0;
++	for (int k = 0; k < 3 && n == 0; k++) {
++		uint32_t flen = assoc_req(f);
++		(void)hw_tx(f, flen, true, false);
++		n = wait_mgmt(0x10, 500);
++	}
++	if (n < 30) {
++		sta_fail(9, "no association response", out, len, &o);
++		goto done;
++	}
++	status = (uint16_t)(sj.mgmt[26] | sj.mgmt[27] << 8);
++	if (status != 0) {
++		say("join: association refused, status %u\n", status);
++		sta_fail(2, "association refused", out, len, &o);
++		goto done;
++	}
++	sj.aid = (uint16_t)((sj.mgmt[28] | sj.mgmt[29] << 8) & 0x3fff);
++	{
++		/* what the AP agreed to: HT only if its response carries HT capabilities, WMM if it has the parameter IE */
++		static const uint8_t wmm_param[4] = { 0x00, 0x50, 0xf2, 0x02 };
++		const uint8_t *ies = sj.mgmt + 30;
++		uint32_t il = n - 30;
++		sj.ht = sj.ht && ie_find(ies, il, 45, NULL) != NULL;
++		sj.wmm = sj.wmm && ie_find(ies, il, 0xdd, wmm_param) != NULL;
++	}
++	hw_wmm();
++	if (hw_bss_info(true) != 0 || hw_sta_rec(3) != 0) {
++		sta_fail(2, "firmware refused the connected state", out, len, &o);
++		goto done;
++	}
++	hw_pm_connected(true);
++	say("join: associated, aid %u%s%s\n", sj.aid, sj.ht ? ", HT" : "", sj.wmm ? ", WMM" : "");
++	if (!sj.rsn) {
++		sta_up(out, len, &o);
++		goto done;
++	}
++	viva_wpa_start(&sj.wpa, sj.pmk, sj.ap.bssid, wl.mac, sj.rsnie, sj.rsnie_len);
++	sj.deadline = mach_absolute_time() + ms_abs(EAPOL_MS);
++	say("join: waiting for the 4-way handshake\n");
++done:
++	*po = o;
++}
++
++/* An EAPOL frame from the AP (802.3, header included). */
++static void
++sta_eapol(const uint8_t *eth, uint32_t len)
++{
++	static bool inside;                     /* hw_key() pumps RX: a retransmission arriving then is dropped */
++	sj.eapolRx++;
++	if (inside || !sj.rsn || sj.state < 3 || memcmp(eth + 6, sj.ap.bssid, 6) != 0) {
++		return;
++	}
++	inside = true;
++	int act = viva_wpa_rx(&sj.wpa, eth + 14, len - 14);
++	if (act & VIVA_WPA_SEND) {
++		(void)tx_eapol(sj.wpa.out, sj.wpa.out_len);
++		sj.sentMsg2 |= sj.wpa.state == 1;
++	}
++	if (act & VIVA_WPA_PTK) {
++		delay(30000);                           /* message 4 leaves in the clear before the key is in */
++		int e = hw_key(true, 0, sj.wpa.ptk + 32, 16, NULL);
++		printf("VIVA WIFI: PTK %s\n", e == 0 ? "installed" : "NOT installed");
++	}
++	if (act & VIVA_WPA_GTK) {
++		int e = hw_key(false, sj.wpa.gtk_idx, sj.wpa.gtk, sj.wpa.gtk_len, sj.wpa.gtk_rsc);
++		printf("VIVA WIFI: GTK %u (%u bytes) %s\n", sj.wpa.gtk_idx, sj.wpa.gtk_len, e == 0 ? "installed" : "NOT installed");
++	}
++	if ((act & VIVA_WPA_PTK) && !sj.link) {
++		char buf[256];
++		size_t o = 0;
++		sta_up(buf, sizeof(buf), &o);
++		printf("VIVA WIFI: %s", buf);
++	}
++	inside = false;
++}
++
++static void
++sta_leave(char *out, size_t len, size_t *po)
++{
++	size_t o = *po;
++	if (sj.state == 0 && !sj.link) {
++		*po = o;
++		return;
++	}
++	if (sj.link || sj.state >= 3) {
++		uint8_t f[26];
++		mgmt_hdr(f, 0xc0);
++		f[24] = 3;                              /* reason: leaving */
++		f[25] = 0;
++		(void)hw_tx(f, sizeof(f), true, sj.rsn && sj.link);
++	}
++	sta_teardown();
++	if (sj.link) {
++		vn.bits |= NOTE_DOWN;
++		vn.reason = 0;
++	}
++	say("leave: disconnected from \"%.*s\"\n", sj.ap.ssid_len, sj.ap.ssid);
++	bzero(&sj, sizeof(sj));
++	*po = o;
++}
++
++/*
++ * ---- chip-specific join commands (gen4m SOC2_1X1, ~/Developer/ios-viva/wifi/docs/MT6781-WIFI-JOIN.md) ----
++ * WTBL: 0-3 BIP, 4 the BMC entry of BSS 0 (BSS_ACTIVATE_CTRL), 5 the AP (the host picks it; STA record 0).
++ * Management frames: TX ring 15, 32-byte HW_MAC_TX_DESC + the 802.11 frame in one buffer (no WIFI_CMD half).
++ * Data: TX ring 0, the ring entry is TXD + 32-byte append (64 bytes); the 802.3 frame sits after it in the same
++ * buffer and is fetched later through the append pointer, so the buffer is only free when an MSDU report (RX
++ * packet type 6) gives its token back. Token = ring slot.
++ */
++#define WTBL_AP                 5
++#define WTBL_BMC                4
++#define WTBL_DEFAULT            31
++#define STA_IDX_AP              0
++#define CID_POWER_SAVE_MODE     0x05
++#define CID_ADD_REMOVE_KEY      0x07
++#define CID_UPDATE_BSS_INFO     0x12
++#define CID_UPDATE_STA_RECORD   0x13
++#define CID_REMOVE_STA_RECORD   0x14
++#define CID_PM_BSS_CONNECTED    0x16
++#define CID_PM_BSS_ABORT        0x17
++#define CID_CH_PRIVILEGE        0x1c
++#define CID_UPDATE_WMM_PARMS    0x1d
++#define EID_ACTIVATE_STA_REC    0x0c
++#define EID_CH_PRIVILEGE        0x10
++#define EID_ADD_PKEY_DONE       0x24
++
++static struct {
++	uint16_t busy;                  /* TX ring 0 slots whose token is out */
++	uint64_t when[RING_N];
++	uint16_t sn;                    /* management frames' sequence numbers */
++	uint8_t  chToken;
++	bool     ptk;                   /* pairwise key in: data goes out protected */
++	uint32_t reports, lost, full;
++} tx0;
++
++static void
++hw_reset(void)
++{
++	bzero(&tx0, sizeof(tx0));
++}
++
++static inline void
++put16(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++}
++
++static inline void
++put32(uint8_t *p, uint32_t v)
++{
++	put16(p, v);
++	put16(p + 2, v >> 16);
++}
++
++/* SW rate index (wlan_def.h): 1, 2, 5.5, 11, 22, 33, 6, 9, 12, 18, 24, 36, 48, 54 Mb/s in 500 kb/s units */
++static int
++rate_bit(uint8_t r)
++{
++	static const uint8_t v[14] = { 2, 4, 11, 22, 44, 66, 12, 18, 24, 36, 48, 72, 96, 108 };
++	for (int i = 0; i < 14; i++) {
++		if ((r & 0x7f) == v[i]) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++static void
++rate_sets(uint16_t *oper, uint16_t *basic)
++{
++	*oper = *basic = 0;
++	for (uint32_t i = 0; i < sj.nrates; i++) {
++		int b = rate_bit(sj.rates[i]);
++		if (b >= 0) {
++			*oper |= (uint16_t)(1u << b);
++			if (sj.rates[i] & 0x80) {
++				*basic |= (uint16_t)(1u << b);
++			}
++		}
++	}
++}
++
++/* Lowest basic rate as a fixed-rate code: CCK 1/2/5.5/11 M = 0..3, otherwise OFDM 6 M (0x4B). */
++static uint16_t
++rate_code(void)
++{
++	uint16_t oper, basic;
++	rate_sets(&oper, &basic);
++	for (int b = 0; b < 4; b++) {
++		if (basic & (1u << b)) {
++			return (uint16_t)b;
++		}
++	}
++	return 0x004b;
++}
++
++static uint8_t
++phy_set(void)
++{
++	uint16_t oper, basic;
++	rate_sets(&oper, &basic);
++	uint8_t p = 0;
++	if (sj.ap.ch > 14) {
++		p = 0x08;                               /* OFDM */
++	} else {
++		if (oper & 0x3fc0) {
++			p |= 0x02;                      /* ERP */
++		}
++		if ((oper & 0x000f) && !(basic & 0x3fc0)) {
++			p |= 0x01;                      /* HR/DSSS */
++		}
++	}
++	return p | (sj.ht ? 0x10 : 0);
++}
++
++static int
++cmd_set(uint8_t cid, const void *p, uint32_t n)
++{
++	static char junk[256];
++	size_t o = 0;
++	return wifi_cmd(cid, true, p, n, 0, NULL, 0, 0, junk, sizeof(junk), &o);
++}
++
++/* A received MSDU report (RX packet type 6): the tokens of TX ring 0 slots that are done. */
++static void
++tx_report(const uint8_t *b, uint32_t n)
++{
++	uint32_t cnt = (uint32_t)(b[2] | b[3] << 8) & 0x7f;
++	for (uint32_t i = 0; i < cnt && 8 + 4 * i + 2 <= n; i++) {
++		uint32_t tok = (uint32_t)(b[8 + 4 * i] | b[9 + 4 * i] << 8) & 0x7fff;
++		if (tok < RING_N) {
++			tx0.busy &= (uint16_t)~(1u << tok);
++		}
++	}
++	tx0.reports++;
++}
++
++/* 802.3 frame on TX ring 0 (hardware 802.3 -> 802.11 translation and CCMP with the WTBL key). */
++static int
++tx_data(const uint8_t *eth, uint32_t len, bool protect, bool lowRate)
++{
++	if (len < 14 || len > 1532) {
++		return -1;
++	}
++	uint32_t i = wd.txIdx[0];
++	if (tx0.busy & (1u << i)) {
++		/* give the reports a moment, then reuse a slot whose report never came */
++		for (int k = 0; k < 4 && (tx0.busy & (1u << i)); k++) {
++			int kind;
++			(void)rx_next(wcmd_ev, RX_BUF_LEN, 200, &kind);
++		}
++		if (tx0.busy & (1u << i)) {
++			if (mach_absolute_time() - tx0.when[i] < ms_abs(1000)) {
++				tx0.full++;
++				return -1;
++			}
++			tx0.lost++;
++		}
++	}
++	uint32_t boff = OFF_TXBUF + BUF_SZ * i;
++	uint8_t *t = wd.va + boff;
++	uint64_t pa = wd.pa + boff, fpa = pa + 64;
++	uint16_t type = (uint16_t)(eth[12] << 8 | eth[13]);
++	bzero(t, 64);
++	put16(t + 0, 32 + len);                         /* TXD + frame, the append not counted */
++	t[2] = 0x08;                                    /* ether offset ((14 - 2) + 4) / 2 */
++	t[3] = 0x04;                                    /* LMAC, queue 1 = AC_BE (WMM set 0) */
++	t[4] = WTBL_AP;
++	t[5] = type >= 0x600 ? 0x90 : 0x80;             /* long, non-802.11, Ethernet II */
++	t[7] = 0x04;                                    /* PktFt 0, own MAC 1 */
++	put16(t + 12, 0xf000 | (protect ? 0x0002 : 0));
++	if (lowRate) {
++		t[11] = 0x80;                           /* fixed rate */
++		put16(t + 26, rate_code());
++	}
++	put16(t + 32, i | 0x8000);                      /* MSDU id = token, valid */
++	put32(t + 40, (uint32_t)fpa);
++	put16(t + 44, (len & 0xfff) | (uint32_t)((fpa >> 32) & 0x7) << 12 | 0x8000);
++	memcpy(t + 64, eth, len);
++	viva_wifi_dma_flush(boff, 64 + len);
++	uint32_t *d = desc(OFF_TX(0), i);
++	d[0] = (uint32_t)pa;
++	d[1] = (64u << 16) | DESC_LASTSEC0;
++	d[2] = 0;
++	d[3] = (uint32_t)(pa >> 32) & 0xf;
++	viva_wifi_dma_flush(OFF_TX(0) + 16 * i, 16);
++	tx0.busy |= (uint16_t)(1u << i);
++	tx0.when[i] = mach_absolute_time();
++	wd.txIdx[0] = (i + 1) % RING_N;
++	wr(WF_TX_RING(0) + 8, wd.txIdx[0]);
++	return 0;
++}
++
++/* 802.11 management frame on TX ring 15 behind its own TXD (subtype from the frame control). */
++static int
++tx_mgmt(const uint8_t *f, uint32_t len)
++{
++	static uint8_t pkt[32 + 512];
++	if (len > 512) {
++		return -1;
++	}
++	uint16_t sn = tx0.sn = (uint16_t)((tx0.sn + 1) & 0xfff);
++	bzero(pkt, 32);
++	put16(pkt + 0, 32 + len);
++	pkt[2] = 0x0e;                                  /* (4 + 24) / 2 */
++	pkt[3] = 0x84;                                  /* MCU port, MCU_Q1 */
++	pkt[4] = sj.staRec ? WTBL_AP : WTBL_DEFAULT;
++	pkt[5] = 0xcc;                                  /* long, 802.11 normal, 12-word header */
++	pkt[7] = 0x06;                                  /* PktFt 2, own MAC 1 */
++	pkt[8] = (uint8_t)((f[0] >> 4) & 0xf);          /* type 0, subtype */
++	pkt[10] = 0x3d;                                 /* 2 s lifetime */
++	pkt[11] = 0x80;                                 /* fixed rate */
++	put16(pkt + 12, 0xf010);                        /* 30 tries, force TX */
++	put16(pkt + 14, 0x8000 | sn);
++	put16(pkt + 26, rate_code());
++	memcpy(pkt + 32, f, len);
++	return wfdma_tx(15, pkt, 32 + len) ? 0 : -1;
++}
++
++static int
++hw_tx(const uint8_t *frame, uint32_t len, bool mgmt, bool protect)
++{
++	if (mgmt) {
++		return tx_mgmt(frame, len);
++	}
++	bool eapol = len >= 14 && frame[12] == 0x88 && frame[13] == 0x8e;
++	if (eapol && len >= 14 + 7) {
++		/* EAPOL-Key with the pairwise bit (4-way M2/M4) never protected; group-key M2 is once the PTK is in */
++		uint16_t info = (uint16_t)(frame[14 + 5] << 8 | frame[14 + 6]);
++		protect = tx0.ptk && !(frame[14 + 1] == 3 && (info & 0x0008));
++	} else {
++		protect = protect && tx0.ptk;
++	}
++	return tx_data(frame, len, protect, eapol);
++}
++
++static int
++hw_ch_privilege(bool get)
++{
++	uint8_t p[24], ev[128];
++	static char junk[256];
++	size_t o = 0;
++	bzero(p, sizeof(p));
++	if (!get) {
++		p[1] = tx0.chToken;
++		p[2] = 1;                               /* abort */
++		p[10] = 4;
++		return cmd_set(CID_CH_PRIVILEGE, p, sizeof(p));
++	}
++	p[1] = ++tx0.chToken;
++	p[3] = sj.ap.ch;
++	p[5] = sj.ap.ch > 14 ? 2 : 1;
++	p[10] = 4;                                      /* DBDC band auto */
++	put32(p + 12, 4000);                            /* max interval, ms */
++	int n = wifi_cmd(CID_CH_PRIVILEGE, true, p, sizeof(p), EID_CH_PRIVILEGE, ev, sizeof(ev), 1000, junk, sizeof(junk), &o);
++	if (n >= 32 + 3 && ev[33] == tx0.chToken && ev[34] == 0) {
++		return 0;
++	}
++	printf("VIVA WIFI: channel %u: no grant (%d bytes, token %u/%u, status %u)\n", sj.ap.ch, n, n > 33 ? ev[33] : 0,
++	    tx0.chToken, n > 34 ? ev[34] : 0);
++	return -1;
++}
++
++static int
++hw_sta_rec(uint8_t state)
++{
++	uint8_t p[168], ev[128];
++	static char junk[256];
++	size_t o = 0;
++	uint16_t oper, basic;
++	rate_sets(&oper, &basic);
++	bzero(p, sizeof(p));
++	p[0] = STA_IDX_AP;
++	p[1] = 0x41;                                    /* legacy AP */
++	memcpy(p + 2, sj.ap.bssid, 6);
++	p[12] = 0;                                      /* BSS 0 */
++	p[13] = phy_set();
++	put16(p + 14, oper & 0x3fcf);
++	put16(p + 16, basic);
++	p[54] = WTBL_AP;
++	p[55] = 0xff;
++	p[68] = 3;                                      /* RTS policy legacy */
++	put16(p + 74, rate_code());
++	p[76] = 1;                                      /* TX A-MPDU */
++	p[77] = 0;                                      /* no RX block ack: we do not reorder */
++	put32(p + 88, 0x10);
++	p[92] = 0x40;
++	p[128] = 1;
++	p[129] = 1;
++	put32(p + 132, 8192);
++	if (state != 3) {
++		p[20] = 0;                              /* STA_STATE_1 */
++		return cmd_set(CID_UPDATE_STA_RECORD, p, sizeof(p));
++	}
++	p[20] = 2;                                      /* STA_STATE_3 */
++	p[51] = 1;                                      /* answer with EVENT_ACTIVATE_STA_REC */
++	put16(p + 8, sj.aid);
++	put16(p + 10, 10);                              /* as in our association request */
++	p[18] = (sj.wmm || sj.ht) ? 1 : 0;
++	if (sj.ht && sj.mgmtLen > 30) {
++		const uint8_t *h = ie_find(sj.mgmt + 30, sj.mgmtLen - 30, 45, NULL);
++		if (h && h[1] == 26) {
++			put16(p + 40, (uint32_t)(h[2] | h[3] << 8));    /* HT cap info */
++			p[48] = h[4];                                   /* A-MPDU parameters */
++			p[21] = h[5];                                   /* MCS 0-7 */
++			p[22] = h[9] & 1;                               /* MCS 32 */
++			memcpy(p + 24, h + 5, 10);
++			put16(p + 34, (uint32_t)(h[15] | h[16] << 8) & 0x3ff);
++			p[36] = h[17];
++			put16(p + 42, (uint32_t)(h[21] | h[22] << 8));
++			memcpy(p + 44, h + 23, 4);
++			p[49] = h[27];
++		}
++	}
++	int n = wifi_cmd(CID_UPDATE_STA_RECORD, true, p, sizeof(p), EID_ACTIVATE_STA_REC, ev, sizeof(ev), 1000, junk,
++	    sizeof(junk), &o);
++	if (n < 0) {
++		printf("VIVA WIFI: STA record (state 3): no EVENT_ACTIVATE_STA_REC, going on\n");
++	}
++	return 0;
++}
++
++static void
++hw_sta_remove(void)
++{
++	uint8_t p[4] = { 1, 27, 0, 0 };                 /* every record of BSS 0 */
++	(void)cmd_set(CID_REMOVE_STA_RECORD, p, sizeof(p));
++}
++
++/* CMD_UPDATE_WMM_PARMS from the AP's WMM parameter element in its association response. */
++static void
++hw_wmm(void)
++{
++	static const uint8_t oui[4] = { 0x00, 0x50, 0xf2, 0x02 };
++	if (!sj.wmm || sj.mgmtLen <= 30) {
++		return;
++	}
++	const uint8_t *w = ie_find(sj.mgmt + 30, sj.mgmtLen - 30, 0xdd, oui);
++	if (w == NULL || w[1] < 24 || w[6] != 1) {
++		return;                                 /* not the parameter element */
++	}
++	uint8_t p[44];
++	bzero(p, sizeof(p));
++	for (int ac = 0; ac < 4; ac++) {                /* BE, BK, VI, VO as in the element */
++		const uint8_t *r = w + 10 + 4 * ac;
++		uint8_t *q = p + 10 * ac;
++		put16(q + 0, (1u << (r[1] & 0xf)) - 1);
++		put16(q + 2, (1u << (r[1] >> 4)) - 1);
++		put16(q + 4, (uint32_t)(r[2] | r[3] << 8));
++		put16(q + 6, r[0] & 0xf);
++		q[9] = (r[0] >> 4) & 1;
++	}
++	p[41] = 1;
++	(void)cmd_set(CID_UPDATE_WMM_PARMS, p, sizeof(p));
++}
++
++static int
++hw_bss_info(bool connected)
++{
++	uint8_t p[116];
++	uint16_t oper, basic;
++	rate_sets(&oper, &basic);
++	bzero(p, sizeof(p));
++	p[1] = connected ? 0 : 1;
++	p[3] = sj.ap.ssid_len;
++	memcpy(p + 4, sj.ap.ssid, sj.ap.ssid_len);
++	memcpy(p + 36, sj.ap.bssid, 6);
++	p[42] = (sj.wmm || sj.ht) ? 1 : 0;
++	put16(p + 44, oper);
++	put16(p + 46, basic);
++	p[48] = STA_IDX_AP;
++	put16(p + 50, rate_code());
++	p[52] = sj.ap.ch > 14 ? 3 : (oper & 0x3fc0) ? 1 : 0;
++	p[53] = sj.rsn ? 7 : 0;                         /* WPA2-PSK / open */
++	p[54] = sj.rsn ? 6 : 1;                         /* CCMP enabled / encryption disabled */
++	p[55] = phy_set();
++	p[58] = WTBL_BMC;
++	/* RLM parameters at +68 */
++	p[69] = sj.ap.ch > 14 ? 2 : 1;
++	p[70] = sj.ap.ch;
++	if (connected) {
++		const uint8_t *erp = ie_find(sj.ap.ie, sj.ap.ie_len, 42, NULL);
++		const uint8_t *op = ie_find(sj.ap.ie, sj.ap.ie_len, 61, NULL);
++		p[72] = (erp && erp[1] >= 1 && (erp[2] & 0x02)) ? 1 : 0;
++		if (sj.ht && op && op[1] >= 22) {
++			uint16_t i2 = (uint16_t)(op[4] | op[5] << 8), i3 = (uint16_t)(op[6] | op[7] << 8);
++			p[73] = i2 & 0x3;
++			p[74] = (i2 & 0x4) ? 1 : 0;
++			p[75] = (op[3] & 0x08) ? 0 : 1;
++			put16(p + 76, i3);
++			put16(p + 78, i2);
++			p[80] = op[3] & (uint8_t)~0x07;  /* 20 MHz only */
++		}
++		p[81] = (sj.ap.capinfo & 0x0020) ? 1 : 0;
++		p[82] = (sj.ap.ch > 14 || (sj.ap.capinfo & 0x0400)) ? 1 : 0;
++		put16(p + 86, basic);
++	}
++	p[88] = 1;
++	p[89] = 1;
++	p[90] = 4;                                      /* DBDC band auto */
++	p[93] = 1;                                      /* NSS */
++	return cmd_set(CID_UPDATE_BSS_INFO, p, sizeof(p));
++}
++
++static void
++hw_pm_connected(bool connected)
++{
++	uint8_t p[12];
++	bzero(p, sizeof(p));
++	if (!connected) {
++		(void)cmd_set(CID_PM_BSS_ABORT, p, 4);
++		return;
++	}
++	const uint8_t *tim = ie_find(sj.ap.ie, sj.ap.ie_len, 5, NULL);
++	p[1] = (tim && tim[1] >= 2 && tim[3]) ? tim[3] : 1;
++	put16(p + 2, sj.aid);
++	put16(p + 4, sj.ap.bintval ? sj.ap.bintval : 100);
++	(void)cmd_set(CID_PM_BSS_CONNECTED, p, sizeof(p));
++	uint8_t cam[4] = { 0, 0, 0, 0 };                /* power save: CAM while we poll */
++	(void)cmd_set(CID_POWER_SAVE_MODE, cam, sizeof(cam));
++}
++
++static int
++hw_key(bool pairwise, uint8_t keyid, const uint8_t *key, uint32_t klen, const uint8_t *rsc)
++{
++	uint8_t p[64], ev[128];
++	static char junk[256];
++	size_t o = 0;
++	(void)rsc;                                      /* gen4m never sends it for CCMP */
++	if (klen != 16 && klen != 32) {
++		return -1;
++	}
++	bzero(p, sizeof(p));
++	p[0] = 1;
++	p[1] = pairwise ? 1 : 0;
++	p[2] = pairwise ? 1 : 0;
++	memcpy(p + 4, sj.ap.bssid, 6);
++	p[11] = klen == 32 ? 2 : 4;                     /* TKIP (group only) / CCMP */
++	p[12] = keyid;
++	p[13] = (uint8_t)klen;
++	p[14] = pairwise ? WTBL_AP : WTBL_BMC;
++	memcpy(p + 16, key, klen);
++	int n = wifi_cmd(CID_ADD_REMOVE_KEY, true, p, sizeof(p), pairwise ? EID_ADD_PKEY_DONE : 0, ev, sizeof(ev), 500, junk,
++	    sizeof(junk), &o);
++	bzero(p, sizeof(p));
++	if (pairwise) {
++		tx0.ptk = true;
++		if (n < 0) {
++			printf("VIVA WIFI: no ADD_PKEY_DONE for the PTK, going on\n");
++		}
++	}
++	return n < 0 && !pairwise ? -1 : 0;
++}
++
++
++/* ---- the worker ---- */
++
++static size_t
++wifi_up(char *out, size_t len, size_t o)
++{
++	if (!vw.on) {
++		o = wifi_on(out, len, o);
++		if (!vw.on || rd(CONN_MCU_COM_REG0) != CONN_IDLE_MAGIC) {
++			return o;
++		}
++	}
++	if (!vw.wmt) {
++		o = wifi_wmt(out, len, o);
++		if (!vw.wmt) {
++			return o;
++		}
++	}
++	if ((rd(WF_READY) & 0x6) != 0x6) {
++		o = wifi_fw(out, len, o);
++		if ((rd(WF_READY) & 0x6) != 0x6) {
++			return o;
++		}
++	}
++	if (!wl.init) {
++		o = wifi_init(out, len, o);
++	}
++	return o;
++}
++
++/* Status for the ioctls (vw_mtx held). */
++static void
++st_publish(void)
++{
++	struct vwl_status s;
++	bzero(&s, sizeof(s));
++	s.state = sj.state ? sj.state : (wl.scanBusy ? 1 : 0);
++	s.link = sj.link;
++	s.result = sj.result;
++	s.rsn = sj.rsn;
++	s.ch = sj.ap.ch;
++	s.rssi = sj.rssi;
++	s.rate = sj.ht ? 72 : 54;
++	memcpy(s.ssid, sj.ap.ssid, 32);
++	s.ssid_len = sj.ap.ssid_len;
++	memcpy(s.bssid, sj.ap.bssid, 6);
++	memcpy(s.mac, wl.mac, 6);
++	s.txFrames = sj.tx;
++	s.rxFrames = sj.rx;
++	s.txDrops = sj.txDrops;
++	lck_mtx_lock(&vs_mtx);
++	s.power = vs.want;
++	vs.st = s;
++	if (sj.state || sj.link) {
++		bss_to_vwl(&sj.ap, &vs.cur, mach_absolute_time());
++		vs.cur.rssi = sj.rssi;
++	}
++	lck_mtx_unlock(&vs_mtx);
++}
++
++/* Drop vw_mtx, then tell viva_wlan.c what happened (events, received frames). */
++static void
++vw_unlock(void)
++{
++	st_publish();
++	uint32_t bits = vn.bits;
++	int assoc = vn.assoc;
++	uint32_t reason = vn.reason;
++	bool power = vn.power;
++	mbuf_t rx = vn.rxHead;
++	bzero(&vn, sizeof(vn));
++	lck_mtx_unlock(&vw_mtx);
++
++	if (bits & NOTE_POWER) {
++		viva_wlan_power(power);
++	}
++	if (bits & NOTE_DOWN) {
++		viva_wlan_link(false, reason);
++	}
++	if (bits & NOTE_SCAN) {
++		viva_wlan_scan_done(0);
++	}
++	if (bits & NOTE_ASSOC) {
++		viva_wlan_assoc_done(assoc);
++	}
++	while (rx != NULL) {
++		mbuf_t next = mbuf_nextpkt(rx);
++		mbuf_setnextpkt(rx, NULL);
++		viva_wlan_input(rx);
++		rx = next;
++	}
++}
++
++static uint8_t tx_buf[2048];
++
++/* One iteration: requests, then RX, the TX queue and the timers. Returns true when there is more to do soon. */
++static bool
++sta_step(char *out, size_t len, size_t *po)
++{
++	size_t o = *po;
++	lck_mtx_lock(&vs_mtx);
++	uint32_t req = vs.req;
++	bool want = vs.want;
++	struct vwl_scan sc = vs.scan;
++	struct vwl_join jn = vs.join;
++	vs.req = 0;
++	bzero(&vs.join, sizeof(vs.join));
++	lck_mtx_unlock(&vs_mtx);
++
++	if (req & (REQ_POWER | REQ_POWER_EVENT)) {
++		bool changed = false;
++		if (want && !wl.init) {
++			o = wifi_up(out, len, o);
++			say("power: radio %s\n", wl.init ? "UP" : "FAILED to come up");
++			if (!wl.init && vw.on) {
++				o = wifi_off(out, len, o);      /* the next request tries again from scratch */
++			}
++			changed = wl.init;
++		} else if (!want && vw.on) {
++			sta_leave(out, len, &o);
++			o = wifi_off(out, len, o);
++			say("power: radio off\n");
++			changed = true;
++		}
++		if (changed || (req & REQ_POWER_EVENT)) {
++			vn.bits |= NOTE_POWER;
++			vn.power = want;
++		}
++	}
++	if (wl.init && (req & REQ_LEAVE)) {
++		sta_leave(out, len, &o);
++	}
++	if (wl.init && (req & REQ_JOIN)) {
++		sta_join(&jn, out, len, &o);
++	} else if (req & REQ_JOIN) {
++		sj.result = 2;
++		vn.bits |= NOTE_ASSOC;
++		vn.assoc = 2;
++	}
++	bzero(&jn, sizeof(jn));
++	if (req & REQ_SCAN) {
++		if (!wl.init) {
++			vn.bits |= NOTE_SCAN;           /* radio off: an empty answer */
++		} else if (!wl.scanBusy && sj.state != 2 && sj.state != 3) {
++			if (scan_send(sc.ssid, sc.ssid_len, sc.ch, sc.nch, sc.passive, out, len, &o) != 0) {
++				sta_scan_done_locked();
++			}
++		}
++	}
++	if (!wl.init) {
++		*po = o;
++		return false;
++	}
++
++	/* RX: up to 64 packets */
++	for (int k = 0; k < 64; k++) {
++		int kind;
++		if (rx_next(wcmd_ev, RX_BUF_LEN, 0, &kind) == 0) {
++			break;
++		}
++	}
++	/* TX queue */
++	for (int k = 0; k < 64; k++) {
++		lck_mtx_lock(&vs_mtx);
++		mbuf_t m = vs.txHead;
++		if (m != NULL) {
++			vs.txHead = mbuf_nextpkt(m);
++			if (vs.txHead == NULL) {
++				vs.txTail = NULL;
++			}
++			vs.txn--;
++		}
++		lck_mtx_unlock(&vs_mtx);
++		if (m == NULL) {
++			break;
++		}
++		mbuf_setnextpkt(m, NULL);
++		size_t mlen = mbuf_pkthdr_len(m);
++		if (sj.link && mlen >= 14 && mlen <= sizeof(tx_buf) && mbuf_copydata(m, 0, mlen, tx_buf) == 0 &&
++		    hw_tx(tx_buf, (uint32_t)mlen, false, sj.rsn) == 0) {
++			sj.tx++;
++		} else {
++			sj.txDrops++;
++		}
++		mbuf_freem(m);
++	}
++	/* timers */
++	uint64_t now = mach_absolute_time();
++	if (wl.scanBusy && now > wl.scanDeadline) {
++		wl.scanBusy = false;
++		wl.scanStatus = -1;
++		say("scan: no SCAN_DONE (timeout)\n");
++		sta_scan_done_locked();
++	}
++	if (sj.state == 3 && sj.rsn && !sj.link && sj.deadline && now > sj.deadline) {
++		sta_fail(sj.sentMsg2 && sj.wpa.state == 1 ? 21 : 22, sj.sentMsg2 ? "no message 3 (wrong password?)" :
++		    "no EAPOL from the AP", out, len, &o);
++	}
++	if (sj.state == 0 && (sj.staRec || sj.chHeld)) {
++		sta_teardown();                         /* the AP left us (deauth, beacon timeout) */
++	}
++	*po = o;
++	return wl.scanBusy || (sj.state != 0 && !sj.link) || vs.txn;
++}
++
++static void
++vw_worker(__unused void *arg, __unused wait_result_t wr)
++{
++	static char log[2048];
++	for (;;) {
++		size_t o = 0;
++		log[0] = 0;
++		lck_mtx_lock(&vw_mtx);
++		bool busy = sta_step(log, sizeof(log), &o);
++		bool up = wl.init, link = sj.link;
++		vw_unlock();
++		if (log[0]) {
++			printf("VIVA WIFI: %s", log);
++		}
++		struct timespec ts = { 0, (busy ? 1 : link ? 2 : 20) * NSEC_PER_MSEC };
++		lck_mtx_lock(&vs_mtx);
++		if (vs.req == 0 && vs.txn == 0) {
++			(void)msleep(&vw_chan, &vs_mtx, PZERO | PDROP, "vivawifi", up ? &ts : NULL);
++		} else {
++			lck_mtx_unlock(&vs_mtx);
++		}
++	}
++}
++
++/* vs_mtx held */
++static void
++vw_kick_locked(uint32_t req)
++{
++	vs.req |= req;
++	if (!vs.worker) {
++		thread_t th;
++		if (kernel_thread_start(vw_worker, NULL, &th) == KERN_SUCCESS) {
++			vs.worker = true;
++			thread_deallocate(th);
++		}
++	}
++	wakeup(&vw_chan);
++}
++
++/* ---- API for viva_wlan.c ---- */
++
++int
++viva_wifi_set_power(bool on)
++{
++	lck_mtx_lock(&vs_mtx);
++	vs.want = on;
++	vw_kick_locked(REQ_POWER | REQ_POWER_EVENT);
++	lck_mtx_unlock(&vs_mtx);
++	return 0;
++}
++
++int
++viva_wifi_scan(const struct vwl_scan *s)
++{
++	lck_mtx_lock(&vs_mtx);
++	if (!vs.want) {
++		lck_mtx_unlock(&vs_mtx);
++		return EPWROFF;
++	}
++	vs.scan = *s;
++	vw_kick_locked(REQ_SCAN | REQ_POWER);
++	lck_mtx_unlock(&vs_mtx);
++	return 0;
++}
++
++int
++viva_wifi_scan_result(uint32_t i, struct vwl_bss *out)
++{
++	int err = ENOENT;
++	lck_mtx_lock(&vs_mtx);
++	if (i < vs.nres) {
++		*out = vs.res[i];
++		err = 0;
++	}
++	lck_mtx_unlock(&vs_mtx);
++	return err;
++}
++
++int
++viva_wifi_current_bss(struct vwl_bss *out)
++{
++	lck_mtx_lock(&vs_mtx);
++	*out = vs.cur;
++	lck_mtx_unlock(&vs_mtx);
++	return 0;
++}
++
++int
++viva_wifi_join(const struct vwl_join *j)
++{
++	lck_mtx_lock(&vs_mtx);
++	if (!vs.want) {
++		lck_mtx_unlock(&vs_mtx);
++		return EPWROFF;
++	}
++	vs.join = *j;
++	vs.st.result = 0;                               /* running, until the worker says otherwise */
++	vs.st.state = 2;
++	vw_kick_locked(REQ_JOIN | REQ_POWER);
++	lck_mtx_unlock(&vs_mtx);
++	return 0;
++}
++
++void
++viva_wifi_leave(void)
++{
++	lck_mtx_lock(&vs_mtx);
++	vw_kick_locked(REQ_LEAVE);
++	lck_mtx_unlock(&vs_mtx);
++}
++
++void
++viva_wifi_get_status(struct vwl_status *s)
++{
++	lck_mtx_lock(&vs_mtx);
++	*s = vs.st;
++	s->power = vs.want;
++	lck_mtx_unlock(&vs_mtx);
++}
++
++void
++viva_wifi_output(mbuf_t m)
++{
++	lck_mtx_lock(&vs_mtx);
++	if (vs.txn >= 256) {
++		lck_mtx_unlock(&vs_mtx);
++		mbuf_freem(m);
++		return;
++	}
++	mbuf_setnextpkt(m, NULL);
++	if (vs.txTail) {
++		mbuf_setnextpkt(vs.txTail, m);
++	} else {
++		vs.txHead = m;
++	}
++	vs.txTail = m;
++	vs.txn++;
++	wakeup(&vw_chan);
++	lck_mtx_unlock(&vs_mtx);
++}
++
++/* ---- USB link ---- */
++
++static size_t
++wifi_scan(const char *args, char *out, size_t len, size_t o)
++{
++	if (!wl.init) {
++		say("scan: wifi init first (or wifi up)\n");
++		return o;
++	}
++	while (*args == ' ') {
++		args++;
++	}
++	bool only2g = strncmp(args, "2g", 2) == 0;
++	if (only2g) {
++		args += 2;
++		while (*args == ' ') {
++			args++;
++		}
++	}
++	static const uint8_t ch2g[13] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
++	uint32_t frames0 = wl.frames;
++	if (scan_send((const uint8_t *)args, (uint32_t)strlen(args), only2g ? ch2g : NULL, only2g ? 13 : 0, false, out,
++	    len, &o) != 0) {
++		return o;
++	}
++	int r = scan_wait(15000);
++	say("scan: %s (%u beacons/responses received)\n", r == 0 ? "done" : "no SCAN_DONE in 15 s", wl.frames - frames0);
++	/* strongest first, this scan only */
++	uint8_t order[WL_MAX_BSS], m = 0;
++	for (uint32_t i = 0; i < wl.nbss; i++) {
++		if (wl.bss[i].seen == wl.scanGen) {
++			order[m++] = (uint8_t)i;
++		}
++	}
++	for (uint32_t i = 1; i < m; i++) {
++		for (uint32_t j = i; j > 0 && wl.bss[order[j]].rssi > wl.bss[order[j - 1]].rssi; j--) {
++			uint8_t t = order[j];
++			order[j] = order[j - 1];
++			order[j - 1] = t;
++		}
++	}
++	say("scan: %u networks\n", m);
++	for (uint32_t i = 0; i < m; i++) {
++		const struct wl_bss *e = &wl.bss[order[i]];
++		say("%4d dBm ch %3u %02x:%02x:%02x:%02x:%02x:%02x %-9s %.*s\n", e->rssi, e->ch, e->bssid[0], e->bssid[1],
++		    e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5], bss_security(e), e->ssid_len, e->ssid);
++	}
++	return o;
++}
++
++/* wifi join SSID [PASSPHRASE]: the same join wifid asks for (synchronous here, with the handshake). */
++static size_t
++wifi_join_link(const char *args, char *out, size_t len, size_t o)
++{
++	if (!wl.init) {
++		say("join: wifi up first\n");
++		return o;
++	}
++	while (*args == ' ') {
++		args++;
++	}
++	struct vwl_join j;
++	bzero(&j, sizeof(j));
++	const char *sp = strchr(args, ' ');
++	size_t sl = sp ? (size_t)(sp - args) : strlen(args);
++	if (sl == 0 || sl > 32) {
++		say("join: usage wifi join SSID [PASSPHRASE] (SSID without spaces)\n");
++		return o;
++	}
++	memcpy(j.ssid, args, sl);
++	j.ssid_len = (uint8_t)sl;
++	if (sp) {
++		const char *pass = sp + 1;
++		size_t pl = strlen(pass);
++		if (pl < 8 || pl > 63) {
++			say("join: the passphrase must be 8..63 characters\n");
++			return o;
++		}
++		viva_wpa_pmk(pass, j.ssid, j.ssid_len, j.pmk);
++		j.has_pmk = 1;
++	}
++	sta_join(&j, out, len, &o);
++	bzero(&j, sizeof(j));
++	/* the handshake: pump RX until connected or failed */
++	while (sj.state == 3 && !sj.link) {
++		int kind;
++		(void)rx_next(wcmd_ev, RX_BUF_LEN, 10000, &kind);
++		if (sj.deadline && mach_absolute_time() > sj.deadline) {
++			sta_fail(sj.sentMsg2 ? 21 : 22, sj.sentMsg2 ? "no message 3 (wrong password?)" : "no EAPOL from the AP",
++			    out, len, &o);
++		}
++	}
++	if (sj.link) {
++		say("join: link up (%u EAPOL frames in, %u out); en0 takes it from here\n", sj.eapolRx, sj.eapolTx);
++	}
++	return o;
++}
++
++static size_t
++wifi_sta(char *out, size_t len, size_t o)
++{
++	struct vwl_status s;
++	viva_wifi_get_status(&s);
++	say("sta: radio %s (asked %s), state %u, link %u, result %u, \"%.*s\" ch %u %d dBm, aid %u\n",
++	    wl.init ? "up" : "down", s.power ? "on" : "off", sj.state, sj.link, sj.result, sj.ap.ssid_len, sj.ap.ssid,
++	    sj.ap.ch, sj.rssi, sj.aid);
++	say("sta: data tx %u (drops %u) rx %u (drops %u), EAPOL in %u out %u (wpa state %u, drops %u, mic failures %u), "
++	    "%u events, %u frames, %u data\n", sj.tx, sj.txDrops, sj.rx, sj.rxDrops, sj.eapolRx, sj.eapolTx, sj.wpa.state,
++	    sj.wpa.drops, sj.wpa.mic_fail, wl.events, wl.frames, wl.dataFrames);
++	if (o < len) {
++		o += viva_wlan_stats(out + o, len - o);
++	}
++	return o;
++}
++
++void
++viva_wifi_link(const char *args, char *out, size_t len)
++{
++	size_t o = 0;
++	if (len == 0) {
++		return;
++	}
++	out[0] = 0;
++	while (*args == ' ') {
++		args++;
++	}
++	lck_mtx_lock(&vw_mtx);
++	if (strncmp(args, "on", 2) == 0) {
++		printf("VIVA WIFI: power on\n");
++		o = wifi_on(out, len, o);
++	} else if (strncmp(args, "wmt", 3) == 0) {
++		printf("VIVA WIFI: WMT over STP/BTIF\n");
++		o = wifi_wmt(out, len, o);
++	} else if (strncmp(args, "init", 4) == 0) {
++		printf("VIVA WIFI: station init\n");
++		o = wifi_init(out, len, o);
++	} else if (strncmp(args, "up", 2) == 0) {
++		printf("VIVA WIFI: up (on, wmt, fw, init)\n");
++		o = wifi_up(out, len, o);
++		say("up: radio %s\n", wl.init ? "UP" : "NOT up");
++	} else if (strncmp(args, "scan", 4) == 0) {
++		o = wifi_scan(args + 4, out, len, o);
++	} else if (strncmp(args, "join", 4) == 0) {
++		printf("VIVA WIFI: join (link)\n");
++		o = wifi_join_link(args + 4, out, len, o);
++	} else if (strncmp(args, "leave", 5) == 0) {
++		sta_leave(out, len, &o);
++	} else if (strncmp(args, "sta", 3) == 0) {
++		o = wifi_sta(out, len, o);
++	} else if (strncmp(args, "cap", 3) == 0) {
++		o = wifi_cap(out, len, o);
++	} else if (strncmp(args, "fw", 2) == 0) {
++		printf("VIVA WIFI: firmware download\n");
++		o = wifi_fw(out, len, o);
++	} else if (strncmp(args, "off", 3) == 0) {
++		sta_leave(out, len, &o);
++		o = wifi_off(out, len, o);
++	} else if (strncmp(args, "detect", 6) == 0) {
++		if (vw.on) {
++			say("detect: CONN is on (wifi off first)\n");
++		} else {
++			printf("VIVA WIFI: a-die detection\n");
++			o = wifi_detect(out, len, o);
++		}
++	} else {
++		o = wifi_status(out, len, o);
++	}
++	bool up = wl.init;
++	vw_unlock();
++	if (up) {
++		lck_mtx_lock(&vs_mtx);                  /* the worker polls RX / TX from now on */
++		vw_kick_locked(0);
++		lck_mtx_unlock(&vs_mtx);
+ 	}
++	printf("%s", out);
+ 	(void)o;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/viva_wlan.c b/bsd/dev/viva_wlan.c
+new file mode 100644
+index 0000000..2f4c2ce
+--- /dev/null
++++ b/bsd/dev/viva_wlan.c
+@@ -0,0 +1,764 @@
++/*
++ * viva (MT6781): the WiFi station as iOS 16 expects it (no IO80211Family, no Skywalk).
++ *
++ * IO80211.framework (wifid) falls back to the classic ioctl path when IOServiceOpen fails on the interface's
++ * IOService (iokit/Kernel/arm/VivaWLAN.cpp has no user client): SIOCGA80211 / SIOCSA80211 on an AF_INET socket
++ * with struct apple80211req (40 bytes, req_data is a user pointer), and events on the kern_event socket
++ * (vendor 1, class 6 KEV_IEEE80211_CLASS, subclass 1, data = interface name[16] + payload).
++ * Layouts and the call sequence: ~/Developer/ios-viva/wifi/docs/IOS16-WIFI-ABI.md + apple80211_ios16.h
++ * (recovered from 20H392's IO80211.framework and wifid).
++ *
++ * en0: IFT_ETHER, IFNET_SUBFAMILY_WIFI, SIOCGIFMEDIA = IFM_IEEE80211 (Apple80211BindToInterfaceWithIOCTL keeps
++ * only interfaces with that media type), BPF (IPConfiguration's DHCP), KEV_DL_LINK_ON/OFF (configd).
++ * The station (scan, join, WPA2, data) is bsd/dev/viva_wifi.c; every request here is either a snapshot read
++ * or queued to its worker, so wifid never waits on the hardware.
++ *
++ * Which requests are answered, the event payloads and their order follow hakios-xnu-kernel and ios-sapphire (the
++ * same 20H392 userland joining from Settings): ~/Developer/ios-viva/wifi/docs/IOS16-WIFI-HAKIOS.md. In short:
++ * SCAN_DONE / ASSOC_DONE / POWER_CHANGED have no payload; a join ends KEV_DL_LINK_ON, ASSOC_DONE, SSID_CHANGED,
++ * BSSID_CHANGED, LINK_CHANGED(up); RSSI_BOUNDS and NOISE must be answered or auto-join sees every network "below
++ * minimum RSSI"; joined-only GETs say ENXIO when not joined; everything unknown is EOPNOTSUPP.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sockio.h>
++#include <sys/kern_event.h>
++#include <sys/kpi_mbuf.h>
++#include <kern/locks.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <net/if_media.h>
++#include <net/bpf.h>
++#include <net/dlil.h>
++
++#include "viva_wpa.h"
++#include "viva_wlan.h"
++
++struct apple80211req {
++	char     req_if_name[IFNAMSIZ];
++	int32_t  req_type;
++	int32_t  req_val;
++	uint32_t req_len;
++	uint32_t req_pad;
++	uint64_t req_data;
++};
++_Static_assert(sizeof(struct apple80211req) == 40, "apple80211req");
++
++#define SIOCSA80211             _IOW('i', 200, struct apple80211req)
++#define SIOCGA80211             _IOWR('i', 201, struct apple80211req)
++
++#define IOC_SSID                1
++#define IOC_AUTH_TYPE           2
++#define IOC_CHANNEL             4
++#define IOC_POWERSAVE           5
++#define IOC_PROTMODE            6
++#define IOC_TXPOWER             7
++#define IOC_RATE                8
++#define IOC_BSSID               9
++#define IOC_SCAN_REQ            10
++#define IOC_SCAN_RESULT         11
++#define IOC_CARD_CAPABILITIES   12
++#define IOC_STATE               13
++#define IOC_PHY_MODE            14
++#define IOC_OP_MODE             15
++#define IOC_RSSI                16
++#define IOC_NOISE               17
++#define IOC_INT_MIT             18
++#define IOC_POWER               19
++#define IOC_ASSOCIATE           20
++#define IOC_ASSOCIATE_RESULT    21
++#define IOC_DISASSOCIATE        22
++#define IOC_SUPPORTED_CHANNELS  27
++#define IOC_LOCALE              28
++#define IOC_DEAUTH              29
++#define IOC_DRIVER_VERSION      43
++#define IOC_HARDWARE_VERSION    44
++#define IOC_BACKGROUND_SCAN     47
++#define IOC_ASSOCIATION_STATUS  50
++#define IOC_COUNTRY_CODE        51
++#define IOC_MCS                 57
++#define IOC_CURRENT_NETWORK     103
++#define IOC_RSSI_BOUNDS         106
++#define IOC_CHANNELS_INFO       207
++#define IOC_HW_SUPPORTED_CHANNELS 254
++#define IOC_ABORT_SCAN          382
++
++#define M_POWER_CHANGED         1
++#define M_SSID_CHANGED          2
++#define M_BSSID_CHANGED         3
++#define M_LINK_CHANGED          4
++#define M_ASSOC_DONE            9
++#define M_SCAN_DONE             10
++
++#define CH_20MHZ                0x2
++#define CH_2GHZ                 0x8
++#define CH_5GHZ                 0x10
++#define CH_ACTIVE               0x80
++#define CH_DFS                  0x100
++
++#define SCAN_DATA_SIZE          5456
++#define SCAN_RESULT_SIZE        1164
++#define ASSOC_DATA_SIZE         592
++#define SUP_CHANNELS_SIZE       4824
++#define CHANNELS_INFO_SIZE      10016
++
++static struct {
++	ifnet_t     ifp;
++	lck_mtx_t  *mtx;
++	uint32_t    scanIdx;            /* next SCAN_RESULT */
++	bool        link;
++	uint8_t     logged[64];         /* unknown request types already logged (bit per type < 512) */
++	uint32_t    gets, sets, unknown;
++} wn;
++
++static void
++wn_event(uint32_t code, const void *payload, uint32_t plen)
++{
++	struct kev_msg ev;
++	char name[IFNAMSIZ];
++
++	bzero(&ev, sizeof(ev));
++	bzero(name, sizeof(name));
++	strlcpy(name, "en0", sizeof(name));
++	ev.vendor_code = KEV_VENDOR_APPLE;
++	ev.kev_class = KEV_IEEE80211_CLASS;
++	ev.kev_subclass = 1;
++	ev.event_code = code;
++	ev.dv[0].data_length = IFNAMSIZ;
++	ev.dv[0].data_ptr = name;
++	if (plen) {
++		ev.dv[1].data_length = plen;
++		ev.dv[1].data_ptr = (void *)(uintptr_t)payload;
++	}
++	(void)kev_post_msg(&ev);
++}
++
++static void
++wn_log_once(bool set, int32_t type, uint32_t len)
++{
++	wn.unknown++;
++	if (type >= 0 && type < 512) {
++		uint8_t bit = (uint8_t)(1u << (type & 7));
++		if (wn.logged[type >> 3] & bit) {
++			return;
++		}
++		wn.logged[type >> 3] |= bit;
++	}
++	printf("VIVA WLAN: %s type %d len %u not supported\n", set ? "SET" : "GET", type, len);
++}
++
++/* ---- data ---- */
++
++static errno_t
++wn_output(ifnet_t ifp, mbuf_t m)
++{
++	bpf_tap_out(ifp, DLT_EN10MB, m, NULL, 0);
++	if (!wn.link) {
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	ifnet_stat_increment_out(ifp, 1, mbuf_pkthdr_len(m), 0);
++	viva_wifi_output(m);
++	return 0;
++}
++
++void
++viva_wlan_input(mbuf_t m)
++{
++	ifnet_t ifp = wn.ifp;
++	if (ifp == NULL || mbuf_pkthdr_len(m) < ETHER_HDR_LEN) {
++		mbuf_freem(m);
++		return;
++	}
++	struct ifnet_stat_increment_param stats = {};
++	stats.packets_in = 1;
++	stats.bytes_in = mbuf_pkthdr_len(m);
++	mbuf_pkthdr_setrcvif(m, ifp);
++	bpf_tap_in(ifp, DLT_EN10MB, m, NULL, 0);
++	void *frame_header = mbuf_data(m);
++	mbuf_pkthdr_setheader(m, frame_header);
++	mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++	(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++	ifnet_input(ifp, m, &stats);
++}
++
++/* ---- events from the station ---- */
++
++void
++viva_wlan_power(bool on)
++{
++	(void)on;
++	wn_event(M_POWER_CHANGED, NULL, 0);
++}
++
++void
++viva_wlan_scan_done(int status)
++{
++	lck_mtx_lock(wn.mtx);
++	wn.scanIdx = 0;
++	lck_mtx_unlock(wn.mtx);
++	(void)status;
++	wn_event(M_SCAN_DONE, NULL, 0);
++}
++
++static void
++wn_link_event(bool up, uint32_t reason)
++{
++	struct vwl_status s;
++	uint8_t d[32];
++	viva_wifi_get_status(&s);
++	bzero(d, sizeof(d));
++	d[0] = up ? 0 : 1;                                      /* isLinkDown */
++	int32_t rssi = s.rssi;
++	uint16_t snr = (uint16_t)MAX(0, MIN(90, s.rssi + 95)), nf = (uint16_t)-95;
++	memcpy(d + 4, &rssi, 4);
++	memcpy(d + 8, &snr, 2);
++	memcpy(d + 0xa, &nf, 2);
++	if (!up) {
++		d[0x10] = reason != 0;                          /* involuntary */
++		memcpy(d + 0x14, &reason, 4);
++	}
++	wn_event(M_LINK_CHANGED, d, sizeof(d));
++}
++
++void
++viva_wlan_assoc_done(int result)
++{
++	if (result == 1) {
++		wn.link = true;
++		if (wn.ifp != NULL) {
++			dlil_post_msg(wn.ifp, KEV_DL_SUBCLASS, KEV_DL_LINK_ON, NULL, 0, FALSE);
++		}
++		viva_wlan_registry_link(true);
++		wn_event(M_ASSOC_DONE, NULL, 0);
++		wn_event(M_SSID_CHANGED, NULL, 0);
++		wn_event(M_BSSID_CHANGED, NULL, 0);
++		wn_link_event(true, 0);
++	} else {
++		wn_event(M_ASSOC_DONE, NULL, 0);
++	}
++}
++
++void
++viva_wlan_link(bool up, uint32_t reason)
++{
++	if (up || !wn.link) {
++		return;
++	}
++	wn.link = false;
++	if (wn.ifp != NULL) {
++		dlil_post_msg(wn.ifp, KEV_DL_SUBCLASS, KEV_DL_LINK_OFF, NULL, 0, FALSE);
++	}
++	viva_wlan_registry_link(false);
++	wn_link_event(false, reason);
++	wn_event(M_SSID_CHANGED, NULL, 0);
++	wn_event(M_BSSID_CHANGED, NULL, 0);
++}
++
++/* ---- Apple80211 GET ---- */
++
++static const uint8_t wn_ch5[] = { 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136,
++	                          140, 144, 149, 153, 157, 161, 165 };
++
++static uint32_t
++wn_nch(void)
++{
++	return 13 + sizeof(wn_ch5);
++}
++
++static uint32_t
++wn_ch(uint32_t i)
++{
++	return i < 13 ? i + 1 : wn_ch5[i - 13];
++}
++
++static uint32_t
++wn_ch_flags(uint32_t ch)
++{
++	if (ch <= 14) {
++		return CH_2GHZ | CH_20MHZ | CH_ACTIVE;
++	}
++	return CH_5GHZ | CH_20MHZ | ((ch >= 52 && ch <= 144) ? CH_DFS : CH_ACTIVE);
++}
++
++/* struct apple80211_scan_result (1164 bytes) from a BSS */
++static void
++wn_scan_result(uint8_t *r, const struct vwl_bss *b, uint16_t room)
++{
++	static const uint8_t rate_ie[2] = { 1, 50 };
++	bzero(r, SCAN_RESULT_SIZE);
++	uint32_t v = 1, ch = b->ch, fl = wn_ch_flags(b->ch);
++	memcpy(r + 0x00, &v, 4);
++	memcpy(r + 0x04, &v, 4);
++	memcpy(r + 0x08, &ch, 4);
++	memcpy(r + 0x0c, &fl, 4);
++	int16_t noise = -95, rssi = b->rssi, snr = (int16_t)MAX(0, MIN(90, b->rssi + 95));
++	uint16_t one = 1;
++	memcpy(r + 0x10, &one, 2);
++	memcpy(r + 0x12, &noise, 2);
++	memcpy(r + 0x14, &snr, 2);
++	memcpy(r + 0x16, &rssi, 2);
++	memcpy(r + 0x18, &b->bintval, 2);
++	memcpy(r + 0x1a, &b->capinfo, 2);
++	memcpy(r + 0x1c, b->bssid, 6);
++	/* rates (Mbit/s) from the supported / extended rates IEs */
++	uint32_t n = 0;
++	for (int k = 0; k < 2; k++) {
++		for (uint32_t i = 0; i + 2 <= b->ie_len && i + 2 + b->ie[i + 1] <= b->ie_len; i += 2 + b->ie[i + 1]) {
++			if (b->ie[i] != rate_ie[k]) {
++				continue;
++			}
++			for (uint32_t j = 0; j < b->ie[i + 1] && n < 15; j++) {
++				uint32_t mbps = (b->ie[i + 2 + j] & 0x7f) / 2;
++				if (mbps) {
++					memcpy(r + 0x24 + 4 * n++, &mbps, 4);
++				}
++			}
++		}
++	}
++	r[0x22] = (uint8_t)n;
++	r[0x60] = b->ssid_len;
++	memcpy(r + 0x61, b->ssid, b->ssid_len);
++	memcpy(r + 0x84, &b->age_ms, 4);
++	uint16_t ielen = b->ie_len <= room ? b->ie_len : 0;     /* all of them or none (hakios) */
++	memcpy(r + 0x8a, &ielen, 2);
++	memcpy(r + 0x8c, b->ie, ielen);
++}
++
++static int
++wn_out(struct apple80211req *req, const void *buf, uint32_t n)
++{
++	if (req->req_data == 0) {
++		return EINVAL;
++	}
++	n = MIN(n, req->req_len);
++	int err = copyout(buf, (user_addr_t)req->req_data, n);
++	req->req_len = n;
++	return err;
++}
++
++static int
++wn_get(struct apple80211req *req)
++{
++	struct vwl_status s;
++	viva_wifi_get_status(&s);
++	bool assoc = s.link;
++	uint8_t b[64];
++	uint32_t *w = (uint32_t *)(void *)b;
++	bzero(b, sizeof(b));
++	wn.gets++;
++
++	switch (req->req_type) {
++	case IOC_SSID:
++		if (!assoc) {
++			return ENXIO;
++		}
++		return wn_out(req, s.ssid, s.ssid_len);
++	case IOC_BSSID:
++		if (!assoc) {
++			return ENXIO;
++		}
++		return wn_out(req, s.bssid, 6);
++	case IOC_AUTH_TYPE:
++		if (!assoc) {
++			return ENXIO;
++		}
++		w[0] = 1;
++		w[1] = 1;                                       /* open system */
++		w[2] = s.rsn ? 0x8 : 0;                         /* WPA2-PSK */
++		return wn_out(req, b, 16);
++	case IOC_CHANNEL:
++		if (!assoc) {
++			return ENXIO;
++		}
++		w[0] = 1;
++		w[1] = 1;
++		w[2] = s.ch;
++		w[3] = wn_ch_flags(s.ch);
++		return wn_out(req, b, 16);
++	case IOC_RSSI:
++	case IOC_NOISE: {
++		/* NOISE at any time (ios-sapphire 0294: auto-join needs it), RSSI only when joined */
++		if (req->req_type == IOC_RSSI && !assoc) {
++			return ENXIO;
++		}
++		int32_t v = req->req_type == IOC_RSSI ? s.rssi : -95;
++		w[0] = 1;
++		w[1] = 1;
++		w[2] = 0;                                       /* dBm */
++		memcpy(b + 12, &v, 4);                          /* rssi[0] */
++		memcpy(b + 28, &v, 4);                          /* aggregate */
++		memcpy(b + 32, &v, 4);                          /* rssi_ext[0] */
++		memcpy(b + 48, &v, 4);                          /* aggregate_ext */
++		return wn_out(req, b, 52);
++	}
++	case IOC_RSSI_BOUNDS: {
++		/* read once when wifid opens the interface; unanswered = 0 dBm threshold, nothing auto-joins */
++		int32_t rb[4] = { 1, -95, -20, -85 };
++		return wn_out(req, rb, sizeof(rb));
++	}
++	case IOC_STATE:
++		req->req_val = s.state;
++		req->req_len = 0;
++		return 0;
++	case IOC_OP_MODE:
++		req->req_val = 1;                               /* STA */
++		req->req_len = 0;
++		return 0;
++	case IOC_ASSOCIATE_RESULT:
++		req->req_val = s.result;
++		req->req_len = 0;
++		return 0;
++	case IOC_POWER:
++		w[0] = 1;
++		w[1] = 1;
++		w[2] = s.power;                                 /* what was asked: the radio follows on the worker */
++		return wn_out(req, b, 24);
++	case IOC_CARD_CAPABILITIES: {
++		/* 13 raw bytes (req_data is past the version word): AES, AES_CCM, PMGT, SHSLOT, SHPREAMBLE, WPA2, WME,
++		 * SHORT_GI_20 = 4C 46 0A 00 ... (hakios: other bits and the framework sees no WPA2, "Unable to join") */
++		static const uint8_t bits[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
++		for (unsigned i = 0; i < sizeof(bits); i++) {
++			b[bits[i] >> 3] |= (uint8_t)(1u << (bits[i] & 7));
++		}
++		return wn_out(req, b, 13);
++	}
++	case IOC_DRIVER_VERSION:
++	case IOC_HARDWARE_VERSION: {
++		char v[256];
++		bzero(v, sizeof(v));
++		strlcpy(v, "VivaWLAN: MT6781 CONNSYS (CONNAC1) + MT6631", sizeof(v));
++		return wn_out(req, v, sizeof(v));
++	}
++	case IOC_SUPPORTED_CHANNELS:
++	case IOC_HW_SUPPORTED_CHANNELS: {
++		uint8_t *c = kalloc_data(SUP_CHANNELS_SIZE, Z_WAITOK | Z_ZERO);
++		if (c == NULL) {
++			return ENOMEM;
++		}
++		uint32_t n = 0, v = 1;
++		memcpy(c, &v, 4);
++		for (uint32_t i = 0; i < wn_nch(); i++, n++) {
++			uint32_t ch = wn_ch(i), e[3] = { 1, ch, wn_ch_flags(ch) };
++			memcpy(c + 8 + 12 * n, e, 12);
++		}
++		memcpy(c + 4, &n, 4);
++		int err = wn_out(req, c, SUP_CHANNELS_SIZE);
++		kfree_data(c, SUP_CHANNELS_SIZE);
++		return err;
++	}
++	case IOC_CHANNELS_INFO: {
++		/* hakios layout: u16 count @0xc, u8 number[400] @0x32e, indoor @0x4be, dfs @0x64e, passive @0x7de,
++		 * wide40 @0x96e, wide80 @0xafe, u32 flags[400] @0x12d0; no version word */
++		uint8_t *c = kalloc_data(CHANNELS_INFO_SIZE, Z_WAITOK | Z_ZERO);
++		if (c == NULL) {
++			return ENOMEM;
++		}
++		uint16_t n = (uint16_t)wn_nch();
++		memcpy(c + 0xc, &n, 2);
++		for (uint32_t i = 0; i < n; i++) {
++			uint32_t ch = wn_ch(i), fl = wn_ch_flags(ch);
++			c[0x32e + i] = (uint8_t)ch;
++			c[0x64e + i] = (fl & CH_DFS) ? 1 : 0;
++			c[0x7de + i] = (fl & CH_ACTIVE) ? 0 : 1;
++			memcpy(c + 0x12d0 + 4 * i, &fl, 4);
++		}
++		int err = wn_out(req, c, CHANNELS_INFO_SIZE);
++		kfree_data(c, CHANNELS_INFO_SIZE);
++		return err;
++	}
++	case IOC_SCAN_RESULT:
++	case IOC_CURRENT_NETWORK: {
++		if (req->req_type == IOC_CURRENT_NETWORK && !assoc) {
++			return ENXIO;
++		}
++		struct vwl_bss *bss = kalloc_type(struct vwl_bss, Z_WAITOK | Z_ZERO);
++		uint8_t *r = kalloc_data(SCAN_RESULT_SIZE, Z_WAITOK);
++		int err = ENOMEM;
++		if (bss != NULL && r != NULL) {
++			if (req->req_type == IOC_CURRENT_NETWORK) {
++				err = viva_wifi_current_bss(bss);
++			} else {
++				lck_mtx_lock(wn.mtx);
++				uint32_t i = wn.scanIdx++;
++				lck_mtx_unlock(wn.mtx);
++				err = viva_wifi_scan_result(i, bss) == 0 ? 0 : EIO;
++			}
++			if (err == 0) {
++				/* the caller's ie_len (+0x8a) is the room it has for the IEs */
++				uint16_t room = 1024;
++				if (req->req_data != 0 && req->req_len >= 0x8c) {
++					(void)copyin((user_addr_t)req->req_data + 0x8a, &room, 2);
++				}
++				wn_scan_result(r, bss, MIN(room, (uint16_t)1024));
++				err = wn_out(req, r, SCAN_RESULT_SIZE);
++			}
++		}
++		if (r != NULL) {
++			kfree_data(r, SCAN_RESULT_SIZE);
++		}
++		if (bss != NULL) {
++			kfree_type(struct vwl_bss, bss);
++		}
++		return err;
++	}
++	default:
++		wn_log_once(false, req->req_type, req->req_len);
++		return EOPNOTSUPP;
++	}
++}
++
++/* ---- Apple80211 SET ---- */
++
++static int
++wn_in(const struct apple80211req *req, void *buf, uint32_t n)
++{
++	if (req->req_data == 0 || req->req_len < n) {
++		return EINVAL;
++	}
++	return copyin((user_addr_t)req->req_data, buf, n);
++}
++
++static int
++wn_set_scan(const struct apple80211req *req)
++{
++	if (req->req_len != SCAN_DATA_SIZE) {
++		return EINVAL;
++	}
++	uint8_t *d = kalloc_data(SCAN_DATA_SIZE, Z_WAITOK | Z_ZERO);
++	if (d == NULL) {
++		return ENOMEM;
++	}
++	int err = wn_in(req, d, SCAN_DATA_SIZE);
++	if (err == 0) {
++		struct vwl_scan s;
++		bzero(&s, sizeof(s));
++		uint32_t sl, type, nch;
++		memcpy(&sl, d + 0x10, 4);
++		memcpy(&type, d + 0x34, 4);
++		memcpy(&nch, d + 0x44, 4);
++		if (sl > 0 && sl <= 32) {
++			s.ssid_len = (uint8_t)sl;
++			memcpy(s.ssid, d + 0x14, sl);
++		}
++		s.passive = type == 2;
++		if (nch <= sizeof(s.ch)) {                     /* longer lists: every channel */
++			for (uint32_t i = 0; i < nch; i++) {
++				uint32_t ch;
++				memcpy(&ch, d + 0x48 + 12 * i + 4, 4);
++				if (ch > 0 && ch <= 196) {
++					s.ch[s.nch++] = (uint8_t)ch;
++				}
++			}
++		}
++		lck_mtx_lock(wn.mtx);
++		wn.scanIdx = 0;
++		lck_mtx_unlock(wn.mtx);
++		err = viva_wifi_scan(&s);
++	}
++	kfree_data(d, SCAN_DATA_SIZE);
++	return err;
++}
++
++static int
++wn_set_assoc(const struct apple80211req *req)
++{
++	uint8_t *d = kalloc_data(ASSOC_DATA_SIZE, Z_WAITOK | Z_ZERO);
++	if (d == NULL) {
++		return ENOMEM;
++	}
++	int err = req->req_len >= 0x88 ? wn_in(req, d, MIN(req->req_len, (uint32_t)ASSOC_DATA_SIZE)) : EINVAL;
++	if (err == 0) {
++		struct vwl_join j;
++		bzero(&j, sizeof(j));
++		uint32_t sl, klen, cipher;
++		memcpy(&sl, d + 0xc, 4);
++		memcpy(&klen, d + 0x3c, 4);
++		memcpy(&cipher, d + 0x40, 4);
++		if (sl == 0 || sl > 32) {
++			err = EINVAL;
++			goto done;
++		}
++		j.ssid_len = (uint8_t)sl;
++		memcpy(j.ssid, d + 0x10, sl);
++		memcpy(j.bssid, d + 0x30, 6);
++		if (klen == 0) {
++			j.has_pmk = 0;                          /* open */
++		} else if (cipher == 10 && klen >= 8 && klen <= 63) {
++			char pass[64];
++			memcpy(pass, d + 0x48, klen);
++			pass[klen] = 0;
++			viva_wpa_pmk(pass, j.ssid, j.ssid_len, j.pmk);
++			bzero(pass, sizeof(pass));
++			j.has_pmk = 1;
++		} else if (cipher == 6 && klen == 32) {
++			memcpy(j.pmk, d + 0x48, 32);
++			j.has_pmk = 1;
++		} else {
++			err = EINVAL;
++			goto done;
++		}
++		printf("VIVA WLAN: ASSOCIATE \"%.*s\" %02x:%02x:%02x:%02x:%02x:%02x %s\n", j.ssid_len, j.ssid, j.bssid[0],
++		    j.bssid[1], j.bssid[2], j.bssid[3], j.bssid[4], j.bssid[5], !j.has_pmk ? "open" :
++		    cipher == 10 ? "passphrase" : "PMK");
++		err = viva_wifi_join(&j);
++done:
++		bzero(&j, sizeof(j));
++	}
++	bzero(d, ASSOC_DATA_SIZE);
++	kfree_data(d, ASSOC_DATA_SIZE);
++	return err;
++}
++
++static int
++wn_set(struct apple80211req *req)
++{
++	wn.sets++;
++	switch (req->req_type) {
++	case IOC_POWER: {
++		uint32_t p[6];
++		int err = wn_in(req, p, sizeof(p));
++		if (err != 0) {
++			return err;
++		}
++		bool on = p[2] != 0;
++		printf("VIVA WLAN: SET POWER %s\n", on ? "on" : "off");
++		return viva_wifi_set_power(on);
++	}
++	case IOC_SCAN_REQ:
++		return wn_set_scan(req);
++	case IOC_ASSOCIATE:
++		return wn_set_assoc(req);
++	case IOC_DISASSOCIATE:
++		printf("VIVA WLAN: DISASSOCIATE\n");
++		viva_wifi_leave();
++		return 0;
++	default:
++		wn_log_once(true, req->req_type, req->req_len);
++		return EOPNOTSUPP;
++	}
++}
++
++/* ---- ifnet ---- */
++
++static errno_t
++wn_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCGA80211:
++		return wn_get((struct apple80211req *)data);
++	case SIOCSA80211:
++		return wn_set((struct apple80211req *)data);
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++		user_addr_t list = (cmd == SIOCGIFMEDIA64) ? ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
++		int media = IFM_IEEE80211 | IFM_AUTO;
++		ifmr->ifm_current = media;
++		ifmr->ifm_active = media;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = IFM_AVALID | (wn.link ? IFM_ACTIVE : 0);
++		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
++			ifmr->ifm_count = 1;
++			return copyout(&media, list, sizeof(media));
++		}
++		ifmr->ifm_count = 1;
++		return 0;
++	}
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++		ifnet_set_flags(ifp, (ifnet_flags(ifp) & IFF_UP) ? IFF_RUNNING : 0, IFF_RUNNING);
++		return 0;
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++wn_detach(ifnet_t ifp __unused)
++{
++}
++
++void
++viva_wlan_attach(void)
++{
++	struct ifnet_init_eparams init;
++	static lck_grp_t *grp;
++	uint8_t mac[6];
++
++	if (wn.ifp != NULL) {
++		return;
++	}
++	grp = lck_grp_alloc_init("viva_wlan", LCK_GRP_ATTR_NULL);
++	wn.mtx = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++	viva_wifi_mac(mac);
++
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO;      /* classic output(), no Skywalk nexus */
++	init.uniqueid = "viva-wlan";
++	init.uniqueid_len = sizeof("viva-wlan") - 1;
++	init.name = "en";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.subfamily = IFNET_SUBFAMILY_WIFI;
++	init.type = IFT_ETHER;
++	init.output = wn_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = wn_ioctl;
++	init.detach = wn_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ifnet_allocate_extended(&init, &wn.ifp) != 0) {
++		printf("VIVA WLAN: ifnet_allocate failed\n");
++		wn.ifp = NULL;
++		return;
++	}
++	ifnet_set_addrlen(wn.ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(wn.ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(wn.ifp, ETHERMTU);
++	ifnet_set_baudrate(wn.ifp, 150000000);
++	ifnet_set_flags(wn.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(wn.ifp, NULL) != 0) {
++		printf("VIVA WLAN: ifnet_attach failed\n");
++		ifnet_release(wn.ifp);
++		wn.ifp = NULL;
++		return;
++	}
++	ifnet_set_lladdr(wn.ifp, mac, ETHER_ADDR_LEN);
++	bpfattach(wn.ifp, DLT_EN10MB, ETHER_HDR_LEN);
++	printf("VIVA WLAN: en0 %02x:%02x:%02x:%02x:%02x:%02x\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++}
++
++/* USB link "wifi wlan": what wifid asked */
++size_t
++viva_wlan_stats(char *out, size_t len)
++{
++	size_t o = 0;
++	if (len) {
++		o = (size_t)snprintf(out, len, "wlan: en0 %s, link %u, %u GETs, %u SETs, %u unsupported\n",
++		    wn.ifp ? "attached" : "MISSING", wn.link, wn.gets, wn.sets, wn.unknown);
++	}
++	return MIN(o, len);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/viva_wlan.h b/bsd/dev/viva_wlan.h
+new file mode 100644
+index 0000000..ff0623b
+--- /dev/null
++++ b/bsd/dev/viva_wlan.h
+@@ -0,0 +1,73 @@
++/*
++ * viva: the WiFi station (bsd/dev/viva_wifi.c: CONNSYS, MLME, WPA2) and its Apple80211 face for iOS
++ * (bsd/dev/viva_wlan.c: en0, SIOCGA80211/SIOCSA80211, kern_event, iokit/Kernel/arm/VivaWLAN.cpp: registry).
++ */
++#ifndef _VIVA_WLAN_H_
++#define _VIVA_WLAN_H_
++
++#include <sys/kpi_mbuf.h>
++
++#define VWL_IE_MAX      512
++
++struct vwl_bss {                        /* one BSS from the last scans */
++	uint8_t  bssid[6], ssid[32], ssid_len, ch;
++	int8_t   rssi;
++	uint8_t  rsvd;
++	uint16_t capinfo, bintval;
++	uint16_t ie_len;
++	uint8_t  ie[VWL_IE_MAX];        /* beacon / probe response body after the fixed fields */
++	uint32_t age_ms;
++};
++
++struct vwl_scan {
++	uint8_t  ssid[32], ssid_len;    /* 0 = wildcard */
++	uint8_t  passive;
++	uint8_t  nch;                   /* 0 = all */
++	uint8_t  ch[64];
++};
++
++struct vwl_join {
++	uint8_t  ssid[32], ssid_len;
++	uint8_t  bssid[6];              /* zero: the strongest BSS with that SSID */
++	uint8_t  has_pmk;               /* WPA2-PSK; otherwise open */
++	uint8_t  pmk[32];
++	uint8_t  rsnie[64], rsnie_len;  /* RSN IE for the association request (0: built by the driver) */
++};
++
++struct vwl_status {
++	uint8_t  power;                 /* radio on */
++	uint8_t  state;                 /* APPLE80211_S_*: 0 init, 1 scan, 2 auth, 3 assoc, 4 run */
++	uint8_t  link;                  /* associated and keys installed: data flows */
++	uint8_t  result;                /* APPLE80211 ASSOCIATE_RESULT of the last join (0 = running) */
++	uint8_t  ssid[32], ssid_len, ch;
++	uint8_t  bssid[6], mac[6];
++	uint8_t  rsn;                   /* the current BSS uses WPA2-PSK */
++	int8_t   rssi;
++	uint16_t rate;                  /* Mbit/s */
++	uint32_t txFrames, rxFrames, txDrops;
++};
++
++/* viva_wifi.c (station) */
++int  viva_wifi_set_power(bool on);                      /* blocks until the radio is up (or down) */
++int  viva_wifi_scan(const struct vwl_scan *s);          /* async: viva_wlan_scan_done() */
++int  viva_wifi_scan_result(uint32_t i, struct vwl_bss *out);    /* ENOENT past the end */
++int  viva_wifi_current_bss(struct vwl_bss *out);
++int  viva_wifi_join(const struct vwl_join *j);          /* async: viva_wlan_assoc_done() */
++void viva_wifi_leave(void);
++void viva_wifi_get_status(struct vwl_status *s);
++void viva_wifi_output(mbuf_t m);                        /* an 802.3 frame; the mbuf is consumed */
++void viva_wifi_mac(uint8_t mac[6]);
++
++/* viva_wlan.c (Apple80211 / BSD side), called by the station without its locks held */
++void viva_wlan_attach(void);                            /* en0 (VivaWLAN::start) */
++void viva_wlan_scan_done(int status);
++void viva_wlan_assoc_done(int result);                  /* APPLE80211 ASSOCIATE_RESULT, 1 = success */
++void viva_wlan_link(bool up, uint32_t reason);
++void viva_wlan_power(bool on);
++void viva_wlan_input(mbuf_t m);                         /* a received 802.3 frame */
++size_t viva_wlan_stats(char *out, size_t len);            /* USB link "wifi sta" */
++
++/* VivaWLAN.cpp */
++void viva_wlan_registry_link(bool up);
++
++#endif
+diff --git a/iokit/Kernel/arm/VivaWLAN.cpp b/iokit/Kernel/arm/VivaWLAN.cpp
+new file mode 100644
+index 0000000..872044b
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaWLAN.cpp
+@@ -0,0 +1,193 @@
++/*
++ * viva (MT6781): what iOS 16's configd, wifid and IO80211.framework look for in the registry (the station and en0
++ * are bsd/dev/viva_wifi.c and bsd/dev/viva_wlan.c).
++ *
++ * No IONetworkingFamily / IO80211Family here, so (as hakios-xnu-kernel and ios-sapphire do, IOS16-WIFI-HAKIOS.md)
++ * classes with Apple's names that carry properties only:
++ *   IONetworkController <- IOEthernetController <- IO80211Controller <- VivaWLAN, matched on the ADT /arm-io/wlan
++ *     node (IOMACAddress, IOBuiltin; local-mac-address on the node: MobileGestalt waits 5 s per lookup without
++ *     it or an IONetworkController under the node);
++ *   IONetworkInterface <- VivaWLANInterface, its child: IOInterfaceName / BSD Name "en0", IOInterfaceType 6,
++ *     IOInterfaceUnit 0, IOBuiltin, IOPrimaryInterface, IO80211InterfaceRole "Infrastructure" (wifid matches that
++ *     property; configd sees en0 as Wi-Fi because the parent conforms to IO80211Controller and makes its own
++ *     "Wi-Fi" service, the one whose DHCP gives Settings its tick). newUserClient fails: IO80211.framework then
++ *     uses the SIOCGA80211/SIOCSA80211 ioctls on en0.
++ *   IONetworkStack on IOResources with an openable user client that refuses the naming command: en0 is born
++ *     named, but configd's InterfaceNamer only reports quiet after opening it.
++ * Names would clash with a real IONetworkingFamily port (none planned).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++
++extern "C" void viva_wifi_mac(uint8_t mac[6]);          /* bsd/dev/viva_wifi.c */
++extern "C" void viva_wlan_attach(void);                 /* bsd/dev/viva_wlan.c */
++
++class IONetworkController : public IOService {
++	OSDeclareDefaultStructors(IONetworkController);
++};
++OSDefineMetaClassAndStructors(IONetworkController, IOService);
++
++class IOEthernetController : public IONetworkController {
++	OSDeclareDefaultStructors(IOEthernetController);
++};
++OSDefineMetaClassAndStructors(IOEthernetController, IONetworkController);
++
++class IO80211Controller : public IOEthernetController {
++	OSDeclareDefaultStructors(IO80211Controller);
++};
++OSDefineMetaClassAndStructors(IO80211Controller, IOEthernetController);
++
++class IONetworkInterface : public IOService {
++	OSDeclareDefaultStructors(IONetworkInterface);
++};
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++class VivaWLANInterface : public IONetworkInterface {
++	OSDeclareDefaultStructors(VivaWLANInterface);
++public:
++	virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(VivaWLANInterface, IONetworkInterface);
++
++IOReturn
++VivaWLANInterface::newUserClient(task_t, void *, UInt32 type, OSDictionary *, IOUserClient **)
++{
++	static bool logged;
++	if (!logged) {
++		logged = true;
++		IOLog("VIVA WLAN: user client type %u refused (IO80211.framework falls back to the ioctls)\n", (unsigned)type);
++	}
++	return kIOReturnUnsupported;
++}
++
++class VivaWLAN : public IO80211Controller {
++	OSDeclareDefaultStructors(VivaWLAN);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(VivaWLAN, IO80211Controller);
++
++static VivaWLANInterface *gVivaWLANInterface;
++
++static void
++setNumber(IOService *s, const char *key, uint32_t v)
++{
++	OSNumber *n = OSNumber::withNumber(v, 32);
++	if (n != NULL) {
++		s->setProperty(key, n);
++		n->release();
++	}
++}
++
++bool
++VivaWLAN::start(IOService *provider)
++{
++	uint32_t enable = 1;
++	PE_parse_boot_argn("vivawlan", &enable, sizeof(enable));
++	if (enable == 0) {
++		IOLog("VIVA WLAN: off (vivawlan=0)\n");
++		return false;
++	}
++	if (!IO80211Controller::start(provider)) {
++		return false;
++	}
++	uint8_t mac[6];
++	viva_wifi_mac(mac);
++	OSData *m = OSData::withBytes(mac, sizeof(mac));
++	if (m != NULL) {
++		setProperty("IOMACAddress", m);
++		provider->setProperty("local-mac-address", m);
++		m->release();
++	}
++	setProperty("IOBuiltin", kOSBooleanTrue);
++
++	viva_wlan_attach();                     /* en0 first: the registry entry names it */
++
++	VivaWLANInterface *ifc = OSTypeAlloc(VivaWLANInterface);
++	if (ifc == NULL || !ifc->init()) {
++		OSSafeReleaseNULL(ifc);
++		return false;
++	}
++	ifc->setName("en0");
++	ifc->setProperty("IOInterfaceName", "en0");
++	ifc->setProperty("BSD Name", "en0");
++	ifc->setProperty("IOInterfaceNamePrefix", "en");
++	setNumber(ifc, "IOInterfaceType", 6);   /* IFT_ETHER */
++	setNumber(ifc, "IOInterfaceUnit", 0);
++	ifc->setProperty("IOBuiltin", kOSBooleanTrue);
++	ifc->setProperty("IOPrimaryInterface", kOSBooleanTrue);
++	ifc->setProperty("IO80211InterfaceRole", "Infrastructure");
++	if (!ifc->attach(this) || !ifc->start(this)) {
++		ifc->release();
++		return false;
++	}
++	registerService();
++	ifc->registerService();
++	gVivaWLANInterface = ifc;
++	IOLog("VIVA WLAN: IO80211Controller + en0 interface registered, MAC %02x:%02x:%02x:%02x:%02x:%02x\n", mac[0], mac[1],
++	    mac[2], mac[3], mac[4], mac[5]);
++	return true;
++}
++
++/* Link state on the interface entry (informational: configd reads the link from the ifnet). */
++extern "C" void
++viva_wlan_registry_link(bool up)
++{
++	if (gVivaWLANInterface != NULL) {
++		setNumber(gVivaWLANInterface, "IOLinkStatus", up ? 3 : 1);     /* kIONetworkLinkValid | Active */
++	}
++}
++
++/* ---- IONetworkStack stand-in ---- */
++
++class IONetworkStack : public IOService {
++	OSDeclareDefaultStructors(IONetworkStack);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IONetworkStack, IOService);
++
++bool
++IONetworkStack::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty("IOUserClientClass", "IONetworkStackUserClient");
++	setName("IONetworkStack");
++	registerService();
++	return true;
++}
++
++class IONetworkStackUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(IONetworkStackUserClient);
++public:
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
++
++IOReturn
++IONetworkStackUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++/* InterfaceNamer's "name this interface" ({IONetworkStackUserCommand, IOPathMatch, IOInterfaceUnit}): en0 is
++ * already named by the ifnet KPI. */
++IOReturn
++IONetworkStackUserClient::setProperties(OSObject *)
++{
++	return kIOReturnUnsupported;
++}
++#endif /* SWEET */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 8c49888..85699ae 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -123,6 +123,16 @@ const char * gIOKernelConfigTables =
+     "     'IONameMatch'     = 'ti,bq27z561';"
+     "   },"
+     "   {"
++    "     'IOClass'         = VivaWLAN;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'mediatek,mt6781-wlan';"
++    "   },"
++    "   {"
++    "     'IOClass'         = IONetworkStack;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IONetworkStack;"
++    "   },"
++    "   {"
+     "     'IOClass'         = VivaGPUAccelerator;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+     "     'IONameMatch'     = 'mediatek,mt6781-mali';"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 1b29e0e..6f73836 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -26,6 +26,7 @@ iokit/Kernel/arm/VivaGPUUserClient.cpp                           optional iokitc
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/VivaBattery.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/VivaWiFi.cpp                                    optional iokitcpp
++iokit/Kernel/arm/VivaWLAN.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/VivaKeypad.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/VivaPMICKeys.cpp                            optional iokitcpp
