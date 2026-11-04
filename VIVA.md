@@ -612,3 +612,21 @@ viva_usb.c; sweet_ufs.c sweet_ufs_bootargs(): the only UFS write outside the roo
 block of boot_a/boot_b holding the SWEETXNU cmdline (checked header/offset/magic/version, read back). NOT tested.
 Check on the phone: `sysctl kern.viva_link` style calls from the app, `sysctl kern.viva_nextbootargs` (read), then a
 root write and `fastboot`-free reboot to see the new kern.bootargs. If boot_b is not on the root's LUN: ENOENT.
+
+### 0145 / 0147: CPU DVFS, A76 preference, LVTS thermal (CI 41849632117, image `out/xnu-ufs-rw-0147.img` = up to 0147, NOT tested on the phone yet)
+Before: nobody set CPU clocks (LK's A55 1866 MHz, **A76 1085 MHz**, CCI 612 MHz), A76s slower than the A55s
+(cpubench2: ALU chunk 1270 us on cpu 6-7 vs 1080 us on cpu 0-5) and XNU picked the lowest idle cpu (UI on the A55s).
+- 0145 `osfmk/arm64/viva_cpufreq.c`: AP-side DVFS as Linux cpufreq_v1 mt6781 (no MCUPM): Vproc11 (A76) / Vproc12
+  (A55 + CCI) via VivaPwrap whitelist (ELR0 0x13a6/0x1426, max 1.11875/1.03125 V), Vsram tracks in hardware (checked),
+  ARMPLL_LL/BL/CCIPLL CON1 PCW + posdiv (FHCTL off, checked), OPP tables = this phone's live DTB dvfsp tables.
+  Governor every 16 ms (100 ms idle): busiest CPU >= 80 % -> ceiling, else <= 70 % target, down after 3 samples;
+  CCI follows the faster cluster. Low Power Mode caps (big 1530, LL 1500, CCI 1050; `vivalpmcpu`). Scheduler
+  (sched_prim.c choose_processor): with the A76s fast, threads >= user-initiated priority take an idle A76 first,
+  lower ones an idle A55 first (`sched_viva_fast_cpus`). Boot-args `vivacpufreq=0|1|2` (off / governor / manual),
+  `vivacpubig|vivacpull|vivacpucci=MHz`, `vivacpufast=0`. Link: `cpu [status] | gov on|off | set|max ll|big|cci MHz |
+  fast on|off | reset`.
+- 0147: LVTS sensors (9 points, devinfo calibration of this phone) read every 256 ms; hottest >= `vivathermtrip`
+  (85 C) one OPP down per sample, < trip-5 one up per second, >= 105 C floor; no valid reading = cap opp 6 (LL 1618,
+  big 1670); `vivatherm=0` = no LVTS. TOPRGU hardware thermal reset NOT armed. Temperatures in `cpu`.
+- If the phone hangs at boot with 0147: boot with `VIVA_EXTRA="... vivacpufreq=0"` (clocks untouched) or
+  `vivatherm=0`.
