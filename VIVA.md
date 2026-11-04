@@ -647,3 +647,11 @@ the link was gone, panic screen). Suspect: data_rx built the mbuf with mbuf_allo
 viva_wlan_input strips 14 bytes with mbuf_len(m) - 14: if copyback left m_len short, the first frame after the link
 came up (DHCP) went to IP with a huge length. Now gethdr + 2 KiB cluster + memcpy + explicit lengths (as sweet_usb.c),
 and viva_wlan_input drops a frame whose first mbuf is shorter than the Ethernet header. NOT tested.
+
+### 0151: calendar from the PMIC RTC
+0150 on the phone: WiFi joins from Settings and gets an address (Settings no longer panics), but the clock is 1970,
+so TLS fails everywhere. Nothing published IORTC, so IOKitInitializeTime waited 30 s and the calendar started at 0.
+The MT6366 RTC (base 0x588, rtc-mt6397 layout, year = 1968 + reg) holds UTC kept by Android/LK: read on the link
+2026-11-04 21:00:07 = the Mac's UTC. VivaPwrap::start reads it (`VIVA RTC: N s since 1970`), publishes IORTC;
+SweetPlatformExpert::getUTCTimeOfDay returns it. setUTCTimeOfDay is a no-op (no RTC writes; NTP/timed only moves
+the kernel calendar). Settings > General > Date & Time crashing is a separate (userland) issue, not looked at yet.
