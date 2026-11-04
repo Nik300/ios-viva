@@ -519,3 +519,9 @@ SwapEnd and the switch costs frame rate directly. Two latencies removed:
   switched at this frame end, not the next one (copies still after the switch).
 `disp` shows "latency (0135, us)": vsync -> SwapEnd (CA render), SwapEnd -> chosen (GPU done, histogram in frames),
 chosen -> on screen, SwapEnd interval, frames chosen at the tick; `disp lat reset`.
+
+0135 on the phone (2026-11-04, Settings scrolls, 6 swipes): ~11 fps. `disp` latency: vsync -> SwapEnd 8.5 ms, SwapEnd -> GPU
+done 27.5 ms (18.8 ms with the GPU pinned at 950 MHz), chosen -> on screen 27-32 ms with ~2 ticks deferred ("not near
+a frame end") per switch. Patch 0136 (NOT tested): the vsync timer is armed without leeway (kIOTimeOptionsWithLeeway, 0:
+the default thread-call coalescing slop let ticks land after the frame end), a tick up to 3 ms early polls instead of
+waiting a whole frame, `disp` counts late/early ticks with a switch pending ("ticks with a switch pending (0136)").

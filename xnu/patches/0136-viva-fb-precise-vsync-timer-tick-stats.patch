@@ -1,0 +1,75 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b6ce747..c0937cc 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -253,6 +253,8 @@ public:
+ 	uint32_t      fMisses;        /* consecutive pending switches without a frame end */
+ 	bool          fResync;        /* the phase is unsure: poll up to a whole frame at the next switch */
+ 	uint64_t      fFlips, fFlipMissed, fFlipUnsure, fFlipEarly, fInPlace, fPolls, fPollAbs;
++	/* 0136: ticks with a switch pending that came after the predicted frame end (late) or too early for it */
++	uint64_t      fTickLate, fTickLateSum, fTickLateMax, fTickEarly, fTickEarlySum, fTickWidePolls;
+ 
+ 	bool dispMap(void);
+ 	bool findLKLayer(char **out, char *end);
+@@ -603,7 +605,12 @@ AppleCLCD::rearm(IOTimerEventSource *timer)
+ 	if (next < now + fLead + min) {
+ 		next += ((now + fLead + min - next) / step + 1) * step;
+ 	}
+-	timer->wakeAtTime(next - fLead);
++	/*
++	 * 0136: no leeway. Without kIOTimeOptionsWithLeeway the thread call gets the default timer coalescing slop, and
++	 * a tick more than fLead late lands after the frame end: the pending switch then waited a whole frame (0135 on
++	 * the phone: ~2 ticks deferred per switch, chosen -> on screen 27-32 ms).
++	 */
++	timer->wakeAtTime(kIOTimeOptionsWithLeeway, next - fLead, 0);
+ }
+ 
+ void
+@@ -1539,13 +1546,26 @@ AppleCLCD::vblankTick(void)
+ 	if (next < now) {
+ 		next += ((now - next) / fPeriod + 1) * fPeriod;
+ 	}
+-	uint64_t budget;
++	uint64_t budget, wide;
++	nanoseconds_to_absolutetime(3000 * 1000, &wide);
+ 	if (fResync) {
+ 		budget = fPeriod + fPeriod / 4;
+ 	} else if (next - now <= fLead + margin) {
+ 		budget = next - now + margin;
++	} else if (next - now <= wide) {
++		budget = next - now + margin;   /* 0136: a little early: poll up to 3 ms rather than lose the frame */
++		fTickWidePolls++;
+ 	} else {
+ 		fFlipEarly++;           /* not near a frame end now: the next tick is */
++		uint64_t prevEnd = next - fPeriod, d = now - prevEnd;
++		if (now >= prevEnd && d < fPeriod / 2) {
++			fTickLate++;    /* the frame end it was armed for has just passed */
++			fTickLateSum += d;
++			fTickLateMax = MAX(fTickLateMax, d);
++		} else {
++			fTickEarly++;
++			fTickEarlySum += next - now;
++		}
+ 		IOLockUnlock(fScanLock);
+ 		return;
+ 	}
+@@ -1644,6 +1664,8 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
+ 		bzero(&fLatRender, sizeof(fLatRender));
+ 		bzero(fLatReadyHist, sizeof(fLatReadyHist));
+ 		fTickPresents = 0;
++		fTickLate = fTickLateSum = fTickLateMax = fTickEarly = fTickEarlySum = fTickWidePolls = 0;
++		fFlips = fFlipEarly = fFlipMissed = fFlipUnsure = 0;
+ 		IOLockUnlock(fLock);
+ 		disp_say(&p, end, "frame latency counters reset\n");
+ 	} else if (strncmp(args, "early on", 8) == 0) {
+@@ -1687,6 +1709,10 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
+ 			    "%llu (%llu swaps); %llu chosen at the tick before its switch (disp lat reset)\n", c, cm, r, rm,
+ 			    fLatReadyHist[0], fLatReadyHist[1], fLatReadyHist[2], fLatReadyHist[3], fLatReadyHist[4], f, fm, s,
+ 			    fLatSwap.n, fTickPresents);
++			disp_say(&p, end, "ticks with a switch pending (0136): %llu late (avg %llu max %llu us after the frame end), "
++			    "%llu early (avg %llu us before it), %llu polled up to 3 ms ahead\n", fTickLate,
++			    absUsFB(fTickLate ? fTickLateSum / fTickLate : 0), absUsFB(fTickLateMax), fTickEarly,
++			    absUsFB(fTickEarly ? fTickEarlySum / fTickEarly : 0), fTickWidePolls);
+ 		}
+ 		disp_say(&p, end, "early present (K0g, sweetfb_early) %s: %llu tries, %llu frames shown before their tick\n",
+ 		    fEarly ? "on" : "off", fEarlyRuns, fEarlyShown);
