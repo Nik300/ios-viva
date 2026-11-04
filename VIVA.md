@@ -383,3 +383,41 @@ Workflow notes:
 - Build: `gh workflow run xnu.yml -R Nik300/ios-viva --ref viva` (~8-10 min), then
   `tools/viva-mkboot.sh KERNEL ~/Developer/ios-viva/stock/boot.img STAGE`; extra boot-args via
   `VIVA_CMDLINE`. Debug features stay compiled in and are switched by boot-args.
+
+Patch 0121 (2026-11-04, CI run 41742051361 OK, NOT tested on the phone yet): **battery, charger, Low Power Mode**.
+- Hardware (Xiaomi viva-r-oss drivers/power/supply/mediatek/{battery/bq27z561.c,charger/syv690.c} + live DT): I2C3
+  @0x1100f000 (SPI 108, 400 kHz, IMP_IIC_WRAP gate bit 3): **TI bq27z561** fuel gauge at 0x55 (LE16 standard commands:
+  0x06 temp 0.1 K, 0x08 mV, 0x0a status, 0x0c/0x14 mA (+ = charging), 0x10/0x12 RM/FCC mAh, 0x16/0x18 TTE/TTF, 0x2a cycles,
+  0x2c SOC %, 0x2e SOH %, 0x30/0x32 the gauge's charge voltage/current request, 0x3c design) and **Silergy SYV690**
+  charger at 0x6a (BQ25890 map; REG14 PN 1 = SYV690 64 mA/step, 4 = SC89890H 60 mA/step), INT = EINT 11 falling.
+  Charge pumps ln8000/sc8551 and the Type-C/PD controller are left alone (5 V charging only).
+- VivaI2C is multi-bus now (`bus-id`, optional IMP gate in reg 1 + `imp-cg-bit`); ADT `/arm-io/i2c3/battery`.
+- **VivaBattery** (`ti,bq27z561` on VivaDTNub) is the IOPMPowerSource (SweetBattery steps aside when it is in the ADT):
+  AppleARMPMUPowerSource conventions (CurrentCapacity % / MaxCapacity 100, AppleRaw* mAh, ExternalConnected,
+  IsCharging, FullyCharged, Voltage, Amperage, InstantAmperage, Temperature centi-C, CycleCount, TimeRemaining,
+  NominalChargeCapacity, DesignCapacity, MaximumCapacityPercent = SOH, AdapterDetails from the charger's VBUS type and
+  input limit, legacy battery dictionary). Poll every 15 s and 300 ms after each charger interrupt.
+- Charger (boot-arg `vivacharge`, default 1): watchdog 160 s kicked at every poll, VREG = min(gauge request, 4448 mV),
+  ICHG = min(gauge request, 3000 mA) (0 only if the gauge says full or the battery is outside 0..50 C); writes only
+  REG03/04/06/07, read back. `vivacharge=0` = never write (then the charger falls back to 4.208 V once its watchdog
+  expires: the battery stops at ~85 %). Charge limit: `vivachargelimit=N` / sysctl `kern.viva_chargelimit`.
+- **Low Power Mode**: powerd posts `com.apple.system.lowpowermode` (state = mode); vivad (now started also without the link
+  device) copies it into sysctl `kern.viva_lowpower`: GPU DVFS ceiling `vivalpmgpu` (550 MHz), panel copy duty
+  `vivalpmduty` (10 %), "LowPowerMode" on the battery service. vivad must be rebuilt/re-pushed (xnu-kernel artifact).
+- Link: `bat` (gauge + charger state and registers), `bat poll`, `bat lpm on|off`; `i2c8 BUS DEV REG N`,
+  `i2c8w BUS DEV REG B..` (8-bit registers on any bus).
+
+Patch 0122 (2026-11-04, K0j in gpu/docs/RICHIESTE-KERNEL.md; its own CI run was cancelled by the 0123 one, NOT tested on the phone yet): unsignalled fences keep their
+dependencies; a connection with a pending promise never waits (WAIT_BO, implicit deps) for a fence that depends on that
+promise, it waits for what that fence waited for; slot queues are FIFO per connection (a job blocked on a promise no
+longer holds back other connections' jobs, the fast kick arms the same candidate); promise timeouts and promises
+resolved with an already signalled fence kick the queue; closing a connection drops its queued jobs (fences aborted)
+and waits up to 1 s for its running ones. `gpu calls` shows the K0j counters.
+
+Patch 0123 (2026-11-04, CI run 41743977521 = 0121+0122+0123, image `out/xnu-ufs-rw-0123.img` with cpus=8 vivausb=3 vivagpu=2,
+vivad in the xnu-kernel artifact; NOT tested on the phone yet): **WiFi step 1** (plan: ~/Developer/ios-viva/wifi/docs/PIANO-WIFI.md;
+hardware: MT6781-WIFI-HW.md; iOS ABI: IOS16-WIFI-ABI.md). Link `wifi` / `wifi status`: CONNSYS MTCMOS, bus protection, EMI
+remap, CONN reset, PMIC rails (read only; CONN registers only if powered and unprotected). `wifi detect`: Linux's A-die
+detection with the 6631 rails (VCN18 only; its enable bits are now in the PMIC whitelist, no voltage writes): CONN on,
+chip id (want 0x100B0000), HW ver (0x8A00), A-die SPI id (0x6631 or 0x6635), CONN off, pinmux and VCN18 restored.
+Refused if CONN is already on. Worst case a bus hang (reboot by hand).
