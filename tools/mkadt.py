@@ -290,6 +290,13 @@ def build(seed=None, qemu=False, highmem=False, viva=False, viva_ufs=False):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
+        # MobileGestalt's WifiAddress (and UniqueDeviceID, built from it on
+        # A11) reads these; without mac-address-wifi0 it waits for an
+        # sdio/wlan/marconi-wifi IOService that never appears, which hung lsd
+        # in every plugin registration. Synthetic, locally administered MACs
+        # from the synthetic ECID.
+        ('mac-address-wifi0', bytes([0x02]) + struct.pack('>Q', ecid)[3:7] + b'\x01'),
+        ('mac-address-bluetooth0', bytes([0x02]) + struct.pack('>Q', ecid)[3:7] + b'\x02'),
     ], [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
