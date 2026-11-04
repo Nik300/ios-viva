@@ -507,6 +507,10 @@ data; then `wifi fw`: WIFI_START OK, ready bits 0x6, MCU PC in the EMI RAM code 
 
 Patch 0134 (NOT tested): `wifi cap` = CMD_ID_GET_NIC_CAPABILITY_V2 (0x8A) on TX ring 15 (first normal command), event 0xEC
 parsed (HW/SW version, efuse MAC, PHY caps, A-die version); calibration answer check relaxed.
+On 0140 `wifi on` failed: "no contiguous 5 MiB below 4 GiB for the EMI window" (vivascanout=1 makes the IOSurfaces
+physically contiguous below 4 GiB and fragments that memory). Patch 0141 (NOT tested): VivaPwrap::start calls
+viva_wifi_reserve() and takes the EMI window (5 MiB) and the WFDMA memory (0x48000) at boot, log "VIVA WIFI: reserved ...";
+boot-arg vivawifi=0 skips it. Also 0020-stage-bearssl.sh falls back to GitHub mirrors (bearssl.org answered 502), SHA pinned.
 
 Patch 0135 (2026-11-04, from the GPU side, NOT tested on the phone yet): **frame rate with scanout + SwapWait (0133)**.
 Measured on 0133 (Settings scrolls): ~12 fps shown, GPU idle 84-91%, the same with the GPU pinned at 950 MHz;
