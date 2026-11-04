@@ -421,3 +421,24 @@ remap, CONN reset, PMIC rails (read only; CONN registers only if powered and unp
 detection with the 6631 rails (VCN18 only; its enable bits are now in the PMIC whitelist, no voltage writes): CONN on,
 chip id (want 0x100B0000), HW ver (0x8A00), A-die SPI id (0x6631 or 0x6635), CONN off, pinmux and VCN18 restored.
 Refused if CONN is already on. Worst case a bus hang (reboot by hand).
+
+0123 on the phone (2026-11-04): `bat` OK (gauge 89 %, 358 cycles, health 88 %, charger PN 1, 8 interrupts, 46 writes, 0
+errors; vbus_stat 5 "unknown adapter" -> 500 mA input with the Mac attached). `wifi`: CONN off after LK (PWR_CON 0x12,
+protected, CONN reset bit set, VCN18/33/28 off, VCN33 vosel 3 = 3.5 V). `wifi detect`: conn version 0x100b0000, cfg id 2,
+hw/fw 0x8a00, **A-die MT6631** (SPI 0xb024 -> 0x66318b01), MTCMOS back off.
+
+Patches 0124-0126 (2026-11-04, CI run 41750485668, image `out/xnu-ufs-rw-0126.img`, NOT tested on the phone yet):
+- **0124 WiFi step 2**: `wifi on` = full CONNSYS power-on for the MT6631: 5 MiB contiguous EMI window below 4 GiB
+  (VivaWiFi.cpp; 16 MiB aligned, 64 KiB fallback) remapped at 0xF0000000, RAM patches read by the kernel from
+  `/usr/share/firmware/wifi/viva/soc2_2_ram_{mcu,bt,wifi}_2_1_hdr.bin` (push them first) to +0x0/+0x170000/+0x2A0000
+  with their dates at +0x88320/300/310, rails VCN18 + VCN33 at 3.3 V + VCN28 (co-clock efuse PALDO; PMIC whitelist
+  extended to those enable bits and VCN33 vosel = 1 only), then every step of mt6781_pos_gen.c and the CPU reset release;
+  success = MCU idle loop (0x18002600 == 0x1D1E). No WMT/STP and no EMI MPU SMC yet. `wifi off` undoes it. `wifi
+  status` now also shows the MCU PC.
+- **0125**: wall charger input limit: with no USB host configuring the link and BC1.2 saying unknown/non-standard/DCP,
+  REG00 IINLIM = `vivachargein` (2000 mA default, 0 = off); a host brings it back to 500 mA.
+- **0126**: K0j cost fix. 0122 walked the dependency graph (up to 128 fences, no memory, repeated per level) for every BO
+  of every SUBMIT and every WAIT_BO while the connection had a pending promise (backboardd: nearly always), under the
+  GPU gate, plus an OSArray per BO and a scan of every promise not yet pruned. Now: answers cached per fence until a
+  promise is made/resolved/signalled or a job is dropped (epoch), the common "no promise involved" case allocates
+  nothing, fPromises holds pending promises only. `gpu calls` shows "dependency walk N nodes + M cached".
