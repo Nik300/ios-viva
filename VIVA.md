@@ -507,3 +507,15 @@ data; then `wifi fw`: WIFI_START OK, ready bits 0x6, MCU PC in the EMI RAM code 
 
 Patch 0134 (NOT tested): `wifi cap` = CMD_ID_GET_NIC_CAPABILITY_V2 (0x8A) on TX ring 15 (first normal command), event 0xEC
 parsed (HW/SW version, efuse MAC, PHY caps, A-die version); calibration answer check relaxed.
+
+Patch 0135 (2026-11-04, from the GPU side, NOT tested on the phone yet): **frame rate with scanout + SwapWait (0133)**.
+Measured on 0133 (Settings scrolls): ~12 fps shown, GPU idle 84-91%, the same with the GPU pinned at 950 MHz;
+K0c "vsyncs waited for the GPU" ~1.6 per frame shown, SwapWait ~110 busy answers/s. Since 0133 CoreAnimation draws
+frame N+1 only after the page of N-1 retired (= frame N switched at a frame end), so every frame of latency between
+SwapEnd and the switch costs frame rate directly. Two latencies removed:
+- a promise resolved with a fence that had already signalled (replay's last job done before its TRANSFER) woke
+  nobody: signalFence of a promise now calls sweet_fb_gpu_done (early present);
+- with scanout live, the vsync tick looks for a finished frame before vblankTick, so a frame chosen at the tick is
+  switched at this frame end, not the next one (copies still after the switch).
+`disp` shows "latency (0135, us)": vsync -> SwapEnd (CA render), SwapEnd -> chosen (GPU done, histogram in frames),
+chosen -> on screen, SwapEnd interval, frames chosen at the tick; `disp lat reset`.

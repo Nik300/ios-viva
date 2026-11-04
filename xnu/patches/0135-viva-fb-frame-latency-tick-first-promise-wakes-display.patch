@@ -1,0 +1,223 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6adf50f..b6ce747 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -179,6 +179,24 @@ public:
+ 	bool          fDirty;
+ 	uint8_t       fQueue[SWEET_FB_QUEUE][SWEET_FB_SWAP_REC_SIZE];       /* swaps not shown yet, oldest first */
+ 	uint64_t      fQueueSeq[SWEET_FB_QUEUE];
++	uint64_t      fQueueAt[SWEET_FB_QUEUE];       /* 0135: mach time of each queued swap's SwapEnd */
++	/*
++	 * 0135 frame latency ("disp"): SwapEnd -> chosen (GPU done, K0c), chosen -> on screen (frame end), SwapEnd to
++	 * SwapEnd, last vsync notification -> SwapEnd (CoreAnimation's render time); sums, counts and maxima in mach time.
++	 */
++	struct LatStat { uint64_t sum, n, max; } fLatReady, fLatFlip, fLatSwap, fLatRender;
++	uint64_t      fLatReadyHist[5];               /* SwapEnd -> chosen in frames: <1, <2, <3, <4, more */
++	uint64_t      fLastSwapAt, fLastNotifyAt, fNextChosenAt;
++	uint64_t      fTickPresents;                  /* 0135: frames chosen at a tick before its frame end (scanout) */
++	static void latAdd(LatStat *s, uint64_t d) { s->sum += d; s->n++; if (d > s->max) s->max = d; }
++	uint64_t periodOr60(void)
++	{
++		uint64_t p = fPeriod;
++		if (p == 0) {
++			nanoseconds_to_absolutetime(16666667, &p);
++		}
++		return p;
++	}
+ 	uint32_t      fQueueCount;
+ 	uint64_t      fSeq;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies (sweetfb_hz) */
+@@ -398,9 +416,22 @@ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+-	fb->vblankTick();               /* first: a pending layer switch happens at this frame end */
+-	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	/*
++	 * 0135, scanout: look for a finished frame before the switch, so one found now is on screen at this frame end
++	 * (choosing it costs no copy). Before, it was chosen after vblankTick and switched one frame later; with
++	 * SwapWait (0133) CoreAnimation only draws the next frame once the switch retired the old page, so every frame
++	 * of latency here is a frame less per second. Copies (3 ms) still run after the switch.
++	 */
++	bool tickFirst = fb->fScanLive && fb->fFlipReady && !fb->fPowerOff;
++	if (tickFirst) {
++		uint64_t shownBefore = fb->fScanFrames;
++		fb->flushFrames(false, count);
++		fb->fTickPresents += fb->fScanFrames != shownBefore;
++	}
++	fb->vblankTick();               /* a pending layer switch happens at this frame end */
++	uint64_t now = mach_absolute_time();
++	fb->fLastNotifyAt = now;
+ 	/* args 4/5: the refresh period (QuartzCore predicts the next vblank as time + period) */
+ 	uint64_t period = fb->fPeriod;
+ 	if (period == 0) {
+@@ -445,7 +476,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		return;
+ 	}
+ 	IOLockUnlock(fb->fLock);
+-	fb->flushFrames(false, count);
++	if (!tickFirst) {
++		fb->flushFrames(false, count);
++	}
+ 	fb->rearm(sender);
+ }
+ 
+@@ -489,7 +522,7 @@ AppleCLCD::flushFrames(bool early, uint64_t count)
+ 		flush = fDirty && (fScanLive || fRetry || due);
+ 	}
+ 	uint8_t *recs = NULL;
+-	uint64_t seqs[SWEET_FB_QUEUE];
++	uint64_t seqs[SWEET_FB_QUEUE], ats[SWEET_FB_QUEUE];
+ 	uint32_t n = 0;
+ 	if (flush) {
+ 		recs = (uint8_t *)IOMallocData(SWEET_FB_QUEUE * SWEET_FB_SWAP_REC_SIZE);
+@@ -498,10 +531,12 @@ AppleCLCD::flushFrames(bool early, uint64_t count)
+ 				n = fQueueCount;
+ 				memcpy(recs, fQueue, n * SWEET_FB_SWAP_REC_SIZE);
+ 				memcpy(seqs, fQueueSeq, n * sizeof(seqs[0]));
++				memcpy(ats, fQueueAt, n * sizeof(ats[0]));
+ 			} else {
+ 				n = 1;                  /* redraw of the latest frame */
+ 				memcpy(recs, fPending, SWEET_FB_SWAP_REC_SIZE);
+ 				seqs[0] = 0;
++				ats[0] = 0;
+ 			}
+ 			fDirty = false;
+ 		}
+@@ -511,12 +546,19 @@ AppleCLCD::flushFrames(bool early, uint64_t count)
+ 		int shown = presentQueued(recs, n, early);
+ 		IOLockLock(fLock);
+ 		if (shown >= 0 && seqs[shown] != 0) {
++			uint64_t t = mach_absolute_time(), period = periodOr60();
++			if (ats[shown] != 0 && t > ats[shown]) {
++				uint64_t d = t - ats[shown];
++				latAdd(&fLatReady, d);
++				fLatReadyHist[MIN(d / period, 4ull)]++;
++			}
+ 			uint32_t keep = 0;      /* drop the shown swap and the older ones */
+ 			for (uint32_t i = 0; i < fQueueCount; i++) {
+ 				if (fQueueSeq[i] > seqs[shown]) {
+ 					if (keep != i) {
+ 						memcpy(fQueue[keep], fQueue[i], SWEET_FB_SWAP_REC_SIZE);
+ 						fQueueSeq[keep] = fQueueSeq[i];
++						fQueueAt[keep] = fQueueAt[i];
+ 					}
+ 					keep++;
+ 				}
+@@ -655,11 +697,21 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		for (uint32_t i = 1; i < SWEET_FB_QUEUE; i++) {
+ 			memcpy(fQueue[i - 1], fQueue[i], SWEET_FB_SWAP_REC_SIZE);
+ 			fQueueSeq[i - 1] = fQueueSeq[i];
++			fQueueAt[i - 1] = fQueueAt[i];
+ 		}
+ 		fQueueCount--;
+ 	}
+ 	memcpy(fQueue[fQueueCount], rec, SWEET_FB_SWAP_REC_SIZE);
++	uint64_t now = mach_absolute_time();
++	fQueueAt[fQueueCount] = now;
+ 	fQueueSeq[fQueueCount++] = ++fSeq;
++	if (fLastSwapAt != 0 && now - fLastSwapAt < 8 * periodOr60()) {
++		latAdd(&fLatSwap, now - fLastSwapAt);
++	}
++	fLastSwapAt = now;
++	if (fLastNotifyAt != 0 && now - fLastNotifyAt < 4 * periodOr60()) {
++		latAdd(&fLatRender, now - fLastNotifyAt);
++	}
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+ 	earlyKick();                    /* shown right away if the GPU has already finished it */
+@@ -981,6 +1033,14 @@ disp_wr(vm_offset_t b, uint32_t o, uint32_t v)
+ static void
+ disp_say(char **p, char *end, const char *fmt, ...) __printflike(3, 4);
+ 
++static uint64_t
++absUsFB(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
+ static void
+ disp_say(char **p, char *end, const char *fmt, ...)
+ {
+@@ -1212,6 +1272,7 @@ AppleCLCD::show(const Target &t)
+ 	fNext = t;
+ 	fNextValid = true;
+ 	fNextSwap = t.swap;
++	fNextChosenAt = mach_absolute_time();
+ }
+ 
+ void
+@@ -1496,6 +1557,9 @@ AppleCLCD::vblankTick(void)
+ 		fMisses = 0;
+ 	}
+ 	if (applied) {
++		if (fNextChosenAt != 0 && at > fNextChosenAt) {
++			latAdd(&fLatFlip, at - fNextChosenAt);
++		}
+ 		layerApply(fNext);      /* written at the frame end already: bookkeeping */
+ 		fNextValid = false;
+ 		fNextSwap = 0;
+@@ -1572,6 +1636,16 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
+ 		scanoutStop();
+ 		fDirty = true;
+ 		disp_say(&p, end, "scanout off: LK's buffer and the CPU copy again\n");
++	} else if (strncmp(args, "lat reset", 9) == 0) {
++		IOLockLock(fLock);
++		bzero(&fLatReady, sizeof(fLatReady));
++		bzero(&fLatFlip, sizeof(fLatFlip));
++		bzero(&fLatSwap, sizeof(fLatSwap));
++		bzero(&fLatRender, sizeof(fLatRender));
++		bzero(fLatReadyHist, sizeof(fLatReadyHist));
++		fTickPresents = 0;
++		IOLockUnlock(fLock);
++		disp_say(&p, end, "frame latency counters reset\n");
+ 	} else if (strncmp(args, "early on", 8) == 0) {
+ 		fEarly = fEarlyTimer != NULL;
+ 		disp_say(&p, end, "early present %s\n", fEarly ? "on" : "off (no timer)");
+@@ -1603,6 +1677,17 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
+ 		    fFlushTicks ? "every N vsyncs, N = " : "adaptive, CPU duty % = ", fFlushTicks ? fFlushTicks : fDuty);
+ 		disp_say(&p, end, "GPU sync (K0c): %llu vsyncs waited for the GPU, %llu copies redone, %llu frames shown anyway "
+ 		    "(sweetfb_gpuwait=%u)\n", fGpuWaits, fGpuRecopies, fGpuForced, fGpuWaitMax);
++		{
++			uint64_t r = absUsFB(fLatReady.n ? fLatReady.sum / fLatReady.n : 0), rm = absUsFB(fLatReady.max);
++			uint64_t f = absUsFB(fLatFlip.n ? fLatFlip.sum / fLatFlip.n : 0), fm = absUsFB(fLatFlip.max);
++			uint64_t s = absUsFB(fLatSwap.n ? fLatSwap.sum / fLatSwap.n : 0);
++			uint64_t c = absUsFB(fLatRender.n ? fLatRender.sum / fLatRender.n : 0), cm = absUsFB(fLatRender.max);
++			disp_say(&p, end, "latency (0135, us): vsync -> SwapEnd avg %llu max %llu; SwapEnd -> GPU done avg %llu max %llu "
++			    "(frames <1 %llu, <2 %llu, <3 %llu, <4 %llu, more %llu); chosen -> on screen avg %llu max %llu; SwapEnd every "
++			    "%llu (%llu swaps); %llu chosen at the tick before its switch (disp lat reset)\n", c, cm, r, rm,
++			    fLatReadyHist[0], fLatReadyHist[1], fLatReadyHist[2], fLatReadyHist[3], fLatReadyHist[4], f, fm, s,
++			    fLatSwap.n, fTickPresents);
++		}
+ 		disp_say(&p, end, "early present (K0g, sweetfb_early) %s: %llu tries, %llu frames shown before their tick\n",
+ 		    fEarly ? "on" : "off", fEarlyRuns, fEarlyShown);
+ 		disp_say(&p, end, "SwapWait: %llu busy answers (CA keeps the page), %llu blocking waits; layer reads swap %u, "
+@@ -1615,7 +1700,7 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
+ 		    fFlipWhy ? ": " : "", fFlipWhy ? fFlipWhy : "", fShown.buf < 0 ? "surface" : "buffer ",
+ 		    fShown.buf < 0 ? 0 : fShown.buf, pns / 1000, fFlips, fInPlace, fFlipMissed, fFlipUnsure, fFlipEarly,
+ 		    pollNs / 1000);
+-		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off|flip on|flip off|early on|early off]\n");
++		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off|flip on|flip off|early on|early off|lat reset]\n");
+ 	}
+ 	IOLockUnlock(fScanLock);
+ }
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index 0b115fc..76d4749 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -3358,6 +3358,12 @@ VivaGPUAccelerator::signalFence(VivaGPUFence *fence, IOReturn error, uint64_t at
+ 		if (idx != (unsigned int)-1) {
+ 			fPromises->removeObject(idx);   /* fPromises = pending promises only (vmHasPromise stays short) */
+ 		}
++		/*
++		 * 0135: the surfaces it covered may now be idle. A promise resolved with a fence that had already signalled
++		 * (the replay's last job done before its TRANSFER) used to wake nobody: the display found the frame only at
++		 * the next vsync tick and switched it one frame after that.
++		 */
++		sweet_fb_gpu_done();
+ 	}
+ 	fenceWake(fence);
+ 	OSArray *followers = fence->followers;
