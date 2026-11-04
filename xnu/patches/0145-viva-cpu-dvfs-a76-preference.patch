@@ -1,0 +1,812 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index 403f32b..0714dca 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -229,6 +229,7 @@ extern int viva_i2c_xfer_bus(uint32_t bus, uint8_t addr, const uint8_t *wbuf, ui
+ extern void viva_battery_link(const char *args, char *out, size_t outLen);   /* iokit/Kernel/arm/VivaBattery.cpp */
+ extern void viva_wifi_link(const char *args, char *out, size_t outLen);      /* bsd/dev/viva_wifi.c */
+ extern void viva_gpu_link(const char *args, char *out, size_t outLen);       /* iokit/Kernel/arm/VivaGPU.cpp */
++extern void viva_cpufreq_link(const char *args, char *out, size_t outLen);   /* osfmk/arm64/viva_cpufreq.c */
+ extern void viva_disp_link(const char *args, char *out, size_t outLen);      /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+ extern int sweet_console_muted;                                             /* osfmk/console/serial_console.c */
+ 
+@@ -935,6 +936,7 @@ vl_vivad_out(uint8_t *out, uint32_t max)
+  *   bat [poll|lpm on|off]  battery (VivaBattery.cpp): gauge, charger registers, Low Power Mode
+  *   wifi [status|detect|on|wmt|fw|cap|off]  CONNSYS (viva_wifi.c): state (read only), A-die detection, power on with RAM patches / off
+  *   gpu [ARGS]        Mali driver (VivaGPU.cpp): status, mfg, on, off, regs, freq, selftest [fault], probe, publish
++ *   cpu [ARGS]        CPU DVFS (viva_cpufreq.c): status, gov on|off, set|max ll|big|cci MHz, fast on|off, reset
+  *   push SIZE MODE FNV PATH  receive a file (raw OUT data follows; written to PATH.vivapush, renamed when
+  *                     its FNV-1a matches; missing directories are created)
+  *   pull PATH         send a file ('F' frames)
+@@ -1069,6 +1071,10 @@ vl_command(void)
+ 		static char bat_reply[4000];
+ 		viva_battery_link(rest, bat_reply, sizeof(bat_reply));
+ 		vl_reply("%s", bat_reply);
++	} else if (IS("cpu")) {
++		static char cpu_reply[4000];
++		viva_cpufreq_link(rest, cpu_reply, sizeof(cpu_reply));
++		vl_reply("%s", cpu_reply);
+ 	} else if (IS("gpu")) {
+ 		static char gpu_reply[4000];  /* vl.reply holds 4096 */
+ 		viva_gpu_link(rest, gpu_reply, sizeof(gpu_reply));
+@@ -1121,7 +1127,7 @@ vl_command(void)
+ 			delay(5000);
+ 		}
+ 	} else if (IS("help")) {
+-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+ 	} else {
+ 		vl_reply("unknown command: %s (try help)\n", c);
+ 	}
+diff --git a/iokit/Kernel/arm/VivaBattery.cpp b/iokit/Kernel/arm/VivaBattery.cpp
+index 0d44c5f..2ce08b8 100644
+--- a/iokit/Kernel/arm/VivaBattery.cpp
++++ b/iokit/Kernel/arm/VivaBattery.cpp
+@@ -181,6 +181,7 @@ static uint32_t gVivaLPMGpuMHz = 550, gVivaLPMDuty = 10;
+ 
+ extern "C" int viva_usb_host_configured(void);           /* bsd/dev/viva_usb.c */
+ extern "C" void viva_gpu_set_dvfs_cap(uint32_t mhz);      /* VivaGPU.cpp: 0 = no cap */
++extern "C" void viva_cpufreq_set_lowpower(int on);        /* osfmk/arm64/viva_cpufreq.c: CPU ceilings */
+ extern "C" void sweet_fb_set_duty_cap(uint32_t pct);      /* SweetFramebuffer.cpp: 0 = no cap */
+ 
+ static uint32_t
+@@ -203,6 +204,7 @@ viva_power_apply(void)
+ {
+ 	bool on = gVivaLowPower != 0;
+ 	viva_gpu_set_dvfs_cap(on ? gVivaLPMGpuMHz : 0);
++	viva_cpufreq_set_lowpower(on);
+ 	sweet_fb_set_duty_cap(on ? gVivaLPMDuty : 0);
+ 	IOLog("VIVA POWER: low power mode %s (GPU ceiling %u MHz, panel copy duty %u %%)\n", on ? "ON" : "off",
+ 	    on ? gVivaLPMGpuMHz : 0, on ? gVivaLPMDuty : 0);
+diff --git a/iokit/Kernel/arm/VivaPwrap.cpp b/iokit/Kernel/arm/VivaPwrap.cpp
+index 9fe2103..b8d06fa 100644
+--- a/iokit/Kernel/arm/VivaPwrap.cpp
++++ b/iokit/Kernel/arm/VivaPwrap.cpp
+@@ -54,6 +54,7 @@
+ OSDefineMetaClassAndStructors(VivaPwrap, IOService);
+ 
+ extern "C" void viva_wifi_reserve(void);        /* VivaWiFi.cpp: CONNSYS memory, before the scanout fragments it */
++extern "C" void viva_cpufreq_start(void);       /* osfmk/arm64/viva_cpufreq.c: CPU DVFS needs the PMIC */
+ 
+ static VivaPwrap *gVivaPwrap;
+ 
+@@ -98,6 +99,7 @@ VivaPwrap::start(IOService *provider)
+ 
+ 	viva_wifi_reserve();
+ 	gVivaPwrap = this;
++	viva_cpufreq_start();
+ 	registerService();
+ 	VivaDTNub::publishChildren(this, provider);
+ 	return true;
+@@ -189,6 +191,9 @@ static const struct {
+ 	{ 0x1526, 0x007f, 0x40 },       /* BUCK_VGPU_ELR0: RG_BUCK_VGPU_VOSEL, <= 0.9 V */
+ 	{ 0x1bc8, 0x0001, 0x01 },       /* LDO_VSRAM_GPU_CON0: RG_LDO_VSRAM_GPU_EN */
+ 	{ 0x1bf4, 0x007f, 0x50 },       /* LDO_VSRAM_CON3: RG_LDO_VSRAM_GPU_VOSEL, <= 1.0 V */
++	/* CPU DVFS (osfmk/arm64/viva_cpufreq.c): Vproc only, Vsram tracks it in hardware; the OPP tables' maxima */
++	{ 0x13a6, 0x007f, 0x63 },       /* BUCK_VPROC11_ELR0: RG_BUCK_VPROC11_VOSEL (A76), <= 1.11875 V */
++	{ 0x1426, 0x007f, 0x55 },       /* BUCK_VPROC12_ELR0: RG_BUCK_VPROC12_VOSEL (A55 + CCI), <= 1.03125 V */
+ 	/* CONNSYS (bsd/dev/viva_wifi.c, mt6781.c consys_hw_vcn18_ctrl): VCN18 enable/mode bits only, no voltage */
+ 	{ 0x1c58, 0x0003, 0x03 },       /* LDO_VCN18_CON0: RG_LDO_VCN18_EN, RG_LDO_VCN18_LP */
+ 	{ 0x1c5a, 0x0003, 0x03 },       /* LDO_VCN18_OP_EN: SW_OP_EN, HW0_OP_EN */
+@@ -237,8 +242,10 @@ VivaPwrap::writeRegulator(uint32_t addr, uint32_t mask, uint32_t value)
+ 	if (ret == kIOReturnSuccess && (readPMIC(addr, &now) != kIOReturnSuccess || (now & mask) != value)) {
+ 		ret = kIOReturnIOError;
+ 	}
+-	IOLog("VIVA PWRAP: regulator 0x%04x 0x%04x -> 0x%04x (reads 0x%04x) %s\n", addr, old, v, now,
+-	    ret == kIOReturnSuccess ? "ok" : "FAILED");
++	if (ret != kIOReturnSuccess || (addr != 0x13a6 && addr != 0x1426)) {   /* CPU DVFS steps are not logged */
++		IOLog("VIVA PWRAP: regulator 0x%04x 0x%04x -> 0x%04x (reads 0x%04x) %s\n", addr, old, v, now,
++		    ret == kIOReturnSuccess ? "ok" : "FAILED");
++	}
+ 	return ret;
+ }
+ 
+diff --git a/osfmk/arm64/viva_cpufreq.c b/osfmk/arm64/viva_cpufreq.c
+new file mode 100644
+index 0000000..3b4ec66
+--- /dev/null
++++ b/osfmk/arm64/viva_cpufreq.c
+@@ -0,0 +1,622 @@
++/*
++ * viva (MT6781): CPU DVFS for the two clusters (6x Cortex-A55 "LL", cpu 0-5; 2x Cortex-A76 "big", cpu 6-7) and the
++ * CCI, plus the scheduler hint that sends foreground threads to the A76s once they run fast.
++ *
++ * Nothing in this port touched the CPU clocks before: they stayed where LK left them (LL 1866 MHz, big 1085 MHz,
++ * CCI 612 MHz), so the A76s ran slower than the A55s. Stock Android does DVFS through the MCUPM firmware (hybrid
++ * cpufreq, CSRAM tables at 0x11bc00); that firmware protocol is not used here. This is the AP-side sequence of
++ * Linux's cpufreq_v1 (mtk_cpufreq_main.c set_cur_freq, mach/mt6781/mtk_cpufreq_platform.c, Xiaomi viva-r-oss):
++ *
++ *   rails  big = Vproc11 (MT6358 BUCK_VPROC11_ELR0 0x13a6, readback DBG0 0x139e), LL + CCI = Vproc12 (ELR0 0x1426,
++ *          DBG0 0x141e); 500 mV + 6.25 mV * vsel. Vsram_proc11/12 follow in hardware (TRACKING_CON0 0x1b64/0x1b6c =
++ *          on, +100 mV, clamped to 850..1118.75 mV), so only Vproc is written.
++ *   PLLs   ARMPLL_LL_CON1 0x1000c204, ARMPLL_BL_CON1 0x1000c214, CCIPLL_CON1 0x1000c2a4: PCW bits 21:0
++ *          (= MHz * posdiv * 2^14 / 26), posdiv bits 26:24 (0 = /1, 1 = /2, 2 = /4), bit 31 PCW change. FHCTL
++ *          hopping is off (0x1000ce00 = 0), so CON1 is the control. Clock dividers MCUCFG 0x0c53a2a0/a4/e0 must read
++ *          ckdiv 8 (/1) and mux 1 (ARMPLL): checked, never written.
++ *   order  up: Vproc first (wait for the readback), then the PLL; down: the PLL first, then Vproc. posdiv grows
++ *          before the PCW write and shrinks after it, as in Linux.
++ *
++ * The OPP tables are this phone's own (live DTB dvfsp@11bc00 L-table / B-table / CCI-table, which LK fills from the
++ * chip's efuse bin): {MHz, vsel, posdiv}. Index 0 is the fastest.
++ *
++ * Governor (every 16 ms, 100 ms when everything idles at the floor): busy = 1 - idle/wall per CPU from recount, the
++ * busiest CPU of a cluster counts. >= 80 % busy: the ceiling; else the slowest OPP that would be <= 70 % busy;
++ * lower OPPs only after 3 samples in a row. The CCI follows the faster cluster's OPP index. Ceilings: boot-args,
++ * Low Power Mode (viva_cpufreq_set_lowpower, VivaBattery.cpp), thermal (viva_cpufreq_set_thermal_cap).
++ *
++ * Boot-args: vivacpufreq=0 (never touch clocks/rails), 1 (governor, default), 2 (manual: link only);
++ *   vivacpubig=MHz / vivacpull=MHz / vivacpucci=MHz ceilings (default 2050/2000/1400); vivalpmcpu=MHz big ceiling
++ *   in Low Power Mode (1530; LL 1500, CCI 1050); vivacpufast=0 no scheduler preference for the A76s.
++ * USB link: cpu [status] | cpu gov on|off | cpu set ll|big|cci MHz (governor off first) | cpu max ll|big|cci MHz |
++ *   cpu fast on|off | cpu reset (counters).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <stdint.h>
++#include <string.h>
++#include <kern/misc_protos.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread_call.h>
++#include <kern/processor.h>
++#include <kern/recount.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern int viva_pwrap_read(uint32_t addr, uint32_t *value);                          /* VivaPwrap.cpp */
++extern int viva_pwrap_write_regulator(uint32_t addr, uint32_t mask, uint32_t value);
++extern uint64_t sched_viva_fast_cpus;                                                /* kern/sched_prim.c */
++
++#define NOPP 16
++struct viva_opp {
++	uint16_t mhz;
++	uint8_t vsel;
++	uint8_t pd;
++};
++
++static const struct viva_opp kOppLL[NOPP] = {
++	{ 2000, 85, 1 }, { 1933, 81, 1 }, { 1866, 77, 1 }, { 1800, 72, 1 }, { 1733, 68, 1 }, { 1666, 64, 2 },
++	{ 1618, 60, 2 }, { 1500, 57, 2 }, { 1375, 52, 2 }, { 1275, 48, 2 }, { 1175, 44, 2 }, { 1075, 40, 2 },
++	{ 975, 36, 2 }, { 875, 32, 2 }, { 774, 28, 4 }, { 500, 16, 4 },
++};
++static const struct viva_opp kOppBig[NOPP] = {
++	{ 2050, 99, 1 }, { 1986, 95, 1 }, { 1923, 90, 1 }, { 1860, 86, 1 }, { 1796, 82, 1 }, { 1733, 77, 1 },
++	{ 1670, 73, 1 }, { 1530, 66, 2 }, { 1419, 60, 2 }, { 1308, 55, 2 }, { 1169, 48, 2 }, { 1085, 44, 2 },
++	{ 1002, 39, 2 }, { 919, 35, 2 }, { 835, 31, 2 }, { 774, 28, 4 },
++};
++static const struct viva_opp kOppCCI[NOPP] = {
++	{ 1400, 85, 2 }, { 1330, 79, 2 }, { 1260, 72, 2 }, { 1190, 65, 2 }, { 1155, 62, 2 }, { 1120, 58, 2 },
++	{ 1050, 55, 2 }, { 980, 51, 2 }, { 927, 48, 2 }, { 875, 45, 2 }, { 822, 43, 2 }, { 752, 39, 4 },
++	{ 682, 35, 4 }, { 612, 31, 4 }, { 560, 28, 4 }, { 500, 16, 4 },
++};
++
++enum { DOM_LL, DOM_BIG, DOM_CCI, NDOM };
++static const char *const kDomName[NDOM] = { "ll", "big", "cci" };
++static const struct viva_opp *const kOpp[NDOM] = { kOppLL, kOppBig, kOppCCI };
++static const uint64_t kPllCon1[NDOM] = { 0x1000c204, 0x1000c214, 0x1000c2a4 };
++static const uint64_t kCkDiv[NDOM] = { 0x0c53a2a0, 0x0c53a2a4, 0x0c53a2e0 };
++#define FHCTL_HP_EN     0x1000ce00
++#define VPROC11_ELR0    0x13a6
++#define VPROC11_DBG0    0x139e
++#define VPROC12_ELR0    0x1426
++#define VPROC12_DBG0    0x141e
++#define VSRAM11_TRACK0  0x1b64
++#define VSRAM12_TRACK0  0x1b6c
++#define FLOOR_IDX       14      /* LL 774, big 835, CCI 560: the lowest OPPs are not used */
++#define LL_FIRST        0
++#define LL_LAST         5
++#define BIG_FIRST       6
++#define BIG_LAST        7
++
++static LCK_GRP_DECLARE(viva_cpufreq_grp, "viva_cpufreq");
++static LCK_MTX_DECLARE(viva_cpufreq_lock, &viva_cpufreq_grp);
++
++static int gMode = 1;           /* vivacpufreq */
++static bool gReady;             /* init passed its checks */
++static bool gGov;               /* governor running */
++static bool gFast = true;       /* vivacpufast */
++static bool gLowPower;
++static int gIdx[NDOM];          /* current OPP index */
++static int gBootIdx[NDOM];
++static int gMaxIdx[NDOM];       /* boot-arg / link ceiling (index: smaller = faster) */
++static int gLpmIdx[NDOM];       /* Low Power Mode ceiling */
++static int gThermIdx = 0;       /* thermal ceiling for big and LL (0 = none) */
++static int gDown[NDOM];
++static unsigned gBusy[NDOM];    /* last window, per mille, busiest CPU */
++static uint64_t gIdle[MAX_SCHED_CPUS], gWall[MAX_SCHED_CPUS];
++static uint64_t gSteps, gVoltWrites, gErrors, gSamples;
++static uint64_t gTimeAt[NDOM][NOPP];   /* mach ticks spent at each OPP */
++static uint64_t gLastAt;
++static const char *gWhy = "not started";
++static thread_call_t gCall;
++
++static inline uint32_t rd(uint64_t pa) { return ml_phys_read_word_64(pa); }
++static inline void wr(uint64_t pa, uint32_t v) { ml_phys_write_word_64(pa, v); }
++
++static unsigned
++pll_mhz(int d)
++{
++	uint32_t con1 = rd(kPllCon1[d]);
++	uint32_t sel = (con1 >> 24) & 7;
++	return (unsigned)((((uint64_t)(con1 & 0x3fffff) * 26) >> 14) >> (sel > 4 ? 4 : sel));
++}
++
++static bool
++ckdiv_ok(int d)
++{
++	uint32_t v = rd(kCkDiv[d]);
++	return ((v >> 17) & 0x1f) == 8 && ((v >> 9) & 3) == 1;
++}
++
++static int
++vproc_read(int rail11, uint32_t *vsel)
++{
++	uint32_t v = 0;
++	int err = viva_pwrap_read(rail11 ? VPROC11_DBG0 : VPROC12_DBG0, &v);
++	*vsel = v & 0x7f;
++	return err;
++}
++
++/* Writes Vproc and waits until the buck reports it (DA_VSEL), plus the slew time at ~5 mV/us. */
++static bool
++vproc_set(int rail11, uint32_t vsel)
++{
++	uint32_t old = 0, now = 0;
++	if (vsel < 16 || vsel > (rail11 ? 99u : 85u) || vproc_read(rail11, &old) != 0) {
++		return false;
++	}
++	if (old == vsel) {
++		return true;
++	}
++	gVoltWrites++;
++	if (viva_pwrap_write_regulator(rail11 ? VPROC11_ELR0 : VPROC12_ELR0, 0x7f, vsel) != 0) {
++		return false;
++	}
++	for (int i = 0; i < 200; i++) {
++		if (vproc_read(rail11, &now) == 0 && now == vsel) {
++			uint32_t dmv = (vsel > old ? vsel - old : old - vsel) * 625 / 100;
++			delay(10 + dmv / 5);
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++/* Linux adjust_posdiv / adjust_armpll_dds order: posdiv up before the PCW write, down after it. */
++static void
++pll_set(int d, const struct viva_opp *o)
++{
++	uint64_t pa = kPllCon1[d];
++	uint32_t con1 = rd(pa);
++	uint32_t cur = (con1 >> 24) & 7, sel = o->pd == 1 ? 0 : o->pd == 2 ? 1 : 2;
++	if (cur < sel) {
++		wr(pa, (con1 & ~(7u << 24)) | (sel << 24));
++		delay(1);
++	}
++	uint32_t dds = (((uint32_t)o->mhz * o->pd) << 14) / 26;
++	con1 = rd(pa);
++	wr(pa, (con1 & ~0x3fffffu) | (dds & 0x3fffff) | (1u << 31));
++	delay(20);
++	if (cur > sel) {
++		con1 = rd(pa);
++		wr(pa, (con1 & ~(7u << 24)) | (sel << 24));
++		delay(1);
++	}
++}
++
++static uint32_t
++vsel12_for(const int idx[NDOM])
++{
++	uint32_t a = kOppLL[idx[DOM_LL]].vsel, b = kOppCCI[idx[DOM_CCI]].vsel;
++	return a > b ? a : b;
++}
++
++static void
++account_time(void)
++{
++	uint64_t now = mach_absolute_time();
++	if (gLastAt != 0) {
++		for (int d = 0; d < NDOM; d++) {
++			gTimeAt[d][gIdx[d]] += now - gLastAt;
++		}
++	}
++	gLastAt = now;
++}
++
++/* Moves all three domains to idx[] with the rail order above. Caller holds the lock. */
++static bool
++apply(const int want[NDOM])
++{
++	int idx[NDOM];
++	bool change = false;
++	for (int d = 0; d < NDOM; d++) {
++		idx[d] = want[d] < 0 ? 0 : want[d] >= NOPP ? NOPP - 1 : want[d];
++		change |= idx[d] != gIdx[d];
++	}
++	if (!change) {
++		return true;
++	}
++	account_time();
++	uint32_t v11 = kOppBig[idx[DOM_BIG]].vsel, v12 = vsel12_for(idx);
++	uint32_t c11 = kOppBig[gIdx[DOM_BIG]].vsel, c12 = vsel12_for(gIdx);
++	if ((v11 > c11 && !vproc_set(1, v11)) || (v12 > c12 && !vproc_set(0, v12))) {
++		gErrors++;
++		gWhy = "Vproc raise failed: frequencies unchanged";
++		return false;
++	}
++	for (int d = 0; d < NDOM; d++) {
++		if (idx[d] != gIdx[d]) {
++			pll_set(d, &kOpp[d][idx[d]]);
++			gIdx[d] = idx[d];
++			gSteps++;
++		}
++	}
++	if ((v11 < c11 && !vproc_set(1, v11)) || (v12 < c12 && !vproc_set(0, v12))) {
++		gErrors++;      /* the rail stays higher than needed: safe */
++		gWhy = "Vproc lower failed (rail left high)";
++	}
++	return true;
++}
++
++static int
++ceiling(int d)
++{
++	int c = gMaxIdx[d];
++	if (gLowPower && gLpmIdx[d] > c) {
++		c = gLpmIdx[d];
++	}
++	if (d != DOM_CCI && gThermIdx > c) {
++		c = gThermIdx;
++	}
++	return c > FLOOR_IDX ? FLOOR_IDX : c;
++}
++
++static int
++idx_for_mhz(int d, unsigned mhz)
++{
++	for (int i = NOPP - 1; i > 0; i--) {
++		if (kOpp[d][i].mhz >= mhz) {
++			return i;
++		}
++	}
++	return 0;
++}
++
++static void
++update_fast_map(void)
++{
++	uint64_t m = 0;
++	if (gFast && gGov && kOppBig[ceiling(DOM_BIG)].mhz >= 1530) {
++		for (int c = BIG_FIRST; c <= BIG_LAST; c++) {
++			if (processor_array[c] != PROCESSOR_NULL) {
++				m |= 1ull << c;
++			}
++		}
++	}
++	sched_viva_fast_cpus = m;
++}
++
++/* Busy per mille of the busiest CPU in [first, last] since the last sample. */
++static unsigned
++cluster_busy(int first, int last)
++{
++	unsigned best = 0;
++	uint64_t now = mach_absolute_time();
++	for (int c = first; c <= last; c++) {
++		processor_t p = processor_array[c];
++		if (p == PROCESSOR_NULL) {
++			continue;
++		}
++		struct recount_usage usage = { 0 };
++		uint64_t idle = 0;
++		recount_processor_usage(&p->pr_recount, &usage, &idle);
++		uint64_t dw = now - gWall[c], di = idle - gIdle[c];
++		gWall[c] = now;
++		gIdle[c] = idle;
++		if (dw == 0 || di > dw) {
++			continue;
++		}
++		unsigned b = (unsigned)(1000 - di * 1000 / dw);
++		best = b > best ? b : best;
++	}
++	return best;
++}
++
++static int
++gov_target(int d, unsigned busy)
++{
++	int cap = ceiling(d);
++	if (busy >= 800) {
++		return cap;
++	}
++	unsigned need = kOpp[d][gIdx[d]].mhz * busy / 700;
++	int t = idx_for_mhz(d, need);
++	if (t < cap) {
++		t = cap;
++	}
++	if (t > FLOOR_IDX) {
++		t = FLOOR_IDX;
++	}
++	return t;
++}
++
++static void
++gov_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	bool slow = false;
++	lck_mtx_lock(&viva_cpufreq_lock);
++	if (gGov && gReady) {
++		int want[NDOM];
++		gSamples++;
++		gBusy[DOM_LL] = cluster_busy(LL_FIRST, LL_LAST);
++		gBusy[DOM_BIG] = cluster_busy(BIG_FIRST, BIG_LAST);
++		for (int d = DOM_LL; d <= DOM_BIG; d++) {
++			int t = gov_target(d, gBusy[d]);
++			if (t > gIdx[d]) {              /* slower */
++				if (++gDown[d] < 3) {
++					t = gIdx[d];
++				}
++			} else {
++				gDown[d] = 0;
++			}
++			if (t < ceiling(d)) {
++				t = ceiling(d);         /* a ceiling that moved down applies at once */
++			}
++			want[d] = t;
++		}
++		int fastest = want[DOM_LL] < want[DOM_BIG] ? want[DOM_LL] : want[DOM_BIG];
++		want[DOM_CCI] = fastest < ceiling(DOM_CCI) ? ceiling(DOM_CCI) : fastest;
++		gBusy[DOM_CCI] = gBusy[DOM_LL] > gBusy[DOM_BIG] ? gBusy[DOM_LL] : gBusy[DOM_BIG];
++		if (!apply(want)) {
++			gGov = false;
++			update_fast_map();
++			printf("VIVA CPUFREQ: %s, governor stopped\n", gWhy);
++		}
++		slow = gIdx[DOM_LL] == FLOOR_IDX && gIdx[DOM_BIG] == FLOOR_IDX && gBusy[DOM_CCI] < 100;
++	}
++	bool again = gGov && gReady;
++	lck_mtx_unlock(&viva_cpufreq_lock);
++	if (again) {
++		uint64_t deadline;
++		clock_interval_to_deadline(slow ? 100 : 16, NSEC_PER_MSEC, &deadline);
++		thread_call_enter_delayed(gCall, deadline);
++	}
++}
++
++static void
++gov_start(void)
++{
++	if (gGov || !gReady) {
++		return;
++	}
++	gGov = true;
++	memset(gDown, 0, sizeof(gDown));
++	(void)cluster_busy(LL_FIRST, BIG_LAST);  /* baseline */
++	update_fast_map();
++	uint64_t deadline;
++	clock_interval_to_deadline(16, NSEC_PER_MSEC, &deadline);
++	thread_call_enter_delayed(gCall, deadline);
++}
++
++static void
++gov_stop(void)
++{
++	gGov = false;
++	update_fast_map();
++	thread_call_cancel(gCall);
++}
++
++static bool
++init_checks(void)
++{
++	uint32_t t11 = 0, t12 = 0, v11 = 0, v12 = 0;
++	if (rd(FHCTL_HP_EN) != 0) {
++		gWhy = "FHCTL hopping enabled (PLL not under CON1 control)";
++		return false;
++	}
++	for (int d = 0; d < NDOM; d++) {
++		if (!ckdiv_ok(d)) {
++			gWhy = "unexpected CPU clock divider / mux";
++			return false;
++		}
++		unsigned mhz = pll_mhz(d);
++		int found = -1;
++		for (int i = 0; i < NOPP; i++) {
++			if (mhz + 3 >= kOpp[d][i].mhz && mhz <= kOpp[d][i].mhz + 3) {
++				found = i;
++			}
++		}
++		if (found < 0) {
++			gWhy = "boot frequency not in the OPP table";
++			return false;
++		}
++		gIdx[d] = gBootIdx[d] = found;
++	}
++	if (viva_pwrap_read(VSRAM11_TRACK0, &t11) != 0 || viva_pwrap_read(VSRAM12_TRACK0, &t12) != 0 ||
++	    (t11 & 6) != 6 || (t12 & 6) != 6) {
++		gWhy = "Vsram tracking off";
++		return false;
++	}
++	if (vproc_read(1, &v11) != 0 || vproc_read(0, &v12) != 0 ||
++	    v11 < kOppBig[gIdx[DOM_BIG]].vsel || v12 < vsel12_for(gIdx)) {
++		gWhy = "Vproc below the table for the boot frequencies";
++		return false;
++	}
++	return true;
++}
++
++/* Called from VivaPwrap::start (the PMIC is reachable from then on). */
++void
++viva_cpufreq_start(void)
++{
++	unsigned v = 0;
++	if (PE_parse_boot_argn("vivacpufreq", &v, sizeof(v))) {
++		gMode = (int)v;
++	}
++	if (PE_parse_boot_argn("vivacpufast", &v, sizeof(v))) {
++		gFast = v != 0;
++	}
++	unsigned def[NDOM] = { 2000, 2050, 1400 }, lpm[NDOM] = { 1500, 1530, 1050 };
++	const char *const arg[NDOM] = { "vivacpull", "vivacpubig", "vivacpucci" };
++	for (int d = 0; d < NDOM; d++) {
++		unsigned mhz = def[d];
++		(void)PE_parse_boot_argn(arg[d], &mhz, sizeof(mhz));
++		gMaxIdx[d] = idx_for_mhz(d, mhz);
++		while (gMaxIdx[d] < NOPP - 1 && kOpp[d][gMaxIdx[d]].mhz > mhz) {
++			gMaxIdx[d]++;
++		}
++		gLpmIdx[d] = idx_for_mhz(d, lpm[d]);
++		while (gLpmIdx[d] < NOPP - 1 && kOpp[d][gLpmIdx[d]].mhz > lpm[d]) {
++			gLpmIdx[d]++;
++		}
++	}
++	if (PE_parse_boot_argn("vivalpmcpu", &v, sizeof(v))) {
++		gLpmIdx[DOM_BIG] = idx_for_mhz(DOM_BIG, v);
++		while (gLpmIdx[DOM_BIG] < NOPP - 1 && kOppBig[gLpmIdx[DOM_BIG]].mhz > v) {
++			gLpmIdx[DOM_BIG]++;
++		}
++	}
++	if (gMode == 0) {
++		gWhy = "off (vivacpufreq=0)";
++		printf("VIVA CPUFREQ: off (vivacpufreq=0), clocks left as LK set them\n");
++		return;
++	}
++	gCall = thread_call_allocate_with_options(gov_tick, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
++	lck_mtx_lock(&viva_cpufreq_lock);
++	gReady = init_checks();
++	if (gReady) {
++		gWhy = "ok";
++		account_time();
++		if (gMode == 1) {
++			gov_start();
++		}
++	}
++	lck_mtx_unlock(&viva_cpufreq_lock);
++	printf("VIVA CPUFREQ: %s; boot ll %u MHz big %u MHz cci %u MHz; %s\n", gWhy, pll_mhz(DOM_LL), pll_mhz(DOM_BIG),
++	    pll_mhz(DOM_CCI), !gReady ? "disabled" : gMode == 1 ? "governor on" : "manual (link)");
++}
++
++void
++viva_cpufreq_set_lowpower(int on)
++{
++	lck_mtx_lock(&viva_cpufreq_lock);
++	gLowPower = on != 0;
++	update_fast_map();
++	lck_mtx_unlock(&viva_cpufreq_lock);
++}
++
++/* Thermal ceiling for both clusters as an OPP index (0 = none); applied at the next governor sample. */
++void
++viva_cpufreq_set_thermal_cap(int idx)
++{
++	gThermIdx = idx < 0 ? 0 : idx > FLOOR_IDX ? FLOOR_IDX : idx;
++}
++
++int
++viva_cpufreq_thermal_cap(void)
++{
++	return gThermIdx;
++}
++
++#define SAY(...) do { if (o < len) o += (size_t)snprintf(out + o, len - o, __VA_ARGS__); } while (0)
++
++static int
++dom_of(const char *s)
++{
++	for (int d = 0; d < NDOM; d++) {
++		if (strncmp(s, kDomName[d], strlen(kDomName[d])) == 0) {
++			return d;
++		}
++	}
++	return -1;
++}
++
++static const char *
++skip(const char *s)
++{
++	while (*s == ' ') {
++		s++;
++	}
++	return s;
++}
++
++static const char *
++word_end(const char *s)
++{
++	while (*s && *s != ' ') {
++		s++;
++	}
++	return s;
++}
++
++void
++viva_cpufreq_link(const char *args, char *out, size_t len)
++{
++	size_t o = 0;
++	const char *a = skip(args ? args : "");
++	out[0] = 0;
++	lck_mtx_lock(&viva_cpufreq_lock);
++	if (strncmp(a, "gov", 3) == 0) {
++		const char *b = skip(word_end(a));
++		if (strncmp(b, "on", 2) == 0) {
++			gov_start();
++		} else if (strncmp(b, "off", 3) == 0) {
++			gov_stop();
++		}
++		SAY("governor %s\n", gGov ? "on" : "off");
++	} else if (strncmp(a, "fast", 4) == 0) {
++		const char *b = skip(word_end(a));
++		gFast = strncmp(b, "off", 3) != 0;
++		update_fast_map();
++		SAY("A76 preference %s (fast cpus 0x%llx)\n", gFast ? "on" : "off", sched_viva_fast_cpus);
++	} else if (strncmp(a, "reset", 5) == 0) {
++		gSteps = gVoltWrites = gErrors = gSamples = 0;
++		memset(gTimeAt, 0, sizeof(gTimeAt));
++		gLastAt = 0;
++		account_time();
++		SAY("counters reset\n");
++	} else if (strncmp(a, "set", 3) == 0 || strncmp(a, "max", 3) == 0) {
++		bool set = a[0] == 's';
++		const char *b = skip(word_end(a));
++		int d = dom_of(b);
++		const char *c = skip(word_end(b));
++		unsigned mhz = 0;
++		while (*c >= '0' && *c <= '9') {
++			mhz = mhz * 10 + (unsigned)(*c++ - '0');
++		}
++		if (d < 0 || mhz == 0) {
++			SAY("usage: cpu %s ll|big|cci MHz\n", set ? "set" : "max");
++		} else if (!gReady) {
++			SAY("not available: %s\n", gWhy);
++		} else if (set && gGov) {
++			SAY("governor is on: cpu gov off first\n");
++		} else {
++			int i = idx_for_mhz(d, mhz);
++			while (i < NOPP - 1 && kOpp[d][i].mhz > mhz) {
++				i++;
++			}
++			if (set) {
++				int want[NDOM] = { gIdx[0], gIdx[1], gIdx[2] };
++				want[d] = i < ceiling(d) ? ceiling(d) : i;
++				bool ok = apply(want);
++				SAY("%s -> %u MHz (opp %d): %s\n", kDomName[d], kOpp[d][gIdx[d]].mhz, gIdx[d], ok ? "ok" : gWhy);
++			} else {
++				gMaxIdx[d] = i;
++				update_fast_map();
++				SAY("%s ceiling %u MHz (opp %d)\n", kDomName[d], kOpp[d][i].mhz, i);
++			}
++		}
++	} else {
++		uint32_t v11 = 0, v12 = 0;
++		(void)vproc_read(1, &v11);
++		(void)vproc_read(0, &v12);
++		account_time();
++		SAY("cpufreq: %s, governor %s, mode %d, low power %s, thermal cap opp %d, A76 preference %s (0x%llx)\n",
++		    gWhy, gGov ? "on" : "off", gMode, gLowPower ? "on" : "off", gThermIdx, gFast ? "on" : "off",
++		    sched_viva_fast_cpus);
++		for (int d = 0; d < NDOM; d++) {
++			SAY("  %-3s %4u MHz (opp %2d, table %4u, boot %4u), ceiling %4u, busy %3u.%u %%\n", kDomName[d],
++			    pll_mhz(d), gIdx[d], kOpp[d][gIdx[d]].mhz, kOpp[d][gBootIdx[d]].mhz, kOpp[d][ceiling(d)].mhz,
++			    gBusy[d] / 10, gBusy[d] % 10);
++		}
++		SAY("  Vproc11 (big) %u mV, Vproc12 (ll+cci) %u mV; %llu steps, %llu rail writes, %llu errors, %llu samples\n",
++		    500 + v11 * 625 / 100, 500 + v12 * 625 / 100, gSteps, gVoltWrites, gErrors, gSamples);
++		for (int d = 0; d < NDOM; d++) {
++			uint64_t tot = 0;
++			for (int i = 0; i < NOPP; i++) {
++				tot += gTimeAt[d][i];
++			}
++			SAY("  time %-3s:", kDomName[d]);
++			for (int i = 0; i < NOPP && tot; i++) {
++				if (gTimeAt[d][i] * 100 / tot) {
++					SAY(" %u:%llu%%", kOpp[d][i].mhz, gTimeAt[d][i] * 100 / tot);
++				}
++			}
++			SAY("\n");
++		}
++		SAY("usage: cpu [status] | gov on|off | set ll|big|cci MHz | max ll|big|cci MHz | fast on|off | reset\n");
++	}
++	lck_mtx_unlock(&viva_cpufreq_lock);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index b0dad49..56ff998 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -41,6 +41,7 @@ osfmk/arm/arm_timer.c		standard
+ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
++osfmk/arm64/viva_cpufreq.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..7222b5f 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5021,6 +5021,34 @@ choose_next_pset(
+  *	The thread must be locked.  The pset must be locked,
+  *	and the resulting pset is locked on return.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * viva: one homogeneous pset holds 6 Cortex-A55s and 2 Cortex-A76s. Once the A76s run fast (osfmk/arm64/
++ * viva_cpufreq.c sets this map), threads at or above user-initiated priority take an idle A76 first and
++ * lower-priority threads an idle A55 first. 0 = the stock lowest-idle-cpu choice.
++ */
++uint64_t sched_viva_fast_cpus = 0;
++
++static processor_t
++viva_pick_idle(processor_set_t pset, thread_t thread, cpumap_t idle)
++{
++	cpumap_t fast = idle & sched_viva_fast_cpus;
++	int cpuid;
++	if (sched_viva_fast_cpus == 0 || idle == 0) {
++		return PROCESSOR_NULL;
++	}
++	if (thread->sched_pri >= BASEPRI_USER_INITIATED && fast != 0) {
++		cpuid = lsb_first(fast);
++	} else if ((idle & ~sched_viva_fast_cpus) != 0) {
++		cpuid = lsb_first(idle & ~sched_viva_fast_cpus);
++	} else {
++		cpuid = lsb_first(idle);
++	}
++	(void)pset;
++	return cpuid >= 0 ? processor_array[cpuid] : PROCESSOR_NULL;
++}
++#endif
++
+ processor_t
+ choose_processor(
+ 	processor_set_t         starting_pset,
+@@ -5084,6 +5112,16 @@ choose_processor(
+ 				 * the "least cost idle" processor above.
+ 				 */
+ 				if ((thread->sched_pri < BASEPRI_RTQUEUES) || processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++					if (thread->sched_pri < BASEPRI_RTQUEUES && sched_viva_fast_cpus != 0 &&
++					    ((sched_viva_fast_cpus >> processor->cpu_id) & 1) != (thread->sched_pri >= BASEPRI_USER_INITIATED)) {
++						processor_t vp = viva_pick_idle(pset, thread, pset->cpu_state_map[PROCESSOR_IDLE] &
++						    pset->primary_map & pset->recommended_bitmask & ~pset->pending_AST_URGENT_cpu_mask);
++						if (vp != PROCESSOR_NULL) {
++							return vp;
++						}
++					}
++#endif
+ 					return processor;
+ 				}
+ 				processor = PROCESSOR_NULL;
+@@ -5246,6 +5284,12 @@ no_available_cpus:
+ 		/* there shouldn't be a pending AST if the processor is idle */
+ 		assert((idle_primary_map & pset->pending_AST_URGENT_cpu_mask) == 0);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		processor_t vp = viva_pick_idle(pset, thread, idle_primary_map);
++		if (vp != PROCESSOR_NULL) {
++			return vp;
++		}
++#endif
+ 		int cpuid = lsb_first(idle_primary_map);
+ 		if (cpuid >= 0) {
+ 			processor = processor_array[cpuid];
