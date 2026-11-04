@@ -1,0 +1,118 @@
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -13,6 +13,7 @@
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
++iokit/Kernel/arm/SweetAMFI.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetGIC.cpp                                    optional iokitcpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -58,6 +58,11 @@
+     "     'IOMatchCategory' = IOWatchdog;"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleMobileFileIntegrity;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleMobileFileIntegrity;"
++    "   },"
++    "   {"
+     "     'IOClass'         = IOCoreSurfaceRoot;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOCoreSurfaceRoot;"
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAMFI.cpp
+@@ -0,0 +1,91 @@
++/*
++ * Built-in AppleMobileFileIntegrity IOService for SWEET.
++ *
++ * The AMFI kext publishes an IOService of this class with a user client.
++ * ExtensionFoundation (+[NSDictionary _EX_dictionaryWithSignedURL:error:])
++ * only trusts the extension point cache after checking its cdhash in the
++ * trust cache through it: IOConnectCallMethod selector 6, scalar 1 (hash
++ * type), struct = cdhash; 0 = in the trust cache, kIOReturnNotFound = not.
++ * Without the service it fails with "Unable to find AMFI", installd knows no
++ * extension point and LaunchServices drops every NSExtension appex whose
++ * point comes from that cache (posterkit.provider, widgetkit-extension...).
++ * SWEET has no trust cache and runs every binary (sweet_amfi.c), so
++ * selector 6 answers "trusted". Other selectors are not implemented
++ * (kIOReturnUnsupported); each selector is logged the first time it is used.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <sys/proc.h>
++
++class AppleMobileFileIntegrity : public IOService {
++	OSDeclareDefaultStructors(AppleMobileFileIntegrity);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrity, IOService);
++
++bool
++AppleMobileFileIntegrity::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "AppleMobileFileIntegrityUserClient");
++	registerService();
++	IOLog("SWEET AMFI: AppleMobileFileIntegrity registered (trust cache checks always pass)\n");
++	return true;
++}
++
++class AppleMobileFileIntegrityUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleMobileFileIntegrityUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrityUserClient, IOUserClient);
++
++IOReturn
++AppleMobileFileIntegrityUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++#define SWEET_AMFI_SEL_TRUST_CACHE 6
++
++static uint64_t sweet_amfi_uc_logged;   /* selectors already logged (< 64) */
++
++IOReturn
++AppleMobileFileIntegrityUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	IOReturn ret = (selector == SWEET_AMFI_SEL_TRUST_CACHE) ? kIOReturnSuccess : kIOReturnUnsupported;
++
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (selector >= 64 || !(sweet_amfi_uc_logged & (1ULL << selector))) {
++		if (selector < 64) {
++			sweet_amfi_uc_logged |= 1ULL << selector;
++		}
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AMFI: %s sel %u in %u/%u out %u/%u -> %#x\n", name, selector,
++		    args->scalarInputCount, args->structureInputSize,
++		    args->scalarOutputCount, args->structureOutputSize, ret);
++	}
++	return ret;
++}
++#endif /* SWEET */
