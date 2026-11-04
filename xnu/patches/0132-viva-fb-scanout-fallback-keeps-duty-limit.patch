@@ -1,0 +1,48 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 74801b5..c26b781 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -201,6 +201,7 @@ public:
+ 	uint32_t      fLkAddr, fLkPitch, fLkPitchMsb;
+ 	char          fScanLayer[16];
+ 	bool          fScanOn;        /* allowed */
++	bool          fScanLive;      /* the last frame shown was scanned out (not copied) */
+ 	uint64_t      fScanFrames, fScanFallbacks;
+ 	const char   *fScanWhy;       /* last reason for falling back */
+ 
+@@ -467,11 +468,11 @@ AppleCLCD::flushFrames(bool early, uint64_t count)
+ 	bool flush;
+ 	if (early) {
+ 		/* scanout costs no copy; a copy only within the duty budget (the tick covers the rest) */
+-		flush = fDirty && !fPowerOff && fFlushTicks == 0 && (fScanOn || now >= fNextCopy);
++		flush = fDirty && !fPowerOff && fFlushTicks == 0 && (fScanLive || now >= fNextCopy);
+ 	} else {
+ 		/* scanout or a frame held back for the GPU: every vsync */
+ 		bool due = fFlushTicks ? (count % fFlushTicks) == 0 : now >= fNextCopy;
+-		flush = fDirty && (fScanOn || fRetry || due);
++		flush = fDirty && (fScanLive || fRetry || due);
+ 	}
+ 	uint8_t *recs = NULL;
+ 	uint64_t seqs[SWEET_FB_QUEUE];
+@@ -754,7 +755,12 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
+ 		fFlipTried = true;              /* once: findLKLayer and the frame-end calibration (< 0.1 s) */
+ 		flipSetup(NULL, NULL);
+ 	}
+-	if (fScanOn && scanout(rec)) {
++	/*
++	 * Scanout costs no copy, so a scanned-out frame skips the CPU duty limit; a frame that falls back to the copy
++	 * does not (with scanout "on" but every frame copied, copies used to run at every vsync and early present).
++	 */
++	fScanLive = fScanOn && scanout(rec);
++	if (fScanLive) {
+ 		IOLockUnlock(fScanLock);
+ 		fGpuTicks = 0;
+ 		return true;
+@@ -1506,6 +1512,7 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
+ 		}
+ 	} else if (strncmp(args, "scanout off", 11) == 0) {
+ 		fScanOn = false;
++		fScanLive = false;
+ 		scanoutStop();
+ 		fDirty = true;
+ 		disp_say(&p, end, "scanout off: LK's buffer and the CPU copy again\n");

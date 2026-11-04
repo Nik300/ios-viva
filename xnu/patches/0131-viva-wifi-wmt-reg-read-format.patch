@@ -1,0 +1,39 @@
+diff --git a/bsd/dev/viva_wifi.c b/bsd/dev/viva_wifi.c
+index 807c907..3f38533 100644
+--- a/bsd/dev/viva_wifi.c
++++ b/bsd/dev/viva_wifi.c
+@@ -806,14 +806,11 @@ wmt_cmd(const char *what, const uint8_t *cmd, uint32_t clen, const uint8_t *want
+ 		say("wmt: %s: no answer (%d, LSR 0x%02x)\n", what, n, rd(BTIF_LSR) & 0xff);
+ 	} else {
+ 		say("wmt: %s ->", what);
+-		for (int i = 0; i < n && i < 16; i++) {
++		for (int i = 0; i < n && i < 24; i++) {
+ 			say(" %02x", ev[i]);
+ 		}
+ 		bool ok = want == NULL || ((uint32_t)n >= wlen && memcmp(ev, want, wlen) == 0);
+-		say("%s\n", ok ? "" : "  (UNEXPECTED)");
+-		if (!ok) {
+-			n = -4;
+-		}
++		say("%s\n", ok ? "" : "  (UNEXPECTED: shown, sequence goes on)");
+ 	}
+ 	*po = o;
+ 	return n;
+@@ -833,10 +830,15 @@ wifi_wmt(char *out, size_t len, size_t o)
+ 	/* wmt_core_hw_check: register read 0x80000008 (GEN_HCR) in mand mode */
+ 	static const uint8_t regrd[] = { 0x01, 0x08, 0x10, 0x00, 0x02, 0x01, 0x00, 0x01, 0x08, 0x00, 0x00, 0x80,
+ 		                         0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff };
+-	static const uint8_t regrdEv[] = { 0x02, 0x08, 0x08, 0x00, 0x00, 0x01, 0x00, 0x01 };
+-	if (wmt_cmd("read 0x80000008", regrd, sizeof(regrd), regrdEv, sizeof(regrdEv), 1000, ev, sizeof(ev), out, len, &o) < 0) {
++	/* MT6781 answers 02 08 0c 00 | status 00, 00 00 01 | address | value (0127+0130 on the phone) */
++	static const uint8_t regrdEv[] = { 0x02, 0x08, 0x0c, 0x00, 0x00 };
++	int rn = wmt_cmd("read 0x80000008", regrd, sizeof(regrd), regrdEv, sizeof(regrdEv), 1000, ev, sizeof(ev), out, len, &o);
++	if (rn < 0) {
+ 		return o;
+ 	}
++	if (rn >= 16) {
++		say("wmt: GEN_HCR 0x%02x%02x%02x%02x (the MCU answers over STP/BTIF)\n", ev[15], ev[14], ev[13], ev[12]);
++	}
+ 	static const uint8_t qstp[] = { 0x01, 0x04, 0x01, 0x00, 0x04 };
+ 	static const uint8_t qstpDef[] = { 0x02, 0x04, 0x06, 0x00, 0x00, 0x04, 0x11, 0x00, 0x00, 0x00 };
+ 	static const uint8_t qstpFull[] = { 0x02, 0x04, 0x06, 0x00, 0x00, 0x04, 0xdb, 0x0e, 0x68, 0x01 };
