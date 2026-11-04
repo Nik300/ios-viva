@@ -553,3 +553,12 @@ zero leeway changes nothing. On the phone (0138): every tick with a switch pendi
 end (6492 deferred for 2682 switches, chosen -> on screen avg 38 ms, SwapEnd every 34 ms ≈ 29 fps). Only urgency
 `TIMEOUT_URGENCY_SYS_CRITICAL` has no slop, and IOTimerEventSource cannot pass it: new option
 `kIOTimeOptionsSysCritical` (0x200) maps to `THREAD_CALL_DELAY_SYS_CRITICAL`; the vsync rearm uses it.
+0138-mac on the phone: IOKit quiet, MobileGestalt answers (WifiAddress 02:41:00:00:00:01, UDID 79ac8bfd...), lsd no
+longer hangs and a full LS rebuild completes (30-90 s), but still 1 extension in the DB. lsd's os_log (new probe
+`viva-tests/vlog SECS [PROC]`, live os_activity stream) shows why: ExtensionFoundation
+`_EX_dictionaryWithSignedURL:` refuses the extension point cache ("Unable to find AMFI": it checks the cache's cdhash via
+IOServiceMatching("AppleMobileFileIntegrity") + user client selector 6), so installd rejects 83 appexes "specifies a value
+(com.apple.widgetkit-extension) for NSExtensionPointIdentifier ... that does not correspond to a known extension point".
+Patch 0140 (CI 41776680999, includes the other agent's 0139 vsync; image `out/xnu-ufs-rw-0140.img` with the MAC ADT,
+NOT tested): built-in AppleMobileFileIntegrity IOService on IOResources, sel 6 -> success, other selectors unsupported
+(logged once as `SWEET AMFI:`). After boot: full rebuild (`viva-tests/vlsr`), then `vwall lsext` / `vwall ext`.
