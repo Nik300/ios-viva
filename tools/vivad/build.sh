@@ -8,3 +8,6 @@ mkdir -p "$(dirname "$OUT")"
 xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -o "$OUT" "$HERE/vivad.c"
 codesign -s - -f "$OUT"
 file "$OUT"
+# vln (symbolic links: iOS has no ln), next to vivad
+xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -o "$(dirname "$OUT")/vln" "$HERE/vln.c"
+codesign -s - -f "$(dirname "$OUT")/vln"
