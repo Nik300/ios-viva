@@ -1,0 +1,39 @@
+diff --git a/bsd/dev/viva_wifi.c b/bsd/dev/viva_wifi.c
+index af597bd..c4da1b4 100644
+--- a/bsd/dev/viva_wifi.c
++++ b/bsd/dev/viva_wifi.c
+@@ -1812,16 +1812,19 @@ data_rx(const uint8_t *eth, uint32_t len)
+ 		sj.rxDrops++;
+ 		return;
+ 	}
++	/* one mbuf with a 2 KiB cluster, lengths set explicitly (as sweet_usb.c; viva_wlan_input strips 14 bytes) */
+ 	mbuf_t m = NULL;
+-	if (mbuf_allocpacket(MBUF_DONTWAIT, len, NULL, &m) != 0) {
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0) {
+ 		sj.rxDrops++;
+ 		return;
+ 	}
+-	if (mbuf_copyback(m, 0, len, eth, MBUF_DONTWAIT) != 0) {
++	if (mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < len) {
+ 		mbuf_freem(m);
+ 		sj.rxDrops++;
+ 		return;
+ 	}
++	memcpy(mbuf_data(m), eth, len);
++	mbuf_setlen(m, len);
+ 	mbuf_pkthdr_setlen(m, len);
+ 	if (vn.rxTail) {
+ 		mbuf_setnextpkt(vn.rxTail, m);
+diff --git a/bsd/dev/viva_wlan.c b/bsd/dev/viva_wlan.c
+index 2f4c2ce..454a481 100644
+--- a/bsd/dev/viva_wlan.c
++++ b/bsd/dev/viva_wlan.c
+@@ -174,7 +174,7 @@ void
+ viva_wlan_input(mbuf_t m)
+ {
+ 	ifnet_t ifp = wn.ifp;
+-	if (ifp == NULL || mbuf_pkthdr_len(m) < ETHER_HDR_LEN) {
++	if (ifp == NULL || mbuf_pkthdr_len(m) < ETHER_HDR_LEN || mbuf_len(m) < ETHER_HDR_LEN) {
+ 		mbuf_freem(m);
+ 		return;
+ 	}

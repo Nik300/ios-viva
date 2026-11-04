@@ -640,3 +640,10 @@ RAM: the live DT says 6 GiB (`reg <0x40000000 0x1_80000000>`, rank0 2 GiB at 0x4
 XNU gets only 0xc0000000-0x1be000000 (~3.97 GiB) because rank0 holds LK's no-map reservations (TEE, ATF, modem SMEM,
 SCP/SSPM, framebuffer: ~472 MiB in 24 regions); ~1.5 GiB of rank0 is free but in holes. Using it needs hole support
 in arm_vm_init/pmap (not done).
+
+### 0150: received frames as one cluster mbuf
+0149 on the phone: joining from Settings panicked after the password, "after some loading" (no photo of the text yet;
+the link was gone, panic screen). Suspect: data_rx built the mbuf with mbuf_allocpacket (m_len 0) + mbuf_copyback, and
+viva_wlan_input strips 14 bytes with mbuf_len(m) - 14: if copyback left m_len short, the first frame after the link
+came up (DHCP) went to IP with a huge length. Now gethdr + 2 KiB cluster + memcpy + explicit lengths (as sweet_usb.c),
+and viva_wlan_input drops a frame whose first mbuf is shorter than the Ethernet header. NOT tested.
