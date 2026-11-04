@@ -545,3 +545,11 @@ hung and lsd with it. Second wait: MobileGestalt's WifiAddress reads `IODeviceTr
 and without it waits for an IOService named sdio/wlan/marconi-wifi. mkadt (commit 8a985d5) now adds synthetic
 `mac-address-wifi0` 02:41:00:00:00:01 and `mac-address-bluetooth0` ..:02. Image `out/xnu-ufs-rw-0138-mac.img`
 (kernel 0138 + that ADT), NOT tested yet.
+
+### 0139: vsync tick without timer coalescing
+
+0136 passed `kIOTimeOptionsWithLeeway` with leeway 0, but XNU computes `slop = MAX(coalescing slop, leeway)`, so a
+zero leeway changes nothing. On the phone (0138): every tick with a switch pending came avg 35 us *after* the frame
+end (6492 deferred for 2682 switches, chosen -> on screen avg 38 ms, SwapEnd every 34 ms ≈ 29 fps). Only urgency
+`TIMEOUT_URGENCY_SYS_CRITICAL` has no slop, and IOTimerEventSource cannot pass it: new option
+`kIOTimeOptionsSysCritical` (0x200) maps to `THREAD_CALL_DELAY_SYS_CRITICAL`; the vsync rearm uses it.
