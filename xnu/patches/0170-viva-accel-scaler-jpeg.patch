@@ -1,0 +1,1471 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -92,6 +92,9 @@
+ uint64_t sweet_surface_before_device_read(SweetSurface *surface);
+ uint64_t sweet_surface_before_cpu_access(SweetSurface *surface);
+ void sweet_surface_device_wrote(SweetSurface *surface);
++/* new seed (contents changed outside a lock); cpu_wrote = CPU-dirty + new seed (the kernel wrote it, VivaScaler) */
++void sweet_surface_seed_bump(SweetSurface *surface);
++void sweet_surface_cpu_wrote(SweetSurface *surface);
+ 
+ /*
+  * viva GPU (VivaGPU.cpp), any thread but the GPU's work loop: no GPU job using the surface is pending (true when
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -162,6 +162,25 @@
+ 	return OSCompareAndSwap(1, 0, &s->cpuDirty) ? sweet_surface_clean(s) : 0;
+ }
+ 
++/* New contents for whoever compares seeds (the Metal driver copies a surface in again only when it moved). */
++void
++sweet_surface_seed_bump(SweetSurface *s)
++{
++	if (s->state != NULL) {
++		OSIncrementAtomic((volatile SInt32 *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED));
++	}
++}
++
++/* The kernel wrote the pixels with the CPU (scaler): like an IOSurfaceUnlock after a write lock. */
++void
++sweet_surface_cpu_wrote(SweetSurface *s)
++{
++	if (OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL) {
++		OSCompareAndSwap(0, 1, &s->cpuDirty);
++	}
++	sweet_surface_seed_bump(s);
++}
++
+ uint64_t
+ sweet_surface_before_cpu_access(SweetSurface *s)
+ {
+diff --git a/iokit/Kernel/arm/VivaScaler.h b/iokit/Kernel/arm/VivaScaler.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaScaler.h
+@@ -0,0 +1,106 @@
++/*
++ * viva (MT6781): AppleM2ScalerCSCDriver, the service behind IOSurfaceAccelerator.framework (scaling, colour
++ * conversion and copies between IOSurfaces). User-client ABI reverse-engineered from iOS 16.7.16 (20H392):
++ * gpu/docs/ABI-IOSURFACEACCELERATOR.md in the viva-gpu repository.
++ *
++ * Boot-arg vivascaler (the Viva Manager app sets it, MaliMetal > Acceleratori):
++ *   0 (default)  the service is not published: every client falls back as before (QuartzCore to the GPU,
++ *                VideoToolbox to software conversions)
++ *   1            published, transfers done by the CPU in the kernel (backend "cpu")
++ *   2            published, transfers on the MDP engines (RDMA -> RSZ -> WROT) when the format and size allow it,
++ *                the CPU otherwise (backend "mdp"; needs the MDP power domain: falls back to 1 if it is off)
++ * vivascalerformats (bitmask, default 3): 1 = 32-bit RGB (BGRA/RGBA/ARGB), 2 = 4:2:0 biplanar (420v/420f) as
++ *   source. Formats outside the mask are refused with kIOReturnUnsupported, which every client handles by
++ *   falling back (VideoToolbox propagates errors of a published service, hence the mask).
++ *
++ * Counters: property "VivaScalerStats" of the service (ioreg / Viva Manager).
++ */
++#ifndef _IOKIT_ARM_VIVASCALER_H
++#define _IOKIT_ARM_VIVASCALER_H
++
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLocks.h>
++
++/* Selector 1 request (0x170 bytes), see the ABI document section 2.2 */
++struct viva_scaler_request {
++	uint32_t srcID, dstID;
++	uint64_t callback, refcon, refcon2;
++	uint64_t flags;
++	uint64_t srcX, srcY, srcW, srcH;        /* 16.16 fixed point; all zero = the whole surface */
++	uint64_t reserved0, reserved1;
++	uint32_t dstX, dstY, dstW, dstH;        /* pixels; all zero = the whole surface */
++	uint32_t alphaOverride;
++	uint32_t borderX, borderY, borderW, borderH, borderA, borderR, borderG, borderB;
++	uint16_t woAlpha, woRed, woGreen, woBlue;
++	uint8_t  reserved2[8];
++	uint32_t histBinMode, histX, histY, histW, histH;
++	uint32_t histBins[8];
++	uint8_t  comm[4][0x28];
++};
++
++enum {
++	kVivaScalerFlagTransformMask    = 0x7,
++	kVivaScalerFlagNearest          = 1ull << 7,
++	kVivaScalerFlagSkipAsync        = 1ull << 10,
++	kVivaScalerFlagAlphaOverride    = 1ull << 18,
++	kVivaScalerFlagBorderFill       = 1ull << 28,
++	kVivaScalerFlagHistogram        = 1ull << 29,
++	kVivaScalerFlagZeroFill         = 1ull << 30,
++};
++
++class SweetSurface;
++struct viva_mdp;
++
++class AppleM2ScalerCSCDriver : public IOService {
++	OSDeclareDefaultStructors(AppleM2ScalerCSCDriver);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++
++	/* Selector 1: does the transfer (synchronously) and returns its status. */
++	IOReturn transfer(const struct viva_scaler_request *req, task_t task);
++	void noteCustomFilter(void) { fCustomFilters++; }
++
++private:
++	IOReturn transferLocked(const struct viva_scaler_request *req, SweetSurface *src, SweetSurface *dst,
++	    const char **backend);
++	void publishStats(void);
++
++	IOLock   *fLock;            /* one transfer at a time (CPU work is short; the MDP has one pipe) */
++	int       fMode;
++	uint32_t  fFormats;
++	struct viva_mdp *fMdp;      /* NULL = CPU only */
++	uint64_t  fTransfers, fCpu, fMdpDone, fUnsupported, fErrors, fBytes, fNs, fCustomFilters, fClients;
++	uint64_t  fLastPublish;
++};
++
++class AppleM2ScalerCSCDriverUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleM2ScalerCSCDriverUserClient);
++public:
++	virtual bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++
++private:
++	AppleM2ScalerCSCDriver *fOwner;
++	task_t                  fTask;
++	mach_port_t             fPort;
++};
++
++/*
++ * MDP backend (VivaMDP.cpp). viva_mdp_create returns NULL when the engines cannot be used (power domain off,
++ * boot-arg). viva_mdp_transfer returns kIOReturnUnsupported for anything it does not handle, so the caller
++ * falls back to the CPU.
++ */
++struct viva_mdp *viva_mdp_create(void);
++IOReturn viva_mdp_transfer(struct viva_mdp *mdp, SweetSurface *src, SweetSurface *dst,
++    uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
++    uint64_t flags);
++
++#endif /* _IOKIT_ARM_VIVASCALER_H */
+diff --git a/iokit/Kernel/arm/VivaScaler.cpp b/iokit/Kernel/arm/VivaScaler.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaScaler.cpp
+@@ -0,0 +1,545 @@
++/*
++ * viva (MT6781): AppleM2ScalerCSCDriver (see VivaScaler.h), the IOSurfaceAccelerator service.
++ *
++ * Selectors (ABI from iOS 16.7.16's IOSurfaceAccelerator.framework):
++ *   1  Transfer/Transform/Blit: struct in 0x170 bytes (viva_scaler_request), nothing out. Done synchronously;
++ *      with a callback and no SkipAsyncCallback the completion goes to the port registered with
++ *      IOConnectSetNotificationPort(type 0) as kIOAsyncCompletionNotificationType with one argument (refcon2):
++ *      QuartzCore releases the surfaces of a copy only in that callback. On an error the call fails and no
++ *      notification is sent (the framework's callers call back themselves).
++ *   2, 3  abort transfers / captures: nothing pending, success
++ *   4  custom filter coefficients (struct 0x20): accepted and ignored (bilinear / nearest only)
++ *   5  scaler id: 0
++ *   7  performance stats configuration: success
++ *   0, 8, 9  capture, kernel tests, histogram: kIOReturnUnsupported
++ *
++ * Backends: the MDP engines (VivaMDP.cpp, vivascaler=2) and the CPU. The CPU path reads the source through the
++ * kernel mapping after the GPU jobs on both surfaces are done and the CPU's stale lines are dropped, writes the
++ * destination and marks it CPU-dirty with a new seed, like an IOSurfaceLock/Unlock pair would (the Metal driver
++ * copies surfaces in again only when the seed moved).
++ *
++ * Formats: source and destination BGRA/RGBA/ARGB 8888 (any of them, channel order converted), scaled with
++ * bilinear or nearest filtering; source 420v/420f (NV12, video/full range, BT.601 below 720 lines, BT.709 from
++ * 720) to a 32-bit destination. Flip/rotate (Transform != 0), YUV destinations and 10-bit formats are
++ * refused with kIOReturnUnsupported.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSDictionary.h>
++#include <mach/mach_time.h>
++#include <kern/clock.h>
++
++#include "VivaScaler.h"
++#include "SweetSurface.h"
++
++extern "C" void iokit_release_port_send(ipc_port_t port);
++
++static_assert(sizeof(struct viva_scaler_request) == 0x170, "selector 1 request is 0x170 bytes");
++
++#define FOURCC(a, b, c, d)      (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
++#define PF_BGRA                 FOURCC('B', 'G', 'R', 'A')
++#define PF_RGBA                 FOURCC('R', 'G', 'B', 'A')
++#define PF_ARGB                 0x00000020u     /* kCVPixelFormatType_32ARGB */
++#define PF_420V                 FOURCC('4', '2', '0', 'v')
++#define PF_420F                 FOURCC('4', '2', '0', 'f')
++
++#define SCALER_GPU_WAIT_MS      1000
++
++OSDefineMetaClassAndStructors(AppleM2ScalerCSCDriver, IOService);
++OSDefineMetaClassAndStructors(AppleM2ScalerCSCDriverUserClient, IOUserClient);
++
++/* ---- Capabilities (registry) --------------------------------------------------------------------------------- */
++
++static void
++setNumber(OSDictionary *d, const char *key, uint64_t value)
++{
++	OSNumber *n = OSNumber::withNumber(value, 32);
++	if (n != NULL) {
++		d->setObject(key, n);
++		n->release();
++	}
++}
++
++/*
++ * IOSurfaceAcceleratorCapabilitiesDict: limits QuartzCore and AppleJPEG read. Deliberately absent: ColorManager
++ * (ImageIO's colour matching), HDR, Accessibility (colour remap), DirectionalScaling, HistogramValues and the
++ * Format*2Planes* keys (AppleJPEG's recode plugin), which this scaler does not do.
++ */
++static OSDictionary *
++capabilities(void)
++{
++	OSDictionary *d = OSDictionary::withCapacity(16);
++	if (d == NULL) {
++		return NULL;
++	}
++	setNumber(d, "IOSurfaceAcceleratorCapabilitiesMinSourceWidth", 4);
++	setNumber(d, "IOSurfaceAcceleratorCapabilitiesMinSourceHeight", 4);
++	setNumber(d, "IOSurfaceAcceleratorCapabilitiesMaxSourceWidth", 8192);
++	setNumber(d, "IOSurfaceAcceleratorCapabilitiesMaxSourceHeight", 8192);
++	setNumber(d, "IOSurfaceAcceleratorCapabilitiesMinDestWidth", 4);
++	setNumber(d, "IOSurfaceAcceleratorCapabilitiesMinDestHeight", 4);
++	setNumber(d, "IOSurfaceAcceleratorCapabilitiesMaxDestWidth", 8192);
++	setNumber(d, "IOSurfaceAcceleratorCapabilitiesMaxDestHeight", 8192);
++	setNumber(d, "IOSurfaceAcceleratorCapabilitiesMaxHUpscale", 8);
++	setNumber(d, "IOSurfaceAcceleratorCapabilitiesMaxVUpscale", 8);
++	setNumber(d, "IOSurfaceAcceleratorCapabilitiesMaxHDownscale", 8);
++	setNumber(d, "IOSurfaceAcceleratorCapabilitiesMaxVDownscale", 8);
++	setNumber(d, "IOSurfaceAcceleratorFilterVerticalTapsCount", 2);
++	setNumber(d, "IOSurfaceAcceleratorFilterVerticalPhasesCount", 16);
++	setNumber(d, "IOSurfaceAcceleratorFilterHorizontalTapsCount", 2);
++	setNumber(d, "IOSurfaceAcceleratorFilterHorizontalPhasesCount", 16);
++	return d;
++}
++
++/* ---- Service ------------------------------------------------------------------------------------------------ */
++
++bool
++AppleM2ScalerCSCDriver::start(IOService *provider)
++{
++	int mode = 0;
++	PE_parse_boot_argn("vivascaler", &mode, sizeof(mode));
++	if (mode <= 0) {
++		IOLog("VIVA SCALER: off (boot-arg vivascaler=1 CPU, 2 MDP)\n");
++		return false;
++	}
++	fFormats = 3;
++	PE_parse_boot_argn("vivascalerformats", &fFormats, sizeof(fFormats));
++	fLock = IOLockAlloc();
++	if (fLock == NULL || !IOService::start(provider)) {
++		return false;
++	}
++	if (mode >= 2) {
++		fMdp = viva_mdp_create();
++		if (fMdp == NULL) {
++			IOLog("VIVA SCALER: MDP unavailable, CPU backend\n");
++			mode = 1;
++		}
++	}
++	fMode = mode;
++	OSDictionary *caps = capabilities();
++	if (caps != NULL) {
++		setProperty("IOSurfaceAcceleratorCapabilitiesDict", caps);
++		caps->release();
++	}
++	setProperty("VivaScalerBackend", fMode >= 2 ? "mdp" : "cpu");
++	setProperty("VivaScalerFormats", fFormats, 32);
++	setProperty("IOUserClientClass", "AppleM2ScalerCSCDriverUserClient");
++	publishStats();
++	registerService();
++	IOLog("VIVA SCALER: AppleM2ScalerCSCDriver published (backend %s, formats 0x%x)\n",
++	    fMode >= 2 ? "mdp" : "cpu", fFormats);
++	return true;
++}
++
++IOReturn
++AppleM2ScalerCSCDriver::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler)
++{
++	if (type != 0) {
++		return kIOReturnUnsupported;    /* 0xB0000x = AppleSRSDriver's sharpener: not this service */
++	}
++	AppleM2ScalerCSCDriverUserClient *client = OSTypeAlloc(AppleM2ScalerCSCDriverUserClient);
++	if (client == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (!client->initWithTask(owningTask, securityID, type) || !client->attach(this)) {
++		client->release();
++		return kIOReturnError;
++	}
++	if (!client->start(this)) {
++		client->detach(this);
++		client->release();
++		return kIOReturnError;
++	}
++	OSIncrementAtomic64((SInt64 *)&fClients);
++	*handler = client;
++	return kIOReturnSuccess;
++}
++
++void
++AppleM2ScalerCSCDriver::publishStats(void)
++{
++	OSDictionary *d = OSDictionary::withCapacity(10);
++	if (d == NULL) {
++		return;
++	}
++	setNumber(d, "transfers", fTransfers);
++	setNumber(d, "cpu", fCpu);
++	setNumber(d, "mdp", fMdpDone);
++	setNumber(d, "unsupported", fUnsupported);
++	setNumber(d, "errors", fErrors);
++	setNumber(d, "bytes", fBytes);
++	setNumber(d, "us", fNs / 1000);
++	setNumber(d, "customFilters", fCustomFilters);
++	setNumber(d, "clients", fClients);
++	setProperty("VivaScalerStats", d);
++	d->release();
++}
++
++/* ---- CPU backend --------------------------------------------------------------------------------------------- */
++
++/* Byte positions of R, G, B, A in a 32-bit pixel of each format (memory order). */
++static bool
++rgbLayout(uint32_t pf, uint8_t pos[4])
++{
++	switch (pf) {
++	case PF_BGRA: pos[0] = 2; pos[1] = 1; pos[2] = 0; pos[3] = 3; return true;
++	case PF_RGBA: pos[0] = 0; pos[1] = 1; pos[2] = 2; pos[3] = 3; return true;
++	case PF_ARGB: pos[0] = 1; pos[1] = 2; pos[2] = 3; pos[3] = 0; return true;
++	default: return false;
++	}
++}
++
++static inline uint8_t
++clamp8(int32_t v)
++{
++	return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
++}
++
++typedef struct {
++	const uint8_t *base;    /* plane 0 */
++	uint32_t       bpr;
++	const uint8_t *uv;      /* plane 1 (NV12) */
++	uint32_t       uvBpr;
++	uint32_t       w, h;
++	uint8_t        pos[4];
++	bool           yuv, full, bt709;
++} src_view;
++
++/* One source pixel as R, G, B, A (0-255). x, y inside the surface. */
++static inline void
++fetch(const src_view *s, uint32_t x, uint32_t y, int32_t out[4])
++{
++	if (!s->yuv) {
++		const uint8_t *p = s->base + (size_t)y * s->bpr + (size_t)x * 4;
++		for (int c = 0; c < 4; c++) {
++			out[c] = p[s->pos[c]];
++		}
++		return;
++	}
++	int32_t Y = s->base[(size_t)y * s->bpr + x];
++	const uint8_t *c = s->uv + (size_t)(y >> 1) * s->uvBpr + (size_t)(x & ~1u);
++	int32_t U = (int32_t)c[0] - 128, V = (int32_t)c[1] - 128;
++	/* 10-bit fixed point coefficients (x1024) */
++	int32_t yy, rv, gu, gv, bu;
++	if (s->full) {
++		yy = Y * 1024;
++		if (s->bt709) { rv = 1613; gu = 192; gv = 479; bu = 1900; } else { rv = 1436; gu = 352; gv = 731; bu = 1815; }
++	} else {
++		yy = (Y - 16) * 1192;
++		if (s->bt709) { rv = 1836; gu = 218; gv = 546; bu = 2163; } else { rv = 1634; gu = 401; gv = 832; bu = 2066; }
++	}
++	out[0] = clamp8((yy + rv * V + 512) >> 10);
++	out[1] = clamp8((yy - gu * U - gv * V + 512) >> 10);
++	out[2] = clamp8((yy + bu * U + 512) >> 10);
++	out[3] = 255;
++}
++
++/* Bilinear (or nearest) sample at source position (fx, fy) in 16.16, clamped to [x0, x0+w) x [y0, y0+h). */
++static inline void
++sample(const src_view *s, int64_t fx, int64_t fy, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1, bool nearest,
++    int32_t out[4])
++{
++	if (nearest) {
++		int64_t x = fx >> 16, y = fy >> 16;
++		x = x < (int64_t)x0 ? x0 : x >= (int64_t)x1 ? x1 - 1 : x;
++		y = y < (int64_t)y0 ? y0 : y >= (int64_t)y1 ? y1 - 1 : y;
++		fetch(s, (uint32_t)x, (uint32_t)y, out);
++		return;
++	}
++	fx -= 0x8000;           /* pixel centres */
++	fy -= 0x8000;
++	int64_t xa = fx >> 16, ya = fy >> 16;
++	uint32_t ax = (uint32_t)(fx & 0xffff) >> 8, ay = (uint32_t)(fy & 0xffff) >> 8;     /* 8-bit weights */
++	int64_t xb = xa + 1, yb = ya + 1;
++#define CL(v, lo, hi) ((v) < (int64_t)(lo) ? (int64_t)(lo) : (v) >= (int64_t)(hi) ? (int64_t)(hi) - 1 : (v))
++	xa = CL(xa, x0, x1); xb = CL(xb, x0, x1); ya = CL(ya, y0, y1); yb = CL(yb, y0, y1);
++#undef CL
++	int32_t p00[4], p01[4], p10[4], p11[4];
++	fetch(s, (uint32_t)xa, (uint32_t)ya, p00);
++	fetch(s, (uint32_t)xb, (uint32_t)ya, p01);
++	fetch(s, (uint32_t)xa, (uint32_t)yb, p10);
++	fetch(s, (uint32_t)xb, (uint32_t)yb, p11);
++	for (int c = 0; c < 4; c++) {
++		int32_t top = p00[c] * (256 - (int32_t)ax) + p01[c] * (int32_t)ax;
++		int32_t bot = p10[c] * (256 - (int32_t)ax) + p11[c] * (int32_t)ax;
++		out[c] = (top * (256 - (int32_t)ay) + bot * (int32_t)ay + 32768) >> 16;
++	}
++}
++
++static IOReturn
++cpuTransfer(SweetSurface *src, SweetSurface *dst, uint64_t sx, uint64_t sy, uint64_t sw, uint64_t sh,
++    uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh, uint64_t flags, uint32_t alphaOverride, uint64_t *bytes)
++{
++	src_view s = {};
++	uint8_t dpos[4];
++	if (!rgbLayout(dst->pixelFormat, dpos) || dst->bytesPerElement != 4) {
++		return kIOReturnUnsupported;
++	}
++	uintptr_t sk = src->kernelAddress(), dk = dst->kernelAddress();
++	if (sk == 0 || dk == 0) {
++		return kIOReturnNoMemory;
++	}
++	s.w = src->width;
++	s.h = src->height;
++	if (rgbLayout(src->pixelFormat, s.pos) && src->bytesPerElement == 4) {
++		s.base = (const uint8_t *)sk + src->offset;
++		s.bpr = src->bytesPerRow;
++	} else if ((src->pixelFormat == PF_420V || src->pixelFormat == PF_420F) && src->planeCount >= 2) {
++		s.yuv = true;
++		s.full = src->pixelFormat == PF_420F;
++		s.bt709 = src->height >= 720;
++		s.base = (const uint8_t *)sk + src->planes[0].offset;
++		s.bpr = src->planes[0].bytesPerRow;
++		s.uv = (const uint8_t *)sk + src->planes[1].offset;
++		s.uvBpr = src->planes[1].bytesPerRow;
++		s.w &= ~1u;
++		s.h &= ~1u;
++	} else {
++		return kIOReturnUnsupported;
++	}
++	/* source rectangle in 16.16; whole surface when all zero */
++	if (sx == 0 && sy == 0 && sw == 0 && sh == 0) {
++		sw = (uint64_t)s.w << 16;
++		sh = (uint64_t)s.h << 16;
++	}
++	if (dx == 0 && dy == 0 && dw == 0 && dh == 0) {
++		dw = dst->width;
++		dh = dst->height;
++	}
++	if (sw == 0 || sh == 0 || dw == 0 || dh == 0 || ((sx + sw) >> 16) > s.w || ((sy + sh) >> 16) > s.h ||
++	    (uint64_t)dx + dw > dst->width || (uint64_t)dy + dh > dst->height) {
++		return kIOReturnBadArgument;
++	}
++	uint32_t x0 = (uint32_t)(sx >> 16), y0 = (uint32_t)(sy >> 16);
++	uint32_t x1 = (uint32_t)((sx + sw + 0xffff) >> 16), y1 = (uint32_t)((sy + sh + 0xffff) >> 16);
++	x1 = x1 > s.w ? s.w : x1;
++	y1 = y1 > s.h ? s.h : y1;
++	bool nearest = (flags & kVivaScalerFlagNearest) != 0;
++	int64_t stepX = (int64_t)((sw << 16) / dw), stepY = (int64_t)((sh << 16) / dh);     /* 16.16 */
++	bool copy = !s.yuv && stepX == 0x10000 && stepY == 0x10000 && (sx & 0xffff) == 0 && (sy & 0xffff) == 0 &&
++	    src->pixelFormat == dst->pixelFormat && !(flags & kVivaScalerFlagAlphaOverride);
++	uint8_t *dbase = (uint8_t *)dk + dst->offset;
++	for (uint32_t j = 0; j < dh; j++) {
++		uint8_t *row = dbase + (size_t)(dy + j) * dst->bytesPerRow + (size_t)dx * 4;
++		if (copy) {
++			memcpy(row, s.base + (size_t)(y0 + j) * s.bpr + (size_t)x0 * 4, (size_t)dw * 4);
++			continue;
++		}
++		int64_t fy = (int64_t)sy + stepY * j + stepY / 2;
++		for (uint32_t i = 0; i < dw; i++) {
++			int64_t fx = (int64_t)sx + stepX * i + stepX / 2;
++			int32_t px[4];
++			sample(&s, fx, fy, x0, y0, x1, y1, nearest, px);
++			if (flags & kVivaScalerFlagAlphaOverride) {
++				px[3] = (int32_t)(alphaOverride & 0xff);
++			}
++			uint8_t *p = row + (size_t)i * 4;
++			for (int c = 0; c < 4; c++) {
++				p[dpos[c]] = (uint8_t)px[c];
++			}
++		}
++	}
++	*bytes = (uint64_t)dw * dh * 4;
++	return kIOReturnSuccess;
++}
++
++/* ---- Transfer ----------------------------------------------------------------------------------------------- */
++
++IOReturn
++AppleM2ScalerCSCDriver::transferLocked(const struct viva_scaler_request *req, SweetSurface *src, SweetSurface *dst,
++    const char **backend)
++{
++	uint64_t flags = req->flags;
++	if ((flags & kVivaScalerFlagTransformMask) != 0) {
++		return kIOReturnUnsupported;    /* flip / rotate */
++	}
++	bool srcYuv = src->pixelFormat == PF_420V || src->pixelFormat == PF_420F;
++	if ((srcYuv && !(fFormats & 2)) || (!srcYuv && !(fFormats & 1))) {
++		return kIOReturnUnsupported;
++	}
++	/* the GPU jobs on both surfaces first (they may still be drawing the source or reading the destination) */
++	if (!viva_gpu_surface_idle(src, NULL)) {
++		viva_gpu_surface_wait(src, SCALER_GPU_WAIT_MS);
++	}
++	if (!viva_gpu_surface_idle(dst, NULL)) {
++		viva_gpu_surface_wait(dst, SCALER_GPU_WAIT_MS);
++	}
++	IOReturn ret = kIOReturnUnsupported;
++	uint64_t bytes = 0;
++	if (fMdp != NULL) {
++		/* the engines read memory: the CPU's dirty lines of the source go out first */
++		sweet_surface_before_device_read(src);
++		sweet_surface_before_device_read(dst);
++		ret = viva_mdp_transfer(fMdp, src, dst, (uint32_t)req->srcX, (uint32_t)req->srcY, (uint32_t)req->srcW,
++		    (uint32_t)req->srcH, req->dstX, req->dstY, req->dstW, req->dstH, flags);
++		if (ret == kIOReturnSuccess) {
++			sweet_surface_device_wrote(dst);
++			sweet_surface_seed_bump(dst);
++			*backend = "mdp";
++			fMdpDone++;
++			return ret;
++		}
++	}
++	sweet_surface_before_cpu_access(src);
++	sweet_surface_before_cpu_access(dst);
++	ret = cpuTransfer(src, dst, req->srcX, req->srcY, req->srcW, req->srcH, req->dstX, req->dstY, req->dstW,
++	    req->dstH, flags, req->alphaOverride, &bytes);
++	if (ret == kIOReturnSuccess) {
++		sweet_surface_cpu_wrote(dst);
++		*backend = "cpu";
++		fCpu++;
++		fBytes += bytes;
++	}
++	return ret;
++}
++
++IOReturn
++AppleM2ScalerCSCDriver::transfer(const struct viva_scaler_request *req, __unused task_t task)
++{
++	SweetSurface *src = sweet_surface_copy(req->srcID), *dst = sweet_surface_copy(req->dstID);
++	IOReturn ret;
++	const char *backend = "";
++	uint64_t t0 = mach_absolute_time();
++	if (src == NULL || dst == NULL) {
++		ret = kIOReturnBadArgument;
++	} else {
++		IOLockLock(fLock);
++		ret = transferLocked(req, src, dst, &backend);
++		fTransfers++;
++		if (ret == kIOReturnUnsupported) {
++			fUnsupported++;
++		} else if (ret != kIOReturnSuccess) {
++			fErrors++;
++		}
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		fNs += ns;
++		uint64_t now = mach_absolute_time(), interval;
++		nanoseconds_to_absolutetime(NSEC_PER_SEC / 4, &interval);
++		bool publish = now - fLastPublish > interval || fTransfers < 8;
++		if (publish) {
++			fLastPublish = now;
++		}
++		IOLockUnlock(fLock);
++		if (publish) {
++			publishStats();
++		}
++		if (fTransfers <= 16 || (ret != kIOReturnSuccess && fErrors + fUnsupported <= 32)) {
++			IOLog("VIVA SCALER: %u (%ux%u '%c%c%c%c') -> %u (%ux%u '%c%c%c%c') flags 0x%llx: 0x%x %s\n",
++			    src->id, src->width, src->height, (char)(src->pixelFormat >> 24), (char)(src->pixelFormat >> 16),
++			    (char)(src->pixelFormat >> 8), (char)src->pixelFormat, dst->id, dst->width, dst->height,
++			    (char)(dst->pixelFormat >> 24), (char)(dst->pixelFormat >> 16), (char)(dst->pixelFormat >> 8),
++			    (char)dst->pixelFormat, req->flags, ret, backend);
++		}
++	}
++	if (src != NULL) {
++		src->release();
++	}
++	if (dst != NULL) {
++		dst->release();
++	}
++	return ret;
++}
++
++/* ---- User client ------------------------------------------------------------------------------------------- */
++
++bool
++AppleM2ScalerCSCDriverUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	fPort = MACH_PORT_NULL;
++	return true;
++}
++
++bool
++AppleM2ScalerCSCDriverUserClient::start(IOService *provider)
++{
++	fOwner = OSDynamicCast(AppleM2ScalerCSCDriver, provider);
++	return fOwner != NULL && IOUserClient::start(provider);
++}
++
++IOReturn
++AppleM2ScalerCSCDriverUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++AppleM2ScalerCSCDriverUserClient::free(void)
++{
++	if (fPort != MACH_PORT_NULL) {
++		iokit_release_port_send((ipc_port_t)fPort);
++		fPort = MACH_PORT_NULL;
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++AppleM2ScalerCSCDriverUserClient::registerNotificationPort(mach_port_t port, UInt32 type, __unused io_user_reference_t refCon)
++{
++	if (type != 0) {
++		return kIOReturnUnsupported;
++	}
++	if (fPort != MACH_PORT_NULL) {
++		iokit_release_port_send((ipc_port_t)fPort);
++	}
++	fPort = port;           /* the send right is ours now (released on replacement and in free) */
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleM2ScalerCSCDriverUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	switch (selector) {
++	case 1: {
++		if (args->structureInput == NULL || args->structureInputSize != sizeof(struct viva_scaler_request)) {
++			return kIOReturnBadArgument;
++		}
++		struct viva_scaler_request req;
++		memcpy(&req, args->structureInput, sizeof(req));
++		IOReturn ret = fOwner->transfer(&req, fTask);
++		if (ret == kIOReturnSuccess && req.callback != 0 && !(req.flags & kVivaScalerFlagSkipAsync) &&
++		    fPort != MACH_PORT_NULL) {
++			OSAsyncReference64 ref = {};
++			setAsyncReference64(ref, fPort, (mach_vm_address_t)req.callback, (io_user_reference_t)req.refcon, fTask);
++			io_user_reference_t arg = (io_user_reference_t)req.refcon2;
++			sendAsyncResult64(ref, kIOReturnSuccess, &arg, 1);
++		}
++		return ret;
++	}
++	case 2:
++	case 3:
++	case 7:
++		return kIOReturnSuccess;
++	case 4:
++		if (args->structureInputSize != 0x20) {
++			return kIOReturnBadArgument;
++		}
++		fOwner->noteCustomFilter();
++		return kIOReturnSuccess;
++	case 5:
++		if (args->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		args->scalarOutput[0] = 0;
++		args->scalarOutputCount = 1;
++		return kIOReturnSuccess;
++	case 0:
++	case 8:
++	case 9:
++		return kIOReturnUnsupported;
++	default:
++		return kIOReturnBadArgument;
++	}
++}
++
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/VivaMDP.cpp b/iokit/Kernel/arm/VivaMDP.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaMDP.cpp
+@@ -0,0 +1,25 @@
++/*
++ * viva (MT6781): MDP backend of AppleM2ScalerCSCDriver (VivaScaler.h). Placeholder until the engine sequence is
++ * validated on the phone (gpu/docs/MDP-MT6781.md): no engine is touched, every transfer is left to the CPU.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include "VivaScaler.h"
++
++struct viva_mdp *
++viva_mdp_create(void)
++{
++	return NULL;
++}
++
++IOReturn
++viva_mdp_transfer(__unused struct viva_mdp *mdp, __unused SweetSurface *src, __unused SweetSurface *dst,
++    __unused uint32_t sx, __unused uint32_t sy, __unused uint32_t sw, __unused uint32_t sh, __unused uint32_t dx,
++    __unused uint32_t dy, __unused uint32_t dw, __unused uint32_t dh, __unused uint64_t flags)
++{
++	return kIOReturnUnsupported;
++}
++
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/VivaJPEG.h b/iokit/Kernel/arm/VivaJPEG.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaJPEG.h
+@@ -0,0 +1,34 @@
++/*
++ * viva (MT6781): hardware JPEG encoder (VivaJPEGHW.cpp) and the AppleJPEGDriver service on top of it
++ * (VivaJPEG.cpp). Encode only: MT6781 has no JPEG decoder, decode requests are refused so clients keep decoding in
++ * software.
++ *
++ * Boot-arg vivajpeg (Viva Manager, MaliMetal > Acceleratori): 0 (default) = not published, 1 = published.
++ */
++#ifndef _IOKIT_ARM_VIVAJPEG_H
++#define _IOKIT_ARM_VIVAJPEG_H
++
++#include <IOKit/IOReturn.h>
++#include <stddef.h>
++#include <stdint.h>
++
++enum { kVivaJpegNV12 = 1, kVivaJpegNV21 = 2, kVivaJpegYUYV = 3 };   /* YUYV: one plane, y = the packed pixels */
++
++struct viva_jpgenc_image {
++	uint32_t format;                /* kVivaJpegNV12 / NV21 */
++	uint32_t width, height;
++	const uint8_t *y, *uv;          /* kernel addresses of the planes */
++	uint32_t yBytesPerRow, uvBytesPerRow;
++};
++
++struct viva_jpgenc;
++
++/* Powers the block and allocates bounce buffers for images up to maxPixels; NULL if the hardware is unusable. */
++struct viva_jpgenc *viva_jpgenc_create(size_t maxPixels);
++void viva_jpgenc_destroy(struct viva_jpgenc *j);
++/* One encode (synchronous, polls the block): a complete JFIF file into out. quality 0..100. Not reentrant. */
++IOReturn viva_jpgenc_encode(struct viva_jpgenc *j, const struct viva_jpgenc_image *img, uint32_t quality, void *out,
++    size_t outCap, size_t *outLen, uint32_t *cycles);
++void viva_jpgenc_stats(struct viva_jpgenc *j, uint64_t *encodes, uint64_t *failures, uint64_t *bytes, uint64_t *cycles);
++
++#endif /* _IOKIT_ARM_VIVAJPEG_H */
+diff --git a/iokit/Kernel/arm/VivaJPEGHW.cpp b/iokit/Kernel/arm/VivaJPEGHW.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaJPEGHW.cpp
+@@ -0,0 +1,383 @@
++/*
++ * viva (MT6781): the hardware JPEG encoder (jpgenc@17030000) driven with physical addresses (VivaJPEG.h).
++ *
++ * Sequence validated by hand on the phone over the USB link (2026-11-05, gpu/docs/JPGENC-MT6781.md): venc_sel
++ * mux = mainpll_d3, VEN MTCMOS on (SPM VEN_PWR_CON 0x10006348: PWR_ON, PWR_ON_2ND, status bit 18 in
++ * 0x1000616C/0x10006170, CLK_DIS/ISO off, RST_B, SRAM_PDN off, SRAM ack bit 12 -> 0x0000000D), bus protection
++ * released (infracfg 0x100012AC bits 19, 31), VENC_GCON 0x17000000 |= larb, venc, jpgenc, gals (1 = on), larb7
++ * outstanding limits 5/3/1/5 and ports 9-12 (Y, CbCr, Q table, bitstream) out of the M4U (physical addresses),
++ * reset, then one 256x256 NV12 at Q90: INT_STS = DONE after ~37k cycles, a complete JFIF file (FF D8 FF E0 ...)
++ * of DMA_ADDR0 - DST_ADDR0 bytes that decodes on the Mac.
++ *
++ * Every encode goes through two physically contiguous bounce buffers below 4 GiB (source NV12/NV21 with its
++ * stride and height padded to 16, destination bitstream): IOSurfaces and user buffers are not contiguous and the
++ * block has no IOMMU mapping. The block does not snoop the CPU caches: the source is cleaned to memory before the
++ * start, the destination dropped from the caches after DONE.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++
++#include "VivaJPEG.h"
++
++#define PA_TOPCKGEN     0x10000000ull
++#define PA_INFRACFG     0x10001000ull
++#define PA_SPM          0x10006000ull
++#define PA_VENC_GCON    0x17000000ull
++#define PA_LARB7        0x17010000ull
++#define PA_JPGENC       0x17030000ull
++
++/* topckgen */
++#define CLK_CFG_UPDATE          0x008
++#define CLK_CFG_9               0x0d0   /* venc_sel [2:0], set +4 / clear +8 */
++#define CLK_CFG_9_SET           0x0d4
++#define CLK_CFG_9_CLR           0x0d8
++#define VENC_SEL_MAINPLL_D3     6
++#define VENC_SEL_UPDATE         (1u << 5)
++/* SPM */
++#define SPM_POWERON_CONFIG      0x000
++#define SPM_PROJECT_KEY         0x0b160001
++#define SPM_PWR_STATUS          0x16c
++#define SPM_PWR_STATUS_2ND      0x170
++#define SPM_VEN_PWR_CON         0x348
++#define PWR_RST_B               (1u << 0)
++#define PWR_ISO                 (1u << 1)
++#define PWR_ON                  (1u << 2)
++#define PWR_ON_2ND              (1u << 3)
++#define PWR_CLK_DIS             (1u << 4)
++#define SRAM_PDN                (1u << 8)
++#define SRAM_PDN_ACK            (1u << 12)
++#define VEN_STATUS_BIT          (1u << 18)
++/* infracfg_ao bus protection */
++#define INFRA_TOPAXI_PROTECTEN_CLR      0x2ac
++#define INFRA_TOPAXI_PROTECTEN_STA1     0x250
++#define VEN_PROT_STEP2          (1u << 19)
++#define VEN_PROT_STEP1          (1u << 31)
++/* VENC_GCON: 1 = clock on */
++#define VENC_CG                 0x000
++#define VENC_CG_ON              ((1u << 0) | (1u << 4) | (1u << 8) | (1u << 28))
++/* larb7 */
++#define LARB_OSTD(port)         (0x200 + 4 * (port))
++#define LARB_PORT_CTRL(port)    (0x380 + 4 * (port))
++#define LARB_PORT_MMU_BITS      0xff01u
++/* jpgenc */
++#define JE_RSTB                 0x100
++#define JE_CTRL                 0x104
++#define JE_QUALITY              0x108
++#define JE_BLK_NUM              0x10c
++#define JE_INT_STS              0x11c
++#define JE_DST_ADDR0            0x120
++#define JE_DMA_ADDR0            0x124
++#define JE_STALL_ADDR0          0x128
++#define JE_OFFSET_ADDR          0x138
++#define JE_RST_MCU_NUM          0x150
++#define JE_IMG_SIZE             0x154
++#define JE_TOTAL_CYCLE          0x168
++#define JE_BYTE_OFFSET_MASK     0x16c
++#define JE_SRC_LUMA_ADDR        0x170
++#define JE_SRC_CHROMA_ADDR      0x174
++#define JE_STRIDE               0x178
++#define JE_IMG_STRIDE           0x17c
++#define JE_CODEC_SEL            0x314
++#define JE_ULTRA_THRES          0x318
++#define JE_CTRL_ENABLE          (1u << 0)
++#define JE_CTRL_INT_EN          (1u << 2)
++#define JE_CTRL_FMT_SHIFT       3
++#define JE_CTRL_START_BITS      (JE_CTRL_ENABLE | JE_CTRL_INT_EN | (1u << 20) | (1u << 29))
++#define JE_INT_DONE             0x01
++#define JE_INT_STALL            0x02
++#define JE_INT_VCODEC           0x10
++
++#define JE_TIMEOUT_MS           500
++
++struct viva_jpgenc {
++	IOMemoryMap *topck, *infra, *spm, *gcon, *larb, *jpg;
++	IOBufferMemoryDescriptor *src, *dst;
++	uint64_t srcPA, dstPA;
++	size_t srcSize, dstSize;
++	bool powered;
++	uint64_t encodes, failures, bytesOut, cycles;
++};
++
++static inline volatile uint32_t *
++reg(IOMemoryMap *m, uint32_t off)
++{
++	return (volatile uint32_t *)(m->getVirtualAddress() + off);
++}
++static inline uint32_t rd(IOMemoryMap *m, uint32_t off) { return *reg(m, off); }
++static inline void wr(IOMemoryMap *m, uint32_t off, uint32_t v) { *reg(m, off) = v; __asm__ volatile ("dsb sy" ::: "memory"); }
++
++static IOMemoryMap *
++mapRegs(uint64_t pa, uint32_t size)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
++	IOMemoryMap *m = md != NULL ? md->map(kIOMapInhibitCache) : NULL;
++	OSSafeReleaseNULL(md);
++	return m;
++}
++
++static void
++cacheClean(const void *p, size_t len)
++{
++	uintptr_t a = (uintptr_t)p & ~(uintptr_t)63, end = (uintptr_t)p + len;
++	for (; a < end; a += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r"(a) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static IOBufferMemoryDescriptor *
++contiguous(size_t size, uint64_t *pa)
++{
++	IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000fffff000ull);
++	if (b == NULL) {
++		return NULL;
++	}
++	IOByteCount len = 0;
++	*pa = b->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
++	if (*pa == 0 || len < size || *pa + size > (1ull << 32)) {
++		b->release();
++		return NULL;
++	}
++	return b;
++}
++
++/* VEN power domain, clocks, larb7 ports: once (the block stays on; it draws nothing while idle and clock-gated). */
++static bool
++powerOn(struct viva_jpgenc *j)
++{
++	if (j->powered) {
++		return true;
++	}
++	/* the parent domain (DIS, bit 21) is on whenever the display is */
++	if (!(rd(j->spm, SPM_PWR_STATUS) & (1u << 21))) {
++		IOLog("VIVA JPEG: display power domain off\n");
++		return false;
++	}
++	wr(j->topck, CLK_CFG_9_CLR, 0x7);
++	wr(j->topck, CLK_CFG_9_SET, VENC_SEL_MAINPLL_D3);
++	wr(j->topck, CLK_CFG_UPDATE, VENC_SEL_UPDATE);
++	if (!(rd(j->spm, SPM_PWR_STATUS) & VEN_STATUS_BIT) || rd(j->spm, SPM_VEN_PWR_CON) != 0xd) {
++		wr(j->spm, SPM_POWERON_CONFIG, SPM_PROJECT_KEY);
++		uint32_t v = rd(j->spm, SPM_VEN_PWR_CON);
++		v |= PWR_ON;
++		wr(j->spm, SPM_VEN_PWR_CON, v);
++		v |= PWR_ON_2ND;
++		wr(j->spm, SPM_VEN_PWR_CON, v);
++		for (int i = 0; i < 1000 && (!(rd(j->spm, SPM_PWR_STATUS) & VEN_STATUS_BIT) ||
++		    !(rd(j->spm, SPM_PWR_STATUS_2ND) & VEN_STATUS_BIT)); i++) {
++			IODelay(10);
++		}
++		if (!(rd(j->spm, SPM_PWR_STATUS) & VEN_STATUS_BIT)) {
++			IOLog("VIVA JPEG: VEN power domain did not come up (0x%08x)\n", rd(j->spm, SPM_VEN_PWR_CON));
++			return false;
++		}
++		v &= ~PWR_CLK_DIS;
++		wr(j->spm, SPM_VEN_PWR_CON, v);
++		v &= ~PWR_ISO;
++		wr(j->spm, SPM_VEN_PWR_CON, v);
++		v |= PWR_RST_B;
++		wr(j->spm, SPM_VEN_PWR_CON, v);
++		v &= ~SRAM_PDN;
++		wr(j->spm, SPM_VEN_PWR_CON, v);
++		for (int i = 0; i < 1000 && (rd(j->spm, SPM_VEN_PWR_CON) & SRAM_PDN_ACK); i++) {
++			IODelay(10);
++		}
++		if (rd(j->spm, SPM_VEN_PWR_CON) & SRAM_PDN_ACK) {
++			IOLog("VIVA JPEG: VEN SRAM did not power up (0x%08x)\n", rd(j->spm, SPM_VEN_PWR_CON));
++			return false;
++		}
++		wr(j->infra, INFRA_TOPAXI_PROTECTEN_CLR, VEN_PROT_STEP2);
++		wr(j->infra, INFRA_TOPAXI_PROTECTEN_CLR, VEN_PROT_STEP1);
++	}
++	/* only now is 0x170xxxxx on the bus */
++	wr(j->gcon, VENC_CG, rd(j->gcon, VENC_CG) | VENC_CG_ON);
++	static const uint32_t ostd[4] = { 5, 3, 1, 5 };
++	for (uint32_t p = 9; p <= 12; p++) {
++		wr(j->larb, LARB_OSTD(p), ostd[p - 9]);
++		wr(j->larb, LARB_PORT_CTRL(p), rd(j->larb, LARB_PORT_CTRL(p)) & ~LARB_PORT_MMU_BITS);
++	}
++	wr(j->jpg, JE_RSTB, 0);
++	wr(j->jpg, JE_RSTB, 1);
++	(void)rd(j->jpg, JE_ULTRA_THRES);
++	if (rd(j->jpg, JE_DMA_ADDR0) == 0xffffffff) {
++		IOLog("VIVA JPEG: jpgenc not answering on the APB bus\n");
++		return false;
++	}
++	wr(j->jpg, JE_CODEC_SEL, 0);
++	j->powered = true;
++	IOLog("VIVA JPEG: jpgenc powered (VEN 0x%08x, VENC_CG 0x%08x)\n", rd(j->spm, SPM_VEN_PWR_CON), rd(j->gcon, VENC_CG));
++	return true;
++}
++
++struct viva_jpgenc *
++viva_jpgenc_create(size_t maxPixels)
++{
++	struct viva_jpgenc *j = (struct viva_jpgenc *)IOMallocZero(sizeof(*j));
++	if (j == NULL) {
++		return NULL;
++	}
++	j->topck = mapRegs(PA_TOPCKGEN, 0x1000);
++	j->infra = mapRegs(PA_INFRACFG, 0x1000);
++	j->spm = mapRegs(PA_SPM, 0x1000);
++	j->gcon = mapRegs(PA_VENC_GCON, 0x1000);
++	j->larb = mapRegs(PA_LARB7, 0x1000);
++	j->jpg = mapRegs(PA_JPGENC, 0x1000);
++	j->srcSize = round_page(maxPixels * 2 + 64 * 1024);    /* YUYV: 2 bytes per pixel */
++	j->dstSize = round_page(maxPixels + 64 * 1024);     /* ~8 bits per pixel worst case at Q97 is far more than enough */
++	j->src = contiguous(j->srcSize, &j->srcPA);
++	j->dst = contiguous(j->dstSize, &j->dstPA);
++	if (j->topck == NULL || j->infra == NULL || j->spm == NULL || j->gcon == NULL || j->larb == NULL || j->jpg == NULL ||
++	    j->src == NULL || j->dst == NULL || !powerOn(j)) {
++		IOLog("VIVA JPEG: hardware encoder unavailable\n");
++		viva_jpgenc_destroy(j);
++		return NULL;
++	}
++	return j;
++}
++
++void
++viva_jpgenc_destroy(struct viva_jpgenc *j)
++{
++	if (j == NULL) {
++		return;
++	}
++	OSSafeReleaseNULL(j->topck);
++	OSSafeReleaseNULL(j->infra);
++	OSSafeReleaseNULL(j->spm);
++	OSSafeReleaseNULL(j->gcon);
++	OSSafeReleaseNULL(j->larb);
++	OSSafeReleaseNULL(j->jpg);
++	OSSafeReleaseNULL(j->src);
++	OSSafeReleaseNULL(j->dst);
++	IOFreeType(j, struct viva_jpgenc);
++}
++
++static uint32_t
++qualityIndex(uint32_t q)
++{
++	/* mtk_jpeg_set_param (MT6781): only these tables are ever chosen */
++	return q >= 97 ? 0x10 : q >= 95 ? 0x3 : q >= 92 ? 0x7 : q >= 90 ? 0x2 : q >= 87 ? 0xb : q >= 84 ? 0x6 :
++	       q >= 80 ? 0x1 : q >= 74 ? 0xa : q >= 64 ? 0xe : q >= 60 ? 0x0 : 0x8;
++}
++
++IOReturn
++viva_jpgenc_encode(struct viva_jpgenc *j, const struct viva_jpgenc_image *img, uint32_t quality, void *out,
++    size_t outCap, size_t *outLen, uint32_t *cyclesOut)
++{
++	*outLen = 0;
++	bool yuyv = img->format == kVivaJpegYUYV;
++	if (img->format != kVivaJpegNV12 && img->format != kVivaJpegNV21 && !yuyv) {
++		return kIOReturnUnsupported;
++	}
++	uint32_t w = img->width, h = img->height;
++	if (w < 16 || h < 16 || w > 8192 || h > 8192) {
++		return kIOReturnUnsupported;
++	}
++	/* MCU grid: 16x16 for 4:2:0, 16x8 for 4:2:2 (mtk_jpeg_set_param) */
++	uint32_t padW = (w + 15) & ~15u, padH = yuyv ? (h + 7) & ~7u : (h + 15) & ~15u;
++	uint32_t stride = yuyv ? (2 * padW + 31) & ~31u : padW;
++	size_t ySize = (size_t)stride * padH, cSize = yuyv ? 0 : (size_t)stride * padH / 2;
++	if (ySize + cSize > j->srcSize) {
++		return kIOReturnNoSpace;
++	}
++	if (!powerOn(j)) {
++		return kIOReturnNotReady;
++	}
++	/* source into the bounce buffer, edges replicated up to the MCU grid */
++	uint8_t *sy = (uint8_t *)j->src->getBytesNoCopy(), *sc = sy + ySize;
++	uint32_t rowBytes = yuyv ? 2 * (w & ~1u) : w;
++	for (uint32_t y = 0; y < padH; y++) {
++		const uint8_t *row = img->y + (size_t)(y < h ? y : h - 1) * img->yBytesPerRow;
++		uint8_t *d = sy + (size_t)y * stride;
++		memcpy(d, row, rowBytes);
++		for (uint32_t x = rowBytes; x < stride; x += yuyv ? 4 : 1) {
++			if (yuyv) {
++				memcpy(d + x, row + rowBytes - 4, 4);   /* last Y0 U Y1 V group */
++			} else {
++				d[x] = row[w - 1];
++			}
++		}
++	}
++	uint32_t ch = h / 2;
++	for (uint32_t y = 0; !yuyv && y < padH / 2; y++) {
++		const uint8_t *row = img->uv + (size_t)(y < ch ? y : ch - 1) * img->uvBytesPerRow;
++		uint32_t cw = w & ~1u;
++		memcpy(sc + (size_t)y * stride, row, cw);
++		for (uint32_t x = cw; x < padW; x += 2) {
++			sc[(size_t)y * stride + x] = row[cw - 2];
++			sc[(size_t)y * stride + x + 1] = row[cw - 1];
++		}
++	}
++	cacheClean(sy, ySize + cSize);
++	cacheClean(j->dst->getBytesNoCopy(), j->dstSize);
++	/* reset, configure, start (mtk_jpeg_device_run) */
++	wr(j->jpg, JE_RSTB, 0);
++	wr(j->jpg, JE_RSTB, 1);
++	wr(j->jpg, JE_CODEC_SEL, 0);
++	wr(j->jpg, JE_INT_STS, 0);
++	wr(j->jpg, JE_IMG_SIZE, (w << 16) | h);
++	uint32_t fmt = yuyv ? 0 : img->format == kVivaJpegNV12 ? 2 : 3;
++	wr(j->jpg, JE_CTRL, fmt << JE_CTRL_FMT_SHIFT);
++	wr(j->jpg, JE_BLK_NUM, yuyv ? (padW / 16) * (padH / 8) * 4 - 1 : (padW / 16) * (padH / 16) * 6 - 1);
++	wr(j->jpg, JE_IMG_STRIDE, stride);
++	wr(j->jpg, JE_STRIDE, stride);
++	wr(j->jpg, JE_SRC_LUMA_ADDR, (uint32_t)j->srcPA);
++	wr(j->jpg, JE_SRC_CHROMA_ADDR, (uint32_t)(j->srcPA + (yuyv ? 0 : ySize)));
++	wr(j->jpg, JE_OFFSET_ADDR, 0);
++	wr(j->jpg, JE_BYTE_OFFSET_MASK, 0);
++	wr(j->jpg, JE_DST_ADDR0, (uint32_t)j->dstPA);
++	wr(j->jpg, JE_STALL_ADDR0, (uint32_t)(j->dstPA + j->dstSize));
++	wr(j->jpg, JE_QUALITY, (rd(j->jpg, JE_QUALITY) & 0xffff0000u) | qualityIndex(quality));
++	wr(j->jpg, JE_RST_MCU_NUM, 0);
++	wr(j->jpg, JE_CTRL, ((fmt << JE_CTRL_FMT_SHIFT) | JE_CTRL_START_BITS) & ~(1u << 30));
++	uint32_t sts = 0;
++	uint64_t deadline;
++	clock_interval_to_deadline(JE_TIMEOUT_MS, kMillisecondScale, &deadline);
++	while (((sts = rd(j->jpg, JE_INT_STS)) & (JE_INT_DONE | JE_INT_STALL | JE_INT_VCODEC)) == 0 &&
++	    mach_absolute_time() < deadline) {
++		IODelay(50);
++	}
++	wr(j->jpg, JE_INT_STS, 0);
++	uint32_t produced = rd(j->jpg, JE_DMA_ADDR0) - (uint32_t)j->dstPA;
++	uint32_t cycles = rd(j->jpg, JE_TOTAL_CYCLE);
++	wr(j->jpg, JE_CTRL, fmt << JE_CTRL_FMT_SHIFT);         /* stop */
++	if (!(sts & JE_INT_DONE)) {
++		j->failures++;
++		wr(j->jpg, JE_RSTB, 0);
++		wr(j->jpg, JE_RSTB, 1);
++		IOLog("VIVA JPEG: encode %ux%u failed, status 0x%x (%s)\n", w, h, sts, sts == 0 ? "timeout" :
++		    (sts & JE_INT_STALL) ? "output full" : "codec error");
++		return sts == 0 ? kIOReturnTimeout : kIOReturnError;
++	}
++	cacheClean(j->dst->getBytesNoCopy(), produced);        /* drop stale lines: the block wrote memory */
++	if (produced > outCap) {
++		return kIOReturnNoSpace;
++	}
++	memcpy(out, j->dst->getBytesNoCopy(), produced);
++	*outLen = produced;
++	if (cyclesOut != NULL) {
++		*cyclesOut = cycles;
++	}
++	j->encodes++;
++	j->bytesOut += produced;
++	j->cycles += cycles;
++	return kIOReturnSuccess;
++}
++
++void
++viva_jpgenc_stats(struct viva_jpgenc *j, uint64_t *encodes, uint64_t *failures, uint64_t *bytes, uint64_t *cycles)
++{
++	*encodes = j->encodes;
++	*failures = j->failures;
++	*bytes = j->bytesOut;
++	*cycles = j->cycles;
++}
++
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/VivaJPEG.cpp b/iokit/Kernel/arm/VivaJPEG.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaJPEG.cpp
+@@ -0,0 +1,272 @@
++/*
++ * viva (MT6781): the AppleJPEGDriver that VideoToolbox's JPEG encoder (JPEGH1.videoencoder) opens, on the hardware
++ * encoder of VivaJPEGHW.cpp. ABI from iOS 16.7.16: gpu/docs/ABI-APPLEJPEGDRIVER.md in the viva-gpu repository.
++ *
++ * Phase 1 of that document: the class is VivaJPEGEncoder and only the registry *name* is "AppleJPEGDriver". The VT
++ * encoder looks the service up with IOServiceNameMatching and finds it; VT's decoder, CMPhoto and MobileGestalt match
++ * the class AppleJPEGDriver and do not, so every decode (MT6781 has no JPEG decoder) and CMPhoto's encoding stay in
++ * software exactly as without the service.
++ *
++ * Selector 3 (encode, struct 0x58 in, 0x58 out): source 'yuvf'/'yuvs' (YUYV 4:2:2) or '420f'/'420v' (NV12) IOSurface,
++ * destination IOSurface ('JPEG'); a complete JFIF file at offset 0 of the destination, out+0x10 = its size,
++ * out+0x14/+0x18 = width/height. Quality level +0x1C (0..7, VideoToolbox: higher = better) maps to the jpgenc tables.
++ * Bigger than the destination: kIOReturnOverrun with out+0x10 = the destination size (VT retries one level lower).
++ * Selectors 1, 4, 5 (decode, encode with custom tables): kIOReturnUnsupported.
++ * Registry: AppleJPEGRequiresMCUAlignment = 0 (32-bit number) lets VT hand over 420f as well as yuvf.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSDictionary.h>
++
++#include "VivaJPEG.h"
++#include "SweetSurface.h"
++
++#define FOURCC(a, b, c, d)      (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
++#define PF_YUVF                 FOURCC('y', 'u', 'v', 'f')
++#define PF_YUVS                 FOURCC('y', 'u', 'v', 's')
++#define PF_420F                 FOURCC('4', '2', '0', 'f')
++#define PF_420V                 FOURCC('4', '2', '0', 'v')
++#define JPEG_MAX_PIXELS         (4096u * 4096u)
++#define JPEG_GPU_WAIT_MS        1000
++
++struct viva_jpeg_request {              /* selectors 1/3, 0x58 bytes */
++	uint32_t srcID, srcAllocSize, dstID, dstAllocSize;
++	uint32_t written, width, height, quality, flags, cropX, cropY, chroma;
++	uint64_t callback, refcon, arg;
++	uint32_t traceID, decode[2];         /* 0x48, 0x4c-0x53 (decode only) */
++	uint32_t rstLogging;                 /* 0x54 */
++};
++static_assert(sizeof(struct viva_jpeg_request) == 0x58, "AppleJPEGDriver requests are 0x58 bytes");
++
++class VivaJPEGEncoder : public IOService {
++	OSDeclareDefaultStructors(VivaJPEGEncoder);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++	IOReturn encode(struct viva_jpeg_request *req);
++	void refused(void) { OSIncrementAtomic64((SInt64 *)&fRefused); }
++private:
++	void publishStats(void);
++	IOLock *fLock;
++	struct viva_jpgenc *fHW;
++	uint64_t fRefused, fErrors, fOverruns;
++};
++
++class VivaJPEGEncoderUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(VivaJPEGEncoderUserClient);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++private:
++	VivaJPEGEncoder *fOwner;
++};
++
++OSDefineMetaClassAndStructors(VivaJPEGEncoder, IOService);
++OSDefineMetaClassAndStructors(VivaJPEGEncoderUserClient, IOUserClient);
++
++static void
++setNumber(IORegistryEntry *e, OSDictionary *d, const char *key, uint64_t value)
++{
++	OSNumber *n = OSNumber::withNumber(value, 32);
++	if (n == NULL) {
++		return;
++	}
++	if (d != NULL) {
++		d->setObject(key, n);
++	} else {
++		e->setProperty(key, n);
++	}
++	n->release();
++}
++
++bool
++VivaJPEGEncoder::start(IOService *provider)
++{
++	int mode = 0;
++	PE_parse_boot_argn("vivajpeg", &mode, sizeof(mode));
++	if (mode <= 0) {
++		IOLog("VIVA JPEG: off (boot-arg vivajpeg=1 publishes the hardware encoder)\n");
++		return false;
++	}
++	fLock = IOLockAlloc();
++	if (fLock == NULL || !IOService::start(provider)) {
++		return false;
++	}
++	fHW = viva_jpgenc_create(JPEG_MAX_PIXELS);
++	if (fHW == NULL) {
++		return false;
++	}
++	setName("AppleJPEGDriver");
++	setNumber(this, NULL, "AppleJPEGRequiresMCUAlignment", 0);
++	setNumber(this, NULL, "AppleJPEGNumCores", 1);
++	setProperty("IOUserClientClass", "VivaJPEGEncoderUserClient");
++	publishStats();
++	registerService();
++	IOLog("VIVA JPEG: AppleJPEGDriver (encode only) published\n");
++	return true;
++}
++
++IOReturn
++VivaJPEGEncoder::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler)
++{
++	if (type != 0) {
++		return kIOReturnUnsupported;
++	}
++	VivaJPEGEncoderUserClient *c = OSTypeAlloc(VivaJPEGEncoderUserClient);
++	if (c == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (!c->initWithTask(owningTask, securityID, type) || !c->attach(this) || !c->start(this)) {
++		c->detach(this);
++		c->release();
++		return kIOReturnError;
++	}
++	*handler = c;
++	return kIOReturnSuccess;
++}
++
++void
++VivaJPEGEncoder::publishStats(void)
++{
++	OSDictionary *d = OSDictionary::withCapacity(6);
++	if (d == NULL) {
++		return;
++	}
++	uint64_t enc = 0, fail = 0, bytes = 0, cycles = 0;
++	if (fHW != NULL) {
++		viva_jpgenc_stats(fHW, &enc, &fail, &bytes, &cycles);
++	}
++	setNumber(this, d, "encodes", enc);
++	setNumber(this, d, "failures", fail + fErrors);
++	setNumber(this, d, "overruns", fOverruns);
++	setNumber(this, d, "refused", fRefused);
++	setNumber(this, d, "bytes", bytes);
++	setNumber(this, d, "cycles", cycles);
++	setProperty("VivaJPEGStats", d);
++	d->release();
++}
++
++/* VideoToolbox's level 0..7 (7 = 'sjpg' without rate control) to a 0..100 quality for the jpgenc tables. */
++static uint32_t
++levelQuality(uint32_t level)
++{
++	static const uint8_t q[8] = { 40, 55, 65, 75, 85, 92, 97, 97 };
++	return q[level < 8 ? level : 4];
++}
++
++IOReturn
++VivaJPEGEncoder::encode(struct viva_jpeg_request *req)
++{
++	SweetSurface *src = sweet_surface_copy(req->srcID), *dst = sweet_surface_copy(req->dstID);
++	IOReturn ret = kIOReturnBadArgument;
++	if (src == NULL || dst == NULL) {
++		goto out;
++	}
++	{
++		struct viva_jpgenc_image img = {};
++		uint32_t w = req->width ? req->width : src->width, h = req->height ? req->height : src->height;
++		uintptr_t sk = src->kernelAddress(), dk = dst->kernelAddress();
++		if (sk == 0 || dk == 0 || w > src->width || h > src->height || req->cropX || req->cropY) {
++			ret = sk == 0 || dk == 0 ? kIOReturnNoMemory : kIOReturnUnsupported;
++			goto out;
++		}
++		img.width = w;
++		img.height = h;
++		if ((src->pixelFormat == PF_YUVF || src->pixelFormat == PF_YUVS) && src->bytesPerElement >= 2) {
++			img.format = kVivaJpegYUYV;
++			img.y = (const uint8_t *)sk + src->offset;
++			img.yBytesPerRow = src->bytesPerRow;
++		} else if ((src->pixelFormat == PF_420F || src->pixelFormat == PF_420V) && src->planeCount >= 2) {
++			img.format = kVivaJpegNV12;
++			img.y = (const uint8_t *)sk + src->planes[0].offset;
++			img.yBytesPerRow = src->planes[0].bytesPerRow;
++			img.uv = (const uint8_t *)sk + src->planes[1].offset;
++			img.uvBytesPerRow = src->planes[1].bytesPerRow;
++		} else {
++			ret = kIOReturnUnsupported;
++			goto out;
++		}
++		/* the encoder writes the source through the GPU possibly (pool buffers); wait, then read fresh lines */
++		if (!viva_gpu_surface_idle(src, NULL)) {
++			viva_gpu_surface_wait(src, JPEG_GPU_WAIT_MS);
++		}
++		if (!viva_gpu_surface_idle(dst, NULL)) {
++			viva_gpu_surface_wait(dst, JPEG_GPU_WAIT_MS);
++		}
++		sweet_surface_before_cpu_access(src);
++		sweet_surface_before_cpu_access(dst);
++		size_t cap = dst->allocSize, len = 0;
++		IOLockLock(fLock);
++		ret = viva_jpgenc_encode(fHW, &img, levelQuality(req->quality), (uint8_t *)dk, cap, &len, NULL);
++		if (ret == kIOReturnNoSpace) {
++			fOverruns++;
++		} else if (ret != kIOReturnSuccess) {
++			fErrors++;
++		}
++		IOLockUnlock(fLock);
++		if (ret == kIOReturnSuccess) {
++			sweet_surface_cpu_wrote(dst);
++			req->written = (uint32_t)len;
++			req->width = w;
++			req->height = h;
++		} else if (ret == kIOReturnNoSpace) {
++			req->written = (uint32_t)cap;
++			ret = kIOReturnOverrun;     /* VideoToolbox retries one quality level lower */
++		}
++	}
++out:
++	OSSafeReleaseNULL(src);
++	OSSafeReleaseNULL(dst);
++	publishStats();
++	return ret;
++}
++
++bool
++VivaJPEGEncoderUserClient::start(IOService *provider)
++{
++	fOwner = OSDynamicCast(VivaJPEGEncoder, provider);
++	return fOwner != NULL && IOUserClient::start(provider);
++}
++
++IOReturn
++VivaJPEGEncoderUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++VivaJPEGEncoderUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	switch (selector) {
++	case 3: {
++		if (args->structureInput == NULL || args->structureInputSize != sizeof(struct viva_jpeg_request) ||
++		    args->structureOutput == NULL || args->structureOutputSize < sizeof(struct viva_jpeg_request)) {
++			return kIOReturnBadArgument;
++		}
++		struct viva_jpeg_request req;
++		memcpy(&req, args->structureInput, sizeof(req));
++		IOReturn ret = fOwner->encode(&req);
++		memcpy(args->structureOutput, &req, sizeof(req));
++		args->structureOutputSize = sizeof(req);
++		return ret;
++	}
++	case 1:
++	case 4:
++	case 5:
++		fOwner->refused();      /* decode / custom tables: the clients keep (or fall back to) software */
++		return kIOReturnUnsupported;
++	default:
++		return kIOReturnBadArgument;
++	}
++}
++
++#endif /* SWEET */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -138,6 +138,16 @@
+     "     'IONameMatch'     = 'mediatek,mt6781-mali';"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleM2ScalerCSCDriver;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleM2ScalerCSCDriver;"
++    "   },"
++    "   {"
++    "     'IOClass'         = VivaJPEGEncoder;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = VivaJPEGEncoder;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetHIDButtons;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDButtons;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -27,6 +27,10 @@
+ iokit/Kernel/arm/VivaBattery.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/VivaWiFi.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/VivaWLAN.cpp                                    optional iokitcpp
++iokit/Kernel/arm/VivaScaler.cpp                                  optional iokitcpp
++iokit/Kernel/arm/VivaMDP.cpp                                     optional iokitcpp
++iokit/Kernel/arm/VivaJPEGHW.cpp                                  optional iokitcpp
++iokit/Kernel/arm/VivaJPEG.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/VivaKeypad.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/VivaPMICKeys.cpp                            optional iokitcpp
