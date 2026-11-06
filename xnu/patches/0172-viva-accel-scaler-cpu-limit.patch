@@ -1,0 +1,60 @@
+diff --git a/iokit/Kernel/arm/VivaScaler.h b/iokit/Kernel/arm/VivaScaler.h
+--- a/iokit/Kernel/arm/VivaScaler.h
++++ b/iokit/Kernel/arm/VivaScaler.h
+@@ -13,6 +13,11 @@
+  *   source. Formats outside the mask are refused with kIOReturnUnsupported, which every client handles by
+  *   falling back (VideoToolbox propagates errors of a published service, hence the mask).
+  *
++ * vivascalercpumax (pixels, default 65536): largest destination the CPU scales or converts. Bigger requests that the MDP
++ *   cannot take are refused with kIOReturnUnsupported: QuartzCore then does them on the GPU as without the service
++ *   (its switcher/snapshot reductions of the whole screen, 1125x2436 -> 787x1705, cost tens of milliseconds on the
++ *   CPU against ~2 ms on the GPU). Same-size copies of one RGB format are always done (one memcpy per row).
++ *
+  * Counters: property "VivaScalerStats" of the service (ioreg / Viva Manager).
+  */
+ #ifndef _IOKIT_ARM_VIVASCALER_H
+@@ -71,6 +76,7 @@
+ 	IOLock   *fLock;            /* one transfer at a time (CPU work is short; the MDP has one pipe) */
+ 	int       fMode;
+ 	uint32_t  fFormats;
++	uint32_t  fCpuMax;          /* largest destination (pixels) the CPU scales / converts */
+ 	struct viva_mdp *fMdp;      /* NULL = CPU only */
+ 	uint64_t  fTransfers, fCpu, fMdpDone, fUnsupported, fErrors, fBytes, fNs, fCustomFilters, fClients;
+ 	uint64_t  fLastPublish;
+diff --git a/iokit/Kernel/arm/VivaScaler.cpp b/iokit/Kernel/arm/VivaScaler.cpp
+--- a/iokit/Kernel/arm/VivaScaler.cpp
++++ b/iokit/Kernel/arm/VivaScaler.cpp
+@@ -108,6 +108,8 @@
+ 	}
+ 	fFormats = 3;
+ 	PE_parse_boot_argn("vivascalerformats", &fFormats, sizeof(fFormats));
++	fCpuMax = 65536;
++	PE_parse_boot_argn("vivascalercpumax", &fCpuMax, sizeof(fCpuMax));
+ 	fLock = IOLockAlloc();
+ 	if (fLock == NULL || !IOService::start(provider)) {
+ 		return false;
+@@ -127,6 +129,7 @@
+ 	}
+ 	setProperty("VivaScalerBackend", fMode >= 2 ? "mdp" : "cpu");
+ 	setProperty("VivaScalerFormats", fFormats, 32);
++	setProperty("VivaScalerCpuMax", fCpuMax, 32);
+ 	setProperty("IOUserClientClass", "AppleM2ScalerCSCDriverUserClient");
+ 	publishStats();
+ 	registerService();
+@@ -384,6 +387,16 @@
+ 			return ret;
+ 		}
+ 	}
++	/* the CPU only for small work or plain copies: everything else back to the client (QuartzCore uses the GPU) */
++	{
++		uint64_t dw = req->dstW ? req->dstW : dst->width, dh = req->dstH ? req->dstH : dst->height;
++		bool same = src->pixelFormat == dst->pixelFormat && !srcYuv &&
++		    (req->srcW == 0 || req->srcW == dw << 16) && (req->srcH == 0 || req->srcH == dh << 16) &&
++		    (req->srcW != 0 || (src->width == dw && src->height == dh)) && !(flags & kVivaScalerFlagAlphaOverride);
++		if (!same && dw * dh > fCpuMax) {
++			return kIOReturnUnsupported;
++		}
++	}
+ 	sweet_surface_before_cpu_access(src);
+ 	sweet_surface_before_cpu_access(dst);
+ 	ret = cpuTransfer(src, dst, req->srcX, req->srcY, req->srcW, req->srcH, req->dstX, req->dstY, req->dstW,
