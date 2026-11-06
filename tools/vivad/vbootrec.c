@@ -16,11 +16,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/disk.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+
+/* sys/disk.h is not in the iOS SDK: the same values */
+#define DKIOCGETBLOCKSIZE       _IOR('d', 24, uint32_t)
+#define DKIOCGETBLOCKCOUNT      _IOR('d', 25, uint64_t)
+#define DKIOCSYNCHRONIZECACHE   _IO('d', 22)
 
 #define DEV             "/dev/rufsroot0"
 #define BLOCK           4096
@@ -123,7 +127,7 @@ static int write_block(const uint8_t *blk)
 		close(fd);
 		return fail("write");
 	}
-	ioctl(fd, DKIOCSYNCHRONIZE, NULL);
+	ioctl(fd, DKIOCSYNCHRONIZECACHE);
 	ssize_t n = pread(fd, back, BLOCK, off);
 	close(fd);
 	if (n != BLOCK || memcmp(back, blk, BLOCK)) {
