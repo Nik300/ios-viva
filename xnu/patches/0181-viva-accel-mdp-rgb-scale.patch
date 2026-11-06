@@ -1,0 +1,435 @@
+diff --git a/iokit/Kernel/arm/VivaMDP.cpp b/iokit/Kernel/arm/VivaMDP.cpp
+--- a/iokit/Kernel/arm/VivaMDP.cpp
++++ b/iokit/Kernel/arm/VivaMDP.cpp
+@@ -21,8 +21,21 @@
+  * Frames are done in vertical strips of at most 512 pixels (WROT's single-tile width, MT6893 value; MT6781's is
+  * not known). Surfaces that are not physically contiguous below 4 GiB go through bounce buffers.
+  *
++ * 0181: BGRA -> BGRA scaling (any ratio) through the resizer, found the same way (2026-11-06 night):
++ * - path RDMA0 -> PQ0 chain (HDR0 -> AAL0 -> RSZ0 -> TDSHP0) -> WROT0: RDMA0_MOUT_EN = 1, PQ0_SEL_IN (0xF30) = 0,
++ *   AAL0_MOUT_EN (0xF28) = 1, PQ0_SOUT_SEL (0xF80) = 0, WROT0_SEL_IN = 1; HDR0 register 0 = 1 (its reset value 0x38382060
++ *   holds the data), HDR0/AAL0/TDSHP0 in relay with their sizes; mutex MOD0 = 0x3FF; all PQ clocks on (CG 0xAFC3).
++ * - RGB is converted to YUV full range in RDMA (TRANSFORM_0 = 0x10000) and back in WROT (MAT_CTRL 0x41); RSZ0 with
++ *   use121filter, coefficient steps and algorithms of MediaTek's rsz_fw (6 taps up, cubic accumulation down).
++ *   WROT writes a fixed alpha 0xFF: only for opaque content. Boot-arg vivamdprgb: 0 = no RGB on the MDP, 1 (default)
++ *   = sources whose sampled alpha is all 0xFF, 2 = every BGRA source (alpha lost).
++ * - the vertical scaler's line buffer holds ~272 output pixels: frames go in vertical strips of 256 output columns,
++ *   each a frame of its own with the RSZ horizontal phase of its first column (accumulation: offset in the SUB field
++ *   only; 6 taps: INT/SUB with the chroma INT at 0). Measured: 1125x48 -> 787x34 in 4 strips, max error 3 levels
++ *   against a bilinear reference.
++ *
+  * Boot-arg vivascaler=2 enables it (VivaScaler.cpp); vivamdpmax = largest frame in pixels for the bounce buffers
+- * (default 1920x1088).
++ * (default 1125x2448, the screen).
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -50,6 +63,39 @@
+ #define CG_CON0                 0x0100
+ #define CG_CLR0                 0x0108
+ #define CG_MDP                  0xbc1
++#define CG_MDP_PQ               0xafc3  /* + TDSHP0, HDR0, RSZ1, AAL0 */
++#define AAL0_MOUT_EN            0x0f28
++#define PQ0_SEL_IN              0x0f30
++#define PQ0_SOUT_SEL            0x0f80
++/* PQ engines (relay) */
++#define HDR0_TOP                0x7000
++#define HDR0_RELAY              0x7004
++#define HDR0_SIZE               0x7014
++#define AAL0_EN                 0x5000
++#define AAL0_CFG                0x5020
++#define AAL0_SIZE               0x5030
++#define AAL0_OUT_SIZE           0x5034
++#define AAL0_OUT_OFFSET         0x5038
++#define TDSHP0_CTRL             0xc100
++#define TDSHP0_CFG              0xc110
++#define TDSHP0_IN_SIZE          0xc120
++#define TDSHP0_OUT_OFFSET       0xc124
++#define TDSHP0_OUT_SIZE         0xc128
++/* RSZ0 */
++#define RSZ_CON_1               0x8004
++#define RSZ_CON_2               0x8008
++#define RSZ_IN_IMAGE            0x8010
++#define RSZ_OUT_IMAGE           0x8014
++#define RSZ_HOR_STEP            0x8018
++#define RSZ_VER_STEP            0x801c
++#define RSZ_LUMA_HOR_INT        0x8020
++#define RSZ_LUMA_HOR_SUB        0x8024
++#define RSZ_LUMA_VER_INT        0x8028
++#define RSZ_LUMA_VER_SUB        0x802c
++#define RSZ_CHROMA_HOR_INT      0x8030
++#define RSZ_CHROMA_HOR_SUB      0x8034
++#define RSZ_ETC                 0x822c
++#define RST_PQ_ENGINES          0x10703u        /* reset bits: RDMA0 TDSHP0 WROT0 RSZ0 HDR0 AAL0 */
+ #define SW0_RST_B               0x0700
+ #define MOUT_RST                0x0f00
+ #define RDMA0_MOUT_EN           0x0f20
+@@ -112,6 +158,8 @@
+ #define WROT_BASE_V             0xaf08
+ 
+ #define MDP_TILE_W              512
++#define MDP_RSZ_TILE_W          256     /* output columns per strip through RSZ0 (vertical line buffer ~272) */
++#define MDP_RDMA_MAX_W          1024    /* input columns per strip (keeps the RDMA tile in what was measured) */
+ #define MDP_TIMEOUT_MS          100
+ 
+ struct viva_mdp {
+@@ -119,7 +167,8 @@
+ 	IOBufferMemoryDescriptor *srcBuf, *dstBuf;
+ 	uint64_t srcPA, dstPA;
+ 	size_t srcSize, dstSize;
+-	uint64_t frames, strips, timeouts;
++	uint64_t frames, strips, timeouts, rgbFrames, rgbAlpha;
++	uint32_t rgbMode;       /* vivamdprgb: 0 off, 1 opaque sources only (sampled alpha), 2 always (alpha 0xFF) */
+ };
+ 
+ static inline uint32_t rd(IOMemoryMap *m, uint32_t off) { return *(volatile uint32_t *)(m->getVirtualAddress() + off); }
+@@ -168,15 +217,18 @@
+ struct viva_mdp *
+ viva_mdp_create(void)
+ {
+-	uint32_t maxPixels = 1920 * 1088;
++	uint32_t maxPixels = 1125 * 2448;
+ 	PE_parse_boot_argn("vivamdpmax", &maxPixels, sizeof(maxPixels));
++	uint32_t rgbMode = 1;
++	PE_parse_boot_argn("vivamdprgb", &rgbMode, sizeof(rgbMode));
+ 	struct viva_mdp *m = (struct viva_mdp *)IOMallocZero(sizeof(*m));
+ 	if (m == NULL) {
+ 		return NULL;
+ 	}
+ 	m->spm = mapRegs(PA_SPM, 0x1000);
+ 	m->mdp = mapRegs(PA_MDPSYS, 0x10000);
+-	m->srcSize = round_page((size_t)maxPixels * 3 / 2 + 4096);
++	m->rgbMode = rgbMode;
++	m->srcSize = round_page((size_t)maxPixels * 4 + 4096);
+ 	m->dstSize = round_page((size_t)maxPixels * 4 + 4096);
+ 	m->srcBuf = contiguous(m->srcSize, &m->srcPA);
+ 	m->dstBuf = contiguous(m->dstSize, &m->dstPA);
+@@ -188,7 +240,7 @@
+ 		IOFreeType(m, struct viva_mdp);
+ 		return NULL;
+ 	}
+-	IOLog("VIVA MDP: NV12 -> BGRA on RDMA0 -> WROT0 (bounce buffers for %u pixels)\n", maxPixels);
++	IOLog("VIVA MDP: NV12 -> BGRA and BGRA scaling on RDMA0 -> (RSZ0) -> WROT0 (bounce buffers for %u pixels)\n", maxPixels);
+ 	return m;
+ }
+ 
+@@ -199,8 +251,8 @@
+ 	if (!(rd(m->spm, SPM_PWR_STATUS) & DIS_STATUS)) {
+ 		return false;           /* panel off: the MDP is unpowered, the CPU does it */
+ 	}
+-	wr(m->mdp, CG_CLR0, CG_MDP);
+-	if (rd(m->mdp, CG_CON0) & CG_MDP) {
++	wr(m->mdp, CG_CLR0, CG_MDP_PQ);
++	if (rd(m->mdp, CG_CON0) & CG_MDP_PQ) {
+ 		return false;
+ 	}
+ 	wr(m->mdp, LARB_CMD_THRT, 0x00370256);
+@@ -295,8 +347,8 @@
+ 	return pa != 0 && len >= s->allocSize && pa + s->allocSize <= (1ull << 32) ? pa : 0;
+ }
+ 
+-IOReturn
+-viva_mdp_transfer(struct viva_mdp *m, SweetSurface *src, SweetSurface *dst, uint32_t sx, uint32_t sy, uint32_t sw,
++static IOReturn
++nv12Transfer(struct viva_mdp *m, SweetSurface *src, SweetSurface *dst, uint32_t sx, uint32_t sy, uint32_t sw,
+     uint32_t sh, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh, uint64_t flags)
+ {
+ 	/* NV12 -> BGRA, whole surfaces, same size, no transform */
+@@ -365,4 +417,297 @@
+ 	return kIOReturnSuccess;
+ }
+ 
++/* ---- BGRA scaling through RSZ0 (0181) ---------------------------------------------------------------------------- */
++
++struct rsz_axis {
++	uint32_t algo, step, sub, tbl;
++};
++
++/* MediaTek's rsz_fw: 6-tap FIR up (precision 2^15), cubic accumulation down to 1/24 (2^20), source accumulation below. */
++static struct rsz_axis
++rszAxis(uint32_t in, uint32_t out)
++{
++	struct rsz_axis a = {};
++	if (out >= in) {
++		if (in == out) {
++			a.algo = 0; a.step = 32768; a.sub = 0; a.tbl = 7;
++			return a;
++		}
++		a.algo = 0;
++		a.step = (uint32_t)((32768ull * (in - 1)) / (out - 1));
++		a.sub = (uint32_t)((32768ull * (in - 1) - (uint64_t)a.step * (out - 1)) / 2);
++		a.tbl = 9;
++		return a;
++	}
++	a.algo = in > 24 * out ? 1 : 2;
++	uint64_t one = 1ull << 20;
++	uint64_t step = (one * (out - 1)) / (in - 1);
++	if (step * (in - 1) != one * (out - 1)) {
++		step++;
++	}
++	a.step = (uint32_t)step;
++	a.sub = (uint32_t)(((uint64_t)(in - 1) * step - (uint64_t)(out - 1) * one) / 2);
++	a.tbl = 17;
++	return a;
++}
++
++/* One vertical strip: input columns [ix0, ix1) of the source -> output columns [k0, k1). */
++static bool
++rszStrip(struct viva_mdp *m, uint64_t src, uint32_t sstride, uint32_t iw, uint32_t ih, uint64_t dst, uint32_t dstride,
++    uint32_t ow, uint32_t oh, uint32_t k0, uint32_t k1)
++{
++	struct rsz_axis h = rszAxis(iw, ow), v = rszAxis(ih, oh);
++	uint32_t ix0, ix1, hint, hsub;
++	if (h.algo == 0) {
++		uint64_t pos = (uint64_t)k0 * h.step + h.sub;           /* input position of output k0, 1/32768 */
++		ix0 = (uint32_t)(pos >> 15) >= 2 ? (((uint32_t)(pos >> 15) - 2) & ~1u) : 0;
++		uint64_t last = (uint64_t)(k1 - 1) * h.step + h.sub;
++		ix1 = (uint32_t)(last >> 15) + 4;
++		uint64_t off = pos - ((uint64_t)ix0 << 15);
++		hint = (uint32_t)(off >> 15);
++		hsub = (uint32_t)(off & 0x7fff);
++	} else {
++		uint64_t one = 1ull << 20;
++		uint64_t first = ((uint64_t)k0 * one + h.sub) / h.step;  /* input pixel at output k0 */
++		ix0 = first >= 2 ? (uint32_t)first - 2 : 0;
++		uint64_t num = (uint64_t)(k1 - 1) * one + h.sub;
++		ix1 = (uint32_t)((num + h.step - 1) / h.step) + 3;
++		/* output-space phase of the strip's first input pixel, all in the SUB field (INT 0) */
++		hint = 0;
++		hsub = (uint32_t)((uint64_t)h.sub + (uint64_t)k0 * one - (uint64_t)ix0 * h.step);
++	}
++	if (ix1 > iw) {
++		ix1 = iw;
++	}
++	uint32_t tw = ix1 - ix0, ow_ = k1 - k0;
++	if (tw > MDP_RDMA_MAX_W) {
++		return false;
++	}
++	wr(m->mdp, SW0_RST_B, ~RST_PQ_ENGINES);
++	wr(m->mdp, SW0_RST_B, 0xffffffffu);
++	wr(m->mdp, MOUT_RST, 4);
++	wr(m->mdp, MOUT_RST, 0);
++	/* PQ engines in relay; HDR0 and AAL0 sit before RSZ0 (input size), TDSHP0 after it (output size) */
++	wr(m->mdp, TDSHP0_CTRL, 1);
++	wr(m->mdp, TDSHP0_CFG, 1);
++	wr(m->mdp, TDSHP0_IN_SIZE, (ow_ << 16) | oh);
++	wr(m->mdp, TDSHP0_OUT_SIZE, (ow_ << 16) | oh);
++	wr(m->mdp, TDSHP0_OUT_OFFSET, 0);
++	wr(m->mdp, AAL0_EN, 1);
++	wr(m->mdp, AAL0_CFG, 1);
++	wr(m->mdp, AAL0_SIZE, (tw << 16) | ih);
++	wr(m->mdp, AAL0_OUT_SIZE, (tw << 16) | ih);
++	wr(m->mdp, AAL0_OUT_OFFSET, 0);
++	wr(m->mdp, HDR0_RELAY, 1);
++	wr(m->mdp, HDR0_SIZE, (ih << 16) | tw);
++	wr(m->mdp, HDR0_TOP, 1);
++	/* routing RDMA0 -> PQ0 -> WROT0 */
++	wr(m->mdp, RDMA0_MOUT_EN, 1);
++	wr(m->mdp, PQ0_SEL_IN, 0);
++	wr(m->mdp, AAL0_MOUT_EN, 1);
++	wr(m->mdp, PQ0_SOUT_SEL, 0);
++	wr(m->mdp, WROT0_SEL_IN, 1);
++	/* RSZ0 */
++	uint32_t con1 = 0x3 | ((ow >= iw ? 1u : 0u) << 4) | (h.algo << 5) | (v.algo << 7) | (h.tbl << 16) | (v.tbl << 21) |
++	    (1u << 26) | (1u << 31);
++	uint32_t con2 = ((tw % 2) == 0 ? (1u << 12) : 0) | (ix0 > 0 ? (1u << 11) : 0) | (k1 == ow ? 0 : (1u << 13));
++	wr(m->mdp, RSZ_ENABLE, 0x10000);
++	wr(m->mdp, RSZ_ENABLE, 0);
++	wr(m->mdp, RSZ_ETC, 0);
++	wr(m->mdp, RSZ_CON_1, con1);
++	wr(m->mdp, RSZ_CON_2, con2);
++	wr(m->mdp, RSZ_HOR_STEP, h.step);
++	wr(m->mdp, RSZ_VER_STEP, v.step);
++	wr(m->mdp, RSZ_IN_IMAGE, (ih << 16) | tw);
++	wr(m->mdp, RSZ_OUT_IMAGE, (oh << 16) | ow_);
++	wr(m->mdp, RSZ_LUMA_HOR_INT, hint);
++	wr(m->mdp, RSZ_LUMA_HOR_SUB, hsub);
++	wr(m->mdp, RSZ_LUMA_VER_INT, 0);
++	wr(m->mdp, RSZ_LUMA_VER_SUB, v.sub);
++	wr(m->mdp, RSZ_CHROMA_HOR_INT, h.algo == 0 ? 0 : hint);
++	wr(m->mdp, RSZ_CHROMA_HOR_SUB, hsub);
++	wr(m->mdp, RSZ_ENABLE, 1);
++	/* RDMA0: BGRA (code 14 on this chip) -> YUV full range */
++	uint64_t s0 = src + (uint64_t)ix0 * 4;
++	wr(m->mdp, RDMA_GMCIF_CON, 0x00010071);
++	wr(m->mdp, RDMA_SRC_CON, 0x60e);
++	wr(m->mdp, RDMA_COMP_CON, 0);
++	wr(m->mdp, RDMA_CON, 0x1010);
++	wr(m->mdp, RDMA_SRC_BASE_0, (uint32_t)s0);
++	wr(m->mdp, RDMA_SRC_END_0, (uint32_t)(s0 + (uint64_t)sstride * (ih - 1) + (uint64_t)tw * 4 - 1));
++	wr(m->mdp, RDMA_MF_BKGD, sstride);
++	wr(m->mdp, RDMA_SF_BKGD, 0);
++	wr(m->mdp, RDMA_TRANSFORM_0, 0x10000);
++	wr(m->mdp, RDMA_SRC_OFFSET_0, 0);
++	wr(m->mdp, RDMA_SRC_OFFSET_1, 0);
++	wr(m->mdp, RDMA_SRC_OFFSET_2, 0);
++	wr(m->mdp, RDMA_MF_SRC_SIZE, (ih << 16) | tw);
++	wr(m->mdp, RDMA_MF_CLIP_SIZE, (ih << 16) | tw);
++	wr(m->mdp, RDMA_MF_OFFSET_1, 0);
++	wr(m->mdp, RDMA_EN, 1);
++	/* WROT0: YUV full range -> BGRA, alpha 0xFF */
++	wr(m->mdp, WROT_CTRL, 0xa0005002);
++	wr(m->mdp, WROT_BASE, (uint32_t)(dst + (uint64_t)k0 * 4));
++	wr(m->mdp, WROT_BASE_C, 0);
++	wr(m->mdp, WROT_BASE_V, 0);
++	wr(m->mdp, WROT_STRIDE, dstride);
++	wr(m->mdp, WROT_STRIDE_C, 0);
++	wr(m->mdp, WROT_STRIDE_V, 0);
++	wr(m->mdp, WROT_CTRL_2, 0);
++	wr(m->mdp, WROT_SCAN_10BIT, 0);
++	wr(m->mdp, WROT_PENDING_ZERO, 0);
++	wr(m->mdp, WROT_MAT_CTRL, 0x41);
++	wr(m->mdp, WROT_DITHER, 0xff000000);
++	wr(m->mdp, WROT_EOL_SEL, 0x80000000);
++	wr(m->mdp, WROT_PREULTRA, 0x00060010);
++	wr(m->mdp, WROT_OFST_ADDR, 0);
++	wr(m->mdp, WROT_OFST_ADDR_C, 0);
++	wr(m->mdp, WROT_OFST_ADDR_V, 0);
++	wr(m->mdp, WROT_IN_SIZE, (oh << 16) | ow_);
++	wr(m->mdp, WROT_TAR_SIZE, (oh << 16) | ow_);
++	wr(m->mdp, WROT_CROP_OFST, 0);
++	wr(m->mdp, WROT_MAIN_BUF, (ow_ << 16) | (32 << 8));
++	wr(m->mdp, WROT_ROT_EN, 1);
++	/* every engine of the chain gets the start */
++	wr(m->mdp, MUTEX0_MOD0, 0x3ff);
++	wr(m->mdp, MUTEX0_MOD1, 0);
++	wr(m->mdp, MUTEX0_SOF, 0);
++	wr(m->mdp, WROT_INT_EN, 0x300);
++	wr(m->mdp, MUTEX0_EN, 1);
++	uint64_t deadline;
++	clock_interval_to_deadline(MDP_TIMEOUT_MS, kMillisecondScale, &deadline);
++	bool done = false;
++	while (!(done = rd(m->mdp, WROT_DEBUG) & 1) && mach_absolute_time() < deadline) {
++		IODelay(20);
++	}
++	wr(m->mdp, WROT_ROT_EN, 0);
++	wr(m->mdp, RDMA_EN, 0);
++	wr(m->mdp, RSZ_ENABLE, 0);
++	wr(m->mdp, MUTEX0_EN, 0);
++	return done;
++}
++
++static IOReturn
++rgbTransfer(struct viva_mdp *m, SweetSurface *src, SweetSurface *dst, uint32_t sx, uint32_t sy, uint32_t sw,
++    uint32_t sh, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh, uint64_t flags)
++{
++	if (src->pixelFormat != PF_BGRA || dst->pixelFormat != PF_BGRA || src->bytesPerElement != 4 || dst->bytesPerElement != 4 ||
++	    (flags & kVivaScalerFlagTransformMask)) {
++		return kIOReturnUnsupported;
++	}
++	/* source rectangle in 16.16 (integer pixels only), destination in pixels; all zero = whole surface */
++	if ((sx | sy | sw | sh) & 0xffff) {
++		return kIOReturnUnsupported;
++	}
++	uint32_t x0 = sx >> 16, y0 = sy >> 16, iw = sw >> 16, ih = sh >> 16;
++	if (iw == 0 && ih == 0 && x0 == 0 && y0 == 0) {
++		iw = src->width;
++		ih = src->height;
++	}
++	if (dw == 0 && dh == 0 && dx == 0 && dy == 0) {
++		dw = dst->width;
++		dh = dst->height;
++	}
++	if (iw < 8 || ih < 8 || dw < 8 || dh < 8 || iw > 8190 || ih > 8190 || dw > 8190 || dh > 8190 ||
++	    (uint64_t)x0 + iw > src->width || (uint64_t)y0 + ih > src->height ||
++	    (uint64_t)dx + dw > dst->width || (uint64_t)dy + dh > dst->height || (src->bytesPerRow & 15) || (dst->bytesPerRow & 15)) {
++		return kIOReturnUnsupported;
++	}
++	/* a strip's input must fit RDMA: output strip width * ratio */
++	uint32_t tile = MDP_RSZ_TILE_W;
++	while (tile > 16 && (uint64_t)tile * iw / dw + 8 > MDP_RDMA_MAX_W) {
++		tile /= 2;
++	}
++	uint64_t spa = contiguousPA(src), dpa = contiguousPA(dst);
++	size_t inBytes = (size_t)iw * 4 * ih, outBytes = (size_t)dw * 4 * dh;
++	uintptr_t sk = src->kernelAddress(), dk = dst->kernelAddress();
++	if (m->rgbMode == 1) {
++		/* WROT writes alpha 0xFF: translucent sources stay on the GPU. A grid of ~4096 samples (every alpha of a
++		 * snapshot of the screen or of an app window is 0xFF; a layer with transparent parts has whole areas below). */
++		if (sk == 0) {
++			return kIOReturnUnsupported;
++		}
++		sweet_surface_before_cpu_access(src);
++		uint32_t ys = ih / 64 ? ih / 64 : 1, xs = iw / 64 ? iw / 64 : 1;
++		for (uint32_t y = 0; y < ih; y += ys) {
++			const uint8_t *row = (const uint8_t *)sk + src->offset + (size_t)(y0 + y) * src->bytesPerRow + (size_t)x0 * 4;
++			for (uint32_t x = 0; x < iw; x += xs) {
++				if (row[x * 4 + 3] != 0xff) {
++					m->rgbAlpha++;
++					return kIOReturnUnsupported;
++				}
++			}
++		}
++	}
++	if ((spa == 0 && inBytes > m->srcSize) || (dpa == 0 && outBytes > m->dstSize)) {
++		return kIOReturnUnsupported;
++	}
++	if (!setup(m)) {
++		return kIOReturnNotReady;
++	}
++	if ((spa == 0 && sk == 0) || (dpa == 0 && dk == 0)) {
++		return kIOReturnNoMemory;
++	}
++	uint64_t inPA, outPA;
++	uint32_t inStride, outStride;
++	if (spa != 0) {
++		inPA = spa + src->offset + (uint64_t)y0 * src->bytesPerRow + (uint64_t)x0 * 4;
++		inStride = src->bytesPerRow;
++	} else {
++		uint8_t *b = (uint8_t *)m->srcBuf->getBytesNoCopy();
++		for (uint32_t r = 0; r < ih; r++) {
++			memcpy(b + (size_t)r * iw * 4, (const uint8_t *)sk + src->offset + (size_t)(y0 + r) * src->bytesPerRow + (size_t)x0 * 4,
++			    (size_t)iw * 4);
++		}
++		cacheClean(b, inBytes);
++		inPA = m->srcPA;
++		inStride = iw * 4;
++	}
++	if (dpa != 0) {
++		outPA = dpa + dst->offset + (uint64_t)dy * dst->bytesPerRow + (uint64_t)dx * 4;
++		outStride = dst->bytesPerRow;
++	} else {
++		cacheClean(m->dstBuf->getBytesNoCopy(), outBytes);
++		outPA = m->dstPA;
++		outStride = dw * 4;
++	}
++	bool ok = true;
++	for (uint32_t k0 = 0; k0 < dw && ok; k0 += tile) {
++		uint32_t k1 = dw - k0 < tile ? dw : k0 + tile;
++		ok = rszStrip(m, inPA, inStride, iw, ih, outPA, outStride, dw, dh, k0, k1);
++		m->strips++;
++	}
++	if (!ok) {
++		m->timeouts++;
++		IOLog("VIVA MDP: %ux%u -> %ux%u BGRA scale timed out (WROT debug 0x%08x, RDMA status 0x%08x)\n", iw, ih, dw, dh,
++		    rd(m->mdp, WROT_DEBUG), rd(m->mdp, 0x3408));
++		return kIOReturnTimeout;
++	}
++	if (dpa == 0) {
++		cacheClean(m->dstBuf->getBytesNoCopy(), outBytes);
++		const uint8_t *b = (const uint8_t *)m->dstBuf->getBytesNoCopy();
++		for (uint32_t r = 0; r < dh; r++) {
++			memcpy((uint8_t *)dk + dst->offset + (size_t)(dy + r) * dst->bytesPerRow + (size_t)dx * 4, b + (size_t)r * dw * 4,
++			    (size_t)dw * 4);
++		}
++		sweet_surface_cpu_wrote(dst);
++	}
++	m->frames++;
++	m->rgbFrames++;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++viva_mdp_transfer(struct viva_mdp *m, SweetSurface *src, SweetSurface *dst, uint32_t sx, uint32_t sy, uint32_t sw,
++    uint32_t sh, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh, uint64_t flags)
++{
++	if (src->pixelFormat == PF_BGRA) {
++		if (m->rgbMode == 0) {
++			return kIOReturnUnsupported;
++		}
++		return rgbTransfer(m, src, dst, sx, sy, sw, sh, dx, dy, dw, dh, flags);
++	}
++	return nv12Transfer(m, src, dst, sx, sy, sw, sh, dx, dy, dw, dh, flags);
++}
++
+ #endif /* SWEET */
