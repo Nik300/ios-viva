@@ -14,7 +14,7 @@
   viva-link.py bootrec [hex|show]      edit the VIVABOOT block (next boot's boot-args in userdata, patch 0180)
                                        in $EDITOR (default vim; EDITOR=nano ...): fields and command line, or
                                        with `hex` the raw 4096 bytes; written when saved changed. Needs
-                                       /private/var/root/viva-tests/vbootrec (xnu-kernel artifact, tools/vivad)
+                                       /private/var/root/viva-tests/vbootrec (xnu-kernel artifact, tools/vivad) and kernel 0180
 
 The phone shows up as 1209:0002 "viva iOS link" (vendor class, bulk 0x81 IN,
 0x01 OUT). Every IN packet is a frame: 'V', type, u16 length, payload with

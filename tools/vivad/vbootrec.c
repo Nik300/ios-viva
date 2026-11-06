@@ -1,6 +1,8 @@
 /*
  * vbootrec: raw access to the VIVABOOT record (fork/shim/vivaboot.h, patch 0180) = the boot-args of the next boot in
- * the last MiB of userdata, through the root partition's raw device /dev/rufsroot0 (writable with ufsrw=1). Built
+ * the last MiB of userdata, through sysctl kern.viva_bootrec (the kernel reads/writes the 4 KiB block, checking that
+ * the HFS+ volume ends before it). Never the raw device: before 0180 a read of /dev/rufsroot0 panicked the kernel
+ * (physio + PAN). VBOOTREC_DEV=FILE: an image file instead, for tests on the Mac. Built
  * next to vivad (tools/vivad/build.sh), pushed to /private/var/root/viva-tests/vbootrec, driven by
  * `tools/viva-link.py bootrec` (edit in vim/nano on the Mac):
  *   vbootrec text              the record as editable key=value text (stdout)
@@ -26,7 +28,7 @@
 #define DKIOCGETBLOCKCOUNT      _IOR('d', 25, uint64_t)
 #define DKIOCSYNCHRONIZECACHE   _IO('d', 22)
 
-#define DEV             "/dev/rufsroot0"
+#define DEV             "VBOOTREC_DEV"
 #define BLOCK           4096
 #define TAIL_BLOCKS     256
 #define LINE            608
@@ -85,6 +87,13 @@ static int open_dev(int flags, off_t *off)
 
 static int read_block(uint8_t *blk, off_t *off)
 {
+	if (!getenv("VBOOTREC_DEV")) {
+		size_t len = BLOCK;
+		*off = 0;
+		if (sysctlbyname("kern.viva_bootrec", blk, &len, NULL, 0))
+			return -1;
+		return len == BLOCK ? 0 : -1;
+	}
 	int fd = open_dev(O_RDONLY, off);
 	if (fd < 0)
 		return -1;
@@ -114,10 +123,22 @@ static int volume_clear(int fd, off_t off)
 
 static int write_block(const uint8_t *blk)
 {
+	if (!getenv("VBOOTREC_DEV")) {
+		if (sysctlbyname("kern.viva_bootrec", NULL, NULL, (void *)blk, BLOCK))
+			return fail("kern.viva_bootrec (write)");
+		uint8_t back[BLOCK];
+		off_t o;
+		if (read_block(back, &o) || memcmp(back, blk, BLOCK)) {
+			printf("vbootrec: read back differs\n");
+			return 1;
+		}
+		printf("vbootrec: written (kern.viva_bootrec)\n");
+		return 0;
+	}
 	off_t off;
 	int fd = open_dev(O_RDWR, &off);
 	if (fd < 0)
-		return fail(DEV);
+		return fail(getenv("VBOOTREC_DEV") ? DEV : "kern.viva_bootrec");
 	if (volume_clear(fd, off)) {
 		close(fd);
 		return 1;
@@ -143,7 +164,7 @@ static int cmd_text(void)
 	uint8_t blk[BLOCK];
 	off_t off;
 	if (read_block(blk, &off))
-		return fail(DEV);
+		return fail("kern.viva_bootrec (kernel without patch 0180?)");
 	struct rec r;
 	memcpy(&r, blk, sizeof(r));
 	char payload[LINE + 1] = "", src[128] = "";
@@ -157,8 +178,8 @@ static int cmd_text(void)
 	char line[LINE + 1];
 	memcpy(line, r.cmdline, LINE);
 	line[LINE] = 0;
-	printf("# VIVABOOT record: " DEV " byte 0x%llx (block 0x%llx of userdata), %s\n", (unsigned long long)off,
-	    (unsigned long long)(off / BLOCK), magic ? "present" : "empty (no magic)");
+	printf("# VIVABOOT record (last MiB of userdata, kern.viva_bootrec): %s\n", magic ? "present" : "empty (no magic)");
+	(void)off;
 	printf("# kern.viva_nextbootargs_src: %s\n", src);
 	printf("# boot partition line (kern.viva_nextbootargs_orig), hash %016llx:\n#   %s\n",
 	    (unsigned long long)fnv(payload), payload);
@@ -183,7 +204,7 @@ static int cmd_raw(const char *path)
 	uint8_t blk[BLOCK];
 	off_t off;
 	if (read_block(blk, &off))
-		return fail(DEV);
+		return fail(getenv("VBOOTREC_DEV") ? DEV : "kern.viva_bootrec");
 	FILE *f = fopen(path, "wb");
 	if (!f || fwrite(blk, 1, BLOCK, f) != BLOCK)
 		return fail(path);
@@ -215,7 +236,7 @@ static int cmd_put_text(const char *path)
 	uint8_t blk[BLOCK], old[BLOCK];
 	off_t off;
 	if (read_block(old, &off))
-		return fail(DEV);
+		return fail(getenv("VBOOTREC_DEV") ? DEV : "kern.viva_bootrec");
 	struct rec r, prev;
 	memcpy(&prev, old, sizeof(prev));
 	memset(&r, 0, sizeof(r));
@@ -279,24 +300,7 @@ static int cmd_put_text(const char *path)
 	r.line_hash = fnv(r.cmdline);
 	memset(blk, 0, sizeof(blk));
 	memcpy(blk, &r, sizeof(r));
-	off_t o;
-	int fd = open_dev(O_RDWR, &o);
-	if (fd >= 0) {
-		close(fd);
-		return write_block(blk);
-	}
-	/* The raw device refused writing (mounted root): the kernel writes the record (kern.viva_nextbootargs).
-	 * It sets base_hash and seq itself; a disabled record = the boot partition's own line. */
-	printf("vbootrec: " DEV " not writable (%s): through kern.viva_nextbootargs\n", strerror(errno));
-	char payload[LINE + 1] = "";
-	size_t len = LINE;
-	if (sysctlbyname("kern.viva_nextbootargs_orig", payload, &len, NULL, 0))
-		return fail("kern.viva_nextbootargs_orig");
-	const char *want = (r.flags & 1) && r.cmdline[0] ? r.cmdline : payload;
-	if (sysctlbyname("kern.viva_nextbootargs", NULL, NULL, (void *)want, strlen(want) + 1))
-		return fail("kern.viva_nextbootargs");
-	printf("vbootrec: written through the kernel%s\n", want == payload ? " (record disabled)" : "");
-	return 0;
+	return write_block(blk);
 }
 
 int main(int argc, char **argv)

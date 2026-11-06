@@ -1,8 +1,16 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 427dae7..c2f7c4d 100644
+index 427dae7..ba4c18a 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -254,6 +254,16 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+@@ -31,6 +31,7 @@
+ #include <sys/uio.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
++#include <kern/kalloc.h>
+ #include <kern/clock.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -254,6 +255,16 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
  	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
  		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
  		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
@@ -19,7 +27,7 @@ index 427dae7..c2f7c4d 100644
  		return EIO;
  	}
  	return 0;
-@@ -457,8 +467,8 @@ sweet_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len)
+@@ -457,8 +468,8 @@ sweet_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len)
  		uint32_t no = 0;
  		PE_parse_boot_argn("vivanobootargswrite", &no, sizeof(no));
  		size_t n = strnlen(cmdline, len);
@@ -30,19 +38,19 @@ index 427dae7..c2f7c4d 100644
  		}
  		for (size_t i = 0; i < n; i++) {
  			if (cmdline[i] < 0x20 || cmdline[i] > 0x7e) {
-@@ -533,9 +543,135 @@ sweet_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len)
+@@ -533,7 +544,7 @@ sweet_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len)
  	}
  	printf("SWEET UFS: %s: next boot-args %s (block 0x%llx): \"%s\"\n", part, error ? "NOT written" : "written", lba,
  	    cmdline);
 -	if (error && error != EPERM) {
 +	if (error && error != EPERM && error != EROFS) {
-+		error = EIO;
-+	}
-+out:
-+	lck_mtx_unlock(&sweet_ufs_lock);
-+	return error;
-+}
-+
+ 		error = EIO;
+ 	}
+ out:
+@@ -541,6 +552,178 @@ out:
+ 	return error;
+ }
+ 
 +/*
 + * 0180: the VIVABOOT record (fork/shim/vivaboot.h, same layout), because LK write-protects boot_a/boot_b while iOS
 + * runs (WRITE(10) -> CHECK CONDITION, DATA PROTECT). The first 4 KiB block of the root partition's last MiB, outside
@@ -67,6 +75,7 @@ index 427dae7..c2f7c4d 100644
 +
 +uint64_t sweet_vivaboot_hash(const char *s);
 +int sweet_ufs_bootfile(bool write, uint64_t base, char *cmdline, size_t len);
++int sweet_ufs_bootrec_raw(bool write, uint8_t *blk);
 +
 +uint64_t
 +sweet_vivaboot_hash(const char *s)
@@ -84,6 +93,73 @@ index 427dae7..c2f7c4d 100644
 + * Write: cmdline (empty = disable the record) for base. EROFS without ufsrw=1, ENOSPC when the HFS+ volume
 + * reaches the record's block, EINVAL for a bad string, EIO.
 + */
++/* sweet_ufs_lock held. ENOSPC unless an HFS+/HFSX volume header says the volume ends before lba. */
++static int
++vivaboot_volume_clear(uint64_t lba)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	int error = ufs_read_blocks(su.first_block, 1);
++	if (error) {
++		return error;
++	}
++	const uint8_t *vh = b + 1024;           /* block size BE32 @40, total blocks BE32 @44 */
++	uint16_t sig = (uint16_t)(vh[0] << 8 | vh[1]);
++	uint64_t bsize = (uint64_t)vh[40] << 24 | vh[41] << 16 | vh[42] << 8 | vh[43];
++	uint64_t total = (uint64_t)vh[44] << 24 | vh[45] << 16 | vh[46] << 8 | vh[47];
++	if ((sig != 0x482b && sig != 0x4858) || bsize == 0 || bsize * total > (lba - su.first_block) * UFS_BLOCK) {
++		printf("SWEET UFS: VIVABOOT: volume 0x%x of %llu bytes reaches the record's block\n", sig, bsize * total);
++		return ENOSPC;
++	}
++	return 0;
++}
++
++/* sweet_ufs_lock held. blk (4 KiB) to lba, cache flushed, read back and compared. */
++static int
++vivaboot_write_locked(uint64_t lba, const uint8_t *blk)
++{
++	memcpy((void *)(su.dma + DMA_BOUNCE), blk, UFS_BLOCK);
++	int error = ufs_write_blocks(lba, 1);
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	if (!error) {
++		error = ufs_read_blocks(lba, 1);
++	}
++	if (!error && memcmp((const void *)(su.dma + DMA_BOUNCE), blk, UFS_BLOCK) != 0) {
++		error = EIO;
++	}
++	return error;
++}
++
++/* The record's whole 4 KiB block, unchecked (kern.viva_bootrec, tools/vivad/vbootrec). Writes: ufsrw=1, volume check. */
++int
++sweet_ufs_bootrec_raw(bool write, uint8_t *blk)
++{
++	if (!su.ready || su.nblocks <= VIVABOOT_TAIL_BLOCKS) {
++		return ENXIO;
++	}
++	if (write && !su.writable) {
++		return EROFS;
++	}
++	uint64_t lba = su.first_block + su.nblocks - VIVABOOT_TAIL_BLOCKS;
++	lck_mtx_lock(&sweet_ufs_lock);
++	int error = 0;
++	if (write) {
++		error = vivaboot_volume_clear(lba);
++		if (!error) {
++			error = vivaboot_write_locked(lba, blk);
++		}
++		printf("SWEET UFS: VIVABOOT raw block %s (block 0x%llx)\n", error ? "NOT written" : "written", lba);
++	} else {
++		error = ufs_read_blocks(lba, 1);
++		if (!error) {
++			memcpy(blk, (const void *)(su.dma + DMA_BOUNCE), UFS_BLOCK);
++		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
 +int
 +sweet_ufs_bootfile(bool write, uint64_t base, char *cmdline, size_t len)
 +{
@@ -110,20 +186,8 @@ index 427dae7..c2f7c4d 100644
 +	}
 +	uint64_t lba = su.first_block + su.nblocks - VIVABOOT_TAIL_BLOCKS;
 +	lck_mtx_lock(&sweet_ufs_lock);
-+	if (write) {
-+		/* HFS+/HFSX volume header at +1024: block size (BE32 @40), total blocks (BE32 @44) */
-+		if ((error = ufs_read_blocks(su.first_block, 1)) != 0) {
-+			goto out;
-+		}
-+		const uint8_t *vh = b + 1024;
-+		uint16_t sig = (uint16_t)(vh[0] << 8 | vh[1]);
-+		uint64_t bsize = (uint64_t)vh[40] << 24 | vh[41] << 16 | vh[42] << 8 | vh[43];
-+		uint64_t total = (uint64_t)vh[44] << 24 | vh[45] << 16 | vh[46] << 8 | vh[47];
-+		if ((sig != 0x482b && sig != 0x4858) || bsize == 0 || bsize * total > (lba - su.first_block) * UFS_BLOCK) {
-+			printf("SWEET UFS: VIVABOOT: volume 0x%x of %llu bytes reaches the record's block\n", sig, bsize * total);
-+			error = ENOSPC;
-+			goto out;
-+		}
++	if (write && (error = vivaboot_volume_clear(lba)) != 0) {
++		goto out;
 +	}
 +	if ((error = ufs_read_blocks(lba, 1)) != 0) {
 +		goto out;
@@ -151,36 +215,126 @@ index 427dae7..c2f7c4d 100644
 +	rec.line_hash = sweet_vivaboot_hash(rec.cmdline);
 +	bzero(blk, sizeof(blk));
 +	memcpy(blk, &rec, sizeof(rec));
-+	memcpy((void *)(su.dma + DMA_BOUNCE), blk, UFS_BLOCK);
-+	error = ufs_write_blocks(lba, 1);
-+	if (!error) {
-+		error = ufs_sync_cache();
-+	}
-+	if (!error) {
-+		error = ufs_read_blocks(lba, 1);
-+	}
-+	if (!error && memcmp(b, blk, UFS_BLOCK) != 0) {
- 		error = EIO;
- 	}
++	error = vivaboot_write_locked(lba, blk);
 +	printf("SWEET UFS: VIVABOOT %s (block 0x%llx, seq %llu): \"%s\"\n", error ? "NOT written" : n ? "written" : "disabled",
 +	    lba, seq, n ? cmdline : "");
- out:
- 	lck_mtx_unlock(&sweet_ufs_lock);
- 	return error;
++out:
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -657,6 +840,70 @@ done:
+ 	buf_biodone(bp);
+ }
+ 
++/*
++ * The raw device (rufsroot0). Not physio(): with a user buffer buf_map() hands the strategy the *user* address and the
++ * kernel's memcpy to it faults under PAN (panic "Kernel data abort", vbootrec, 2026-11-06). Here the data goes
++ * bounce -> kernel buffer under the lock, kernel buffer <-> user with uiomove() without it (a fault on the user
++ * buffer may need this same disk). Offset and length: multiples of the logical sector size.
++ */
++#define RAW_CHUNK       (64u << 10)
++
++static int
++sweet_ufs_raw_rw(struct uio *uio, bool rd)
++{
++	if (!su.ready) {
++		return ENXIO;
++	}
++	if (!rd && !su.writable) {
++		return EROFS;
++	}
++	uint64_t part = su.nblocks * UFS_BLOCK;
++	if (uio_offset(uio) < 0 || (uint64_t)uio_offset(uio) > part ||
++	    uio_offset(uio) % su.secsize || uio_resid(uio) % su.secsize) {
++		return EINVAL;
++	}
++	char *k = kalloc_data(RAW_CHUNK, Z_WAITOK);
++	if (!k) {
++		return ENOMEM;
++	}
++	int error = 0;
++	while (!error && uio_resid(uio) > 0 && (uint64_t)uio_offset(uio) < part) {
++		uint64_t pos = (uint64_t)uio_offset(uio);
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want = (uint32_t)MIN((uint64_t)uio_resid(uio), (uint64_t)(RAW_CHUNK - skip));
++		want = (uint32_t)MIN((uint64_t)want, part - pos);
++		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint64_t lba = su.first_block + pos / UFS_BLOCK;
++		char *bounce = (char *)(su.dma + DMA_BOUNCE);
++		if (rd) {
++			lck_mtx_lock(&sweet_ufs_lock);
++			error = ufs_read_blocks(lba, blocks);
++			if (!error) {
++				memcpy(k, bounce + skip, want);
++			}
++			lck_mtx_unlock(&sweet_ufs_lock);
++			if (!error) {
++				error = uiomove(k, (int)want, uio);
++			}
++		} else {
++			error = uiomove(k, (int)want, uio);
++			if (!error) {
++				lck_mtx_lock(&sweet_ufs_lock);
++				if (skip || (want % UFS_BLOCK)) {
++					error = ufs_read_blocks(lba, blocks);   /* partial device blocks: read, merge, write */
++				}
++				if (!error) {
++					memcpy(bounce + skip, k, want);
++					error = ufs_write_blocks(lba, blocks);
++				}
++				lck_mtx_unlock(&sweet_ufs_lock);
++			}
++		}
++	}
++	kfree_data(k, RAW_CHUNK);
++	return error;
++}
++
+ static int
+ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+     __unused struct proc *p, int is_char)
+@@ -730,18 +977,15 @@ sweet_ufs_psize(__unused dev_t dev)
+ }
+ 
+ static int
+-sweet_ufs_read(dev_t dev, struct uio *uio, __unused int ioflag)
++sweet_ufs_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+-	return physio(sweet_ufs_strategy, NULL, dev, B_READ, minphys, uio, (int)su.secsize);
++	return sweet_ufs_raw_rw(uio, true);
+ }
+ 
+ static int
+-sweet_ufs_write(dev_t dev, struct uio *uio, __unused int ioflag)
++sweet_ufs_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+-	if (!su.writable) {
+-		return EROFS;
+-	}
+-	return physio(sweet_ufs_strategy, NULL, dev, B_WRITE, minphys, uio, (int)su.secsize);
++	return sweet_ufs_raw_rw(uio, false);
+ }
+ 
+ static const struct bdevsw sweet_ufs_bdevsw = {
 diff --git a/bsd/dev/viva_sysctl.c b/bsd/dev/viva_sysctl.c
-index b102c54..b4a2144 100644
+index b102c54..d52cd31 100644
 --- a/bsd/dev/viva_sysctl.c
 +++ b/bsd/dev/viva_sysctl.c
-@@ -28,6 +28,8 @@ extern void viva_gpu_link(const char *args, char *out, size_t len);         /* i
+@@ -28,6 +28,9 @@ extern void viva_gpu_link(const char *args, char *out, size_t len);         /* i
  extern void viva_cpufreq_link(const char *args, char *out, size_t len);     /* osfmk/arm64/viva_cpufreq.c */
  extern void viva_disp_link(const char *args, char *out, size_t len);        /* iokit/Kernel/arm/SweetFramebuffer.cpp */
  extern int sweet_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len); /* bsd/dev/sweet_ufs.c */
 +extern int sweet_ufs_bootfile(bool write, uint64_t base, char *cmdline, size_t len);     /* bsd/dev/sweet_ufs.c, 0180 */
 +extern uint64_t sweet_vivaboot_hash(const char *s);
++extern int sweet_ufs_bootrec_raw(bool write, uint8_t *blk);                          /* bsd/dev/sweet_ufs.c, 0180 */
  
  #define VL_CMD_MAX      256
  #define VL_REPLY_MAX    8192
-@@ -158,17 +160,70 @@ viva_bootargs_remember(void)
+@@ -158,17 +161,70 @@ viva_bootargs_remember(void)
  	}
  }
  
@@ -253,7 +407,7 @@ index b102c54..b4a2144 100644
  	lck_mtx_unlock(&viva_sysctl_mtx);
  	if (error) {
  		return error;
-@@ -194,11 +249,31 @@ sysctl_viva_nextbootargs SYSCTL_HANDLER_ARGS
+@@ -194,11 +250,67 @@ sysctl_viva_nextbootargs SYSCTL_HANDLER_ARGS
  		want[--n] = 0;
  	}
  	lck_mtx_lock(&viva_sysctl_mtx);
@@ -262,10 +416,10 @@ index b102c54..b4a2144 100644
 +	if (!error) {
 +		error = viva_next_line_set(want, sizeof(want), payload);
 +	}
- 	lck_mtx_unlock(&viva_sysctl_mtx);
- 	return error;
- }
- 
++	lck_mtx_unlock(&viva_sysctl_mtx);
++	return error;
++}
++
 +static int
 +sysctl_viva_nextbootargs_src SYSCTL_HANDLER_ARGS
 +{
@@ -276,12 +430,48 @@ index b102c54..b4a2144 100644
 +	snprintf(out, sizeof(out), "%s %s", error ? "error" : viva_bootargs_src,
 +	    viva_bootpart_wp == 1 ? "boot-partition-write-protected" : viva_bootpart_wp == 0 ? "boot-partition-writable" :
 +	    "boot-partition-untested");
-+	lck_mtx_unlock(&viva_sysctl_mtx);
+ 	lck_mtx_unlock(&viva_sysctl_mtx);
 +	return SYSCTL_OUT(req, out, strlen(out) + 1);
 +}
 +
 +SYSCTL_PROC(_kern, OID_AUTO, viva_nextbootargs_src, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
 +    0, 0, sysctl_viva_nextbootargs_src, "A", "where the next boot's command line comes from (0180)");
++
++/* kern.viva_bootrec: the VIVABOOT record's raw 4 KiB block (tools/vivad/vbootrec). Read: everybody; write: root, exactly
++ * 4096 bytes, stored unchecked apart from the HFS+ volume check (the shim validates what it reads). */
++#define BOOTREC_SIZE    4096
++
++static int
++sysctl_viva_bootrec SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint8_t *blk = kalloc_data(BOOTREC_SIZE, Z_WAITOK | Z_ZERO);
++	if (!blk) {
++		return ENOMEM;
++	}
++	lck_mtx_lock(&viva_sysctl_mtx);
++	int error = sweet_ufs_bootrec_raw(false, blk);
++	lck_mtx_unlock(&viva_sysctl_mtx);
++	if (!error) {
++		error = SYSCTL_OUT(req, blk, BOOTREC_SIZE);
++	}
++	if (!error && req->newptr != USER_ADDR_NULL) {
++		if (!kauth_cred_issuser(kauth_cred_get())) {
++			error = EPERM;
++		} else if (req->newlen != BOOTREC_SIZE) {
++			error = EINVAL;
++		} else if ((error = SYSCTL_IN(req, blk, BOOTREC_SIZE)) == 0) {
++			lck_mtx_lock(&viva_sysctl_mtx);
++			error = sweet_ufs_bootrec_raw(true, blk);
++			lck_mtx_unlock(&viva_sysctl_mtx);
++		}
++	}
++	kfree_data(blk, BOOTREC_SIZE);
+ 	return error;
+ }
+ 
++SYSCTL_PROC(_kern, OID_AUTO, viva_bootrec, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, sysctl_viva_bootrec, "-", "VIVABOOT record, raw 4 KiB block (0180)");
 +
  SYSCTL_PROC(_kern, OID_AUTO, viva_nextbootargs, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
      0, 0, sysctl_viva_nextbootargs, "A", "boot-args of the next boot (KA2)");

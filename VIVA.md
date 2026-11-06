@@ -626,8 +626,13 @@ write-protects the boot partitions in a normal boot (fastboot can still flash th
   key=value fields + `cmdline=`; saved changes are written (line_hash recomputed, seq + 1, `base_hash=payload` = hash of
   the boot partition's line). `bootrec hex` = the raw 4096 bytes as a hex dump, written exactly as saved; `bootrec show`
   prints it. Phone side: `vbootrec` (tools/vivad/vbootrec.c, built into the xnu-kernel artifact next to vivad; push it
-  to /private/var/root/viva-tests/vbootrec 755): raw pread/pwrite of /dev/rufsroot0 (writable with ufsrw=1), HFS+
-  overlap check, read back; if the raw device refuses writing it goes through kern.viva_nextbootargs.
+  to /private/var/root/viva-tests/vbootrec 755) through sysctl `kern.viva_bootrec` (the raw 4 KiB block: read by
+  everybody, written by root with the HFS+ overlap check, read back). On a kernel without 0180 it only reports
+  ENOENT.
+- Panic found on the way (2026-11-06, kernel 0170): the first read of the raw device /dev/rufsroot0 from userspace
+  (vbootrec's first version) -> "Kernel data abort", far = the user buffer: physio() + buf_map() gave sweet_ufs's
+  strategy the user address and its memcpy faulted under PAN. 0180: the raw device goes through a kernel buffer and
+  uiomove() (the UFS lock is not held across the copy to/from the user), never physio.
 - An empty line through kern.viva_nextbootargs disables the record and is never written into the boot partition.
 
 ### 0146: Viva Manager sysctls (KA1 kern.viva_link, KA2 kern.viva_nextbootargs)
