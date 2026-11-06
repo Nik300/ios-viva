@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Host side of the viva USB link (kernel boot-arg vivausb=3, patch 0093).
+"""Host side of the viva USB link (kernel boot-arg vivausb=3, patches 0093 and 0182).
 
-  viva-link.py [-o LOGFILE]            live kernel console + interactive commands
+  viva-link.py [-o LOGFILE]            full-screen interface: command prompt + command output + phone log
+                                       (needs textual; without it, the plain line mode of old)
   viva-link.py [-o LOGFILE] log        live console only
   viva-link.py cmd COMMAND...          send one command, print the reply, exit
   viva-link.py dump PA SIZE FILE       save physical memory (via peek) to FILE
@@ -16,24 +17,47 @@
                                        with `hex` the raw 4096 bytes; written when saved changed. Needs
                                        /private/var/root/viva-tests/vbootrec (xnu-kernel artifact, tools/vivad) and kernel 0180
 
-The phone shows up as 1209:0002 "viva iOS link" (vendor class, bulk 0x81 IN,
-0x01 OUT). Every IN packet is a frame: 'V', type, u16 length, payload with
-type 'L' (console log), 'R' (command reply), 'E' (end of reply), 'F' (file
-data of a pull) or 'O' (output of programs run by vivad).
-Phone commands: ping, stat, help, peek PA [WORDS], poke PA VALUE,
-rewind [BYTES], panic [TEXT], reboot.
+The phone is either 1209:0002 "viva iOS link" (persona `link`, the link is interface 0) or, once vivausbd
+switched it (patch 0182, docs/VIVA-USB-PERSONA.md), 05ac:12a8 (persona `std`: PTP, usbmux and the link as the
+interface of class ff/56/01). Only the link interface is claimed; its bulk endpoints come from the descriptors.
+The interactive and `log` modes wait for the phone and reattach by themselves when it re-enumerates (persona
+switch, reboot); the one-shot modes exit when the link goes away. While attached, every mode sends the
+"Viva Link active" heartbeat (vendor request 0x41/0x56 wValue 1, every second) and a bye (wValue 0) on exit.
 
-Needs pyusb and libusb (macOS: brew install libusb; python3 -m pip install pyusb).
+Every IN packet is a frame: 'V', type, u16 length, payload with type 'L' (console log), 'R' (command
+reply), 'E' (end of reply), 'F' (file data of a pull) or 'O' (output of programs run by vivad).
+Phone commands: see PHONE_COMMANDS (`help` on the phone has the arguments).
+
+Interactive keys: Enter sends, Up/Down history (~/.viva-link-history), Tab completes, PgUp/PgDn scroll the
+selected pane (Shift-Tab switches it), End resumes following, Ctrl-F filters the log, F2 layout, F3 maximise,
+Ctrl-C/Ctrl-D quit. Local commands start with ':' (or '/'): :help lists them.
+
+VIVA_LINK_FAKE=1 replaces the phone with a simulator (tools/viva_link_fake.py) for testing without USB.
+
+Needs pyusb and libusb (macOS: brew install libusb; python3 -m pip install pyusb), textual for the interface.
 """
-import argparse, os, re, sys, threading, time
+import argparse, collections, errno, os, re, sys, threading, time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+FAKE = bool(os.environ.get('VIVA_LINK_FAKE'))
 try:
     import usb.core, usb.util, usb.backend.libusb1
+    USBError, USBTimeoutError = usb.core.USBError, usb.core.USBTimeoutError
 except ImportError:
-    sys.exit('pyusb missing: python3 -m pip install pyusb (and brew install libusb)')
+    if not FAKE:
+        sys.exit('pyusb missing: python3 -m pip install pyusb (and brew install libusb)')
+    from viva_link_fake import USBError, USBTimeoutError
 
-VID, PID = 0x1209, 0x0002
-EP_IN, EP_OUT = 0x81, 0x01
+VID, PID = 0x1209, 0x0002           # persona `link`: the link is interface 0
+STD_VID, STD_PID = 0x05ac, 0x12a8   # persona `std`: the link is the interface of class ff/56/01
+LINK_CLASS = (0xff, 0x56, 0x01)
+EP_IN, EP_OUT = 0x81, 0x01          # only if the descriptors say nothing
+PHONE_COMMANDS = ('ping', 'stat', 'help', 'peek', 'poke', 'pmic', 'i2c', 'i2cw', 'i2c8', 'i2c8w', 'bat', 'wifi',
+                  'cpu', 'gpu', 'disp', 'push', 'pull', 'run', 'vivad', 'rewind', 'console', 'panic', 'reboot')
+LINKS = []                          # every Link, for the bye at exit
+
+# dev: pyusb device (or the simulator's); ifn: link interface number; persona: 'link' or 'std'
+Port = collections.namedtuple('Port', 'dev ifn ep_in ep_out persona')
 
 
 def backend():
@@ -43,35 +67,51 @@ def backend():
     return None             # pyusb's own search (Linux)
 
 
-def wait_device():
-    shown = False
-    while True:
-        dev = usb.core.find(idVendor=VID, idProduct=PID, backend=backend())
-        if dev is not None:
-            return dev
-        if not shown:
-            print('waiting for the phone (%04x:%04x)...' % (VID, PID), file=sys.stderr)
-            shown = True
-        time.sleep(0.5)
+def bulk_endpoints(intf):
+    eps = {usb.util.endpoint_direction(e.bEndpointAddress): e.bEndpointAddress
+           for e in intf if usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK}
+    return eps.get(usb.util.ENDPOINT_IN, EP_IN), eps.get(usb.util.ENDPOINT_OUT, EP_OUT)
 
 
-def open_device():
-    dev = wait_device()
+def find_link():
+    """The phone's link interface in either persona (Port), or None. Descriptors only: nothing is opened."""
+    if FAKE:
+        import viva_link_fake
+        return viva_link_fake.find_link(Port)
+    be = backend()
     try:
-        if dev.is_kernel_driver_active(0):
-            dev.detach_kernel_driver(0)
-    except (NotImplementedError, usb.core.USBError):
+        dev = usb.core.find(idVendor=VID, idProduct=PID, backend=be)
+        if dev is not None:
+            return Port(dev, 0, *bulk_endpoints(dev[0][(0, 0)]), 'link')
+        # 05ac:12a8 is any iPhone: only ours has the link interface
+        for dev in usb.core.find(find_all=True, idVendor=STD_VID, idProduct=STD_PID, backend=be):
+            for cfg in dev:
+                for intf in cfg:
+                    if (intf.bInterfaceClass, intf.bInterfaceSubClass, intf.bInterfaceProtocol) == LINK_CLASS:
+                        return Port(dev, intf.bInterfaceNumber, *bulk_endpoints(intf), 'std')
+    except (USBError, IndexError, KeyError):     # device going away while we look
         pass
-    usb.util.claim_interface(dev, 0)
-    print('connected: %s, %s speed' % (usb.util.get_string(dev, dev.iProduct),
-          {3: 'high', 2: 'full'}.get(dev.speed, 'unknown')), file=sys.stderr)
-    return dev
+    return None
+
+
+def stalled(e):
+    return getattr(e, 'errno', None) == errno.EPIPE or getattr(e, 'backend_error_code', None) == -9
 
 
 class Link:
-    def __init__(self, logfile=None, show_log=True):
-        self.dev = open_device()
+    def __init__(self, logfile=None, show_log=True, reconnect=False):
+        self.port = None                    # Port while attached
+        self.state = 'waiting'              # waiting (never attached) / connected / lost (waiting again)
+        self.reconnect = reconnect          # reattach when the phone goes away (else exit)
+        self.info = ''                      # product, speed
+        self.heartbeat = None               # None, 'ok' or 'unsupported' (old kernels stall the request)
+        self.last_beat = 0.0
+        self.closing = False
+        self.attaches = 0
+        self.log_bytes = 0
+        self.on_log = self.on_output = None # set by the interface: called by the pump thread with the bytes
         self.log = open(logfile, 'ab') if logfile else None
+        self.logfile = logfile
         self.show_log = show_log
         self.reply_done = threading.Event()
         self.reply = bytearray()
@@ -80,58 +120,169 @@ class Link:
         self.output_event = threading.Event()
         self.echo_output = True             # print 'O' frames (run_capture turns it off)
         self.lock = threading.Lock()
+        LINKS.append(self)
+        threading.Thread(target=self.beat, daemon=True).start()
+
+    def note(self, msg, end='\n', err=True):
+        """Progress and state messages, results with err=False (the interface replaces it)."""
+        print(msg, end=end, file=sys.stderr if err else sys.stdout, flush=True)
+
+    def connect(self):
+        """Wait for the phone and claim its link interface."""
+        shown = False
+        while True:
+            port = find_link()
+            if port is not None:
+                try:
+                    self.claim(port)
+                    break
+                except USBError as e:       # just enumerated, or someone else has it: try again
+                    if not shown:
+                        self.note('cannot claim the link interface (%s), retrying' % e)
+                        shown = True
+            elif not shown:
+                self.note('waiting for the phone (%04x:%04x or %04x:%04x)...' % (VID, PID, STD_VID, STD_PID))
+                shown = True
+            time.sleep(0.25)
+        dev = port.dev
+        product = 'viva iOS link'
+        if not FAKE:
+            try:
+                product = usb.util.get_string(dev, dev.iProduct) or product
+            except (USBError, ValueError):
+                pass
+        self.info = '%s, %s speed' % (product, {3: 'high', 2: 'full', 4: 'super'}.get(dev.speed, 'unknown'))
+        self.hello(port)                    # active right away, not at the next beat
+        self.port = port
+        self.state = 'connected'
+        self.attaches += 1
+        self.note('connected: %s (persona %s, interface %d)' % (self.info, port.persona, port.ifn))
+
+    def claim(self, port):
+        if FAKE:
+            return
+        try:
+            if port.dev.is_kernel_driver_active(port.ifn):
+                port.dev.detach_kernel_driver(port.ifn)
+        except (NotImplementedError, USBError):
+            pass
+        usb.util.claim_interface(port.dev, port.ifn)    # never PTP/usbmux: macOS daemons own those
+
+    def lost(self, e):
+        port, self.port = self.port, None
+        self.state = 'lost'
+        self.heartbeat = None
+        self.reply_done.set()               # wake a command waiting for its reply
+        self.output_event.set()
+        if port and not FAKE:
+            try:
+                usb.util.dispose_resources(port.dev)
+            except USBError:
+                pass
+        self.note('link lost: %s' % e)
+
+    def beat(self):
+        """'Viva Link active' heartbeat, every second while attached."""
+        while True:
+            self.hello(self.port)
+            time.sleep(1)
+
+    def hello(self, port):
+        if port and not self.closing:
+            try:
+                port.dev.ctrl_transfer(0x41, 0x56, 1, port.ifn, None, timeout=500)
+                self.heartbeat, self.last_beat = 'ok', time.time()
+            except USBError as e:
+                if stalled(e):
+                    self.heartbeat = 'unsupported'
+
+    def bye(self):
+        self.closing = True                 # no heartbeat after the bye
+        port = self.port
+        if port:
+            try:
+                port.dev.ctrl_transfer(0x41, 0x56, 0, port.ifn, None, timeout=300)
+            except USBError:
+                pass
 
     def frames(self):
         """Yield (type, payload) until the device goes away."""
+        port = self.port
         while True:
             try:
-                pkt = bytes(self.dev.read(EP_IN, 512, timeout=0))
-            except usb.core.USBTimeoutError:
+                pkt = bytes(port.dev.read(port.ep_in, 512, timeout=0))
+            except USBTimeoutError:
                 continue
             if len(pkt) < 4 or pkt[0] != ord('V'):
                 continue
             n = pkt[2] | pkt[3] << 8
             yield chr(pkt[1]), pkt[4:4 + n]
 
+    def write(self, data, timeout=2000):
+        port = self.port
+        if port is None:
+            raise USBError('phone not connected')
+        port.dev.write(port.ep_out, data, timeout=timeout)
+
     def pump(self):
-        try:
-            for kind, data in self.frames():
-                if kind == 'L':
-                    if self.log:
-                        self.log.write(data)
-                        self.log.flush()
-                    if self.show_log:
-                        sys.stdout.buffer.write(data)
-                        sys.stdout.flush()
-                elif kind == 'R':
-                    with self.lock:
-                        self.reply += data
-                elif kind == 'F':
-                    with self.lock:
-                        self.file += data
-                elif kind == 'O':
-                    if self.log:
-                        self.log.write(data)
-                        self.log.flush()
-                    if self.echo_output:
-                        sys.stdout.buffer.write(data)
-                        sys.stdout.flush()
-                    with self.lock:
-                        self.output += data
-                    self.output_event.set()
-                elif kind == 'E':
-                    self.reply_done.set()
-        except usb.core.USBError as e:
-            print('\nlink lost: %s' % e, file=sys.stderr)
-            os._exit(1)
+        while True:
+            if self.port is None:
+                self.connect()
+            try:
+                for kind, data in self.frames():
+                    self.frame(kind, data)
+            except USBError as e:
+                if not self.reconnect:
+                    print('\nlink lost: %s' % e, file=sys.stderr)
+                    os._exit(1)
+                self.lost(e)
+                time.sleep(0.1)
+
+    def frame(self, kind, data):
+        if kind == 'L':
+            self.log_bytes += len(data)
+            if self.log:
+                self.log.write(data)
+                self.log.flush()
+            if self.on_log:
+                self.on_log(data)
+            elif self.show_log:
+                sys.stdout.buffer.write(data)
+                sys.stdout.flush()
+        elif kind == 'R':
+            with self.lock:
+                self.reply += data
+        elif kind == 'F':
+            with self.lock:
+                self.file += data
+        elif kind == 'O':
+            if self.log:
+                self.log.write(data)
+                self.log.flush()
+            if self.echo_output:
+                if self.on_output:
+                    self.on_output(data)
+                else:
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.flush()
+            with self.lock:
+                self.output += data
+            self.output_event.set()
+        elif kind == 'E':
+            self.reply_done.set()
 
     def command(self, line, timeout=10):
         with self.lock:
             self.reply = bytearray()
         self.reply_done.clear()
-        self.dev.write(EP_OUT, line.encode()[:511], timeout=2000)
+        try:
+            self.write(line.encode()[:511])
+        except USBError as e:
+            return '(not sent: %s)\n' % e
         if not self.reply_done.wait(timeout):
             return '(no reply in %d s)\n' % timeout
+        if self.port is None:
+            return '(link lost)\n'
         with self.lock:
             return self.reply.decode(errors='replace')
 
@@ -154,14 +305,14 @@ def push(link, local, path, mode):
     link.reply_done.clear()
     t0 = time.time()
     for at in range(0, len(data), 1 << 16):
-        link.dev.write(EP_OUT, data[at:at + (1 << 16)], timeout=10000)
-        print('\r%d / %d KiB' % (min(at + (1 << 16), len(data)) >> 10, len(data) >> 10), end='', file=sys.stderr)
-    print(' (%.1f s)' % (time.time() - t0), file=sys.stderr)
+        link.write(data[at:at + (1 << 16)], timeout=10000)
+        link.note('\r%d / %d KiB' % (min(at + (1 << 16), len(data)) >> 10, len(data) >> 10), end='')
+    link.note(' (%.1f s)' % (time.time() - t0))
     if not link.reply_done.wait(60):
         sys.exit('no final reply from the phone')
     with link.lock:
         text = link.reply.decode(errors='replace')
-    print(text.strip())
+    link.note(text.strip(), err=False)
     if 'ok' not in text or ('0x%08x' % h) not in text:
         sys.exit(1)
 
@@ -176,10 +327,12 @@ def pull(link, path, local):
     if not m or int(m.group(1)) != len(data) or int(m.group(2), 16) != fnv1a(data):
         sys.exit('pull failed: %s (got %d bytes, fnv1a 0x%08x)' % (reply.strip(), len(data), fnv1a(data)))
     open(local, 'wb').write(data)
-    print('%s: %d bytes from %s' % (local, len(data), path), file=sys.stderr)
+    link.note('%s: %d bytes from %s' % (local, len(data), path))
 
 
 def run(link, args):
+    with link.lock:
+        link.output = bytearray()
     reply = link.command('run ' + ' '.join('"%s"' % a if ' ' in a else a for a in args))
     m = re.search(r'vivad: (\d+) queued', reply)
     if not m:
@@ -188,6 +341,8 @@ def run(link, args):
     while True:
         link.output_event.wait()
         link.output_event.clear()
+        if link.port is None:
+            sys.exit('link lost')
         with link.lock:
             e = end.search(link.output)
         if e:
@@ -208,6 +363,8 @@ def run_capture(link, args):
     while True:
         link.output_event.wait(30)
         link.output_event.clear()
+        if link.port is None:
+            sys.exit('link lost')
         with link.lock:
             out = bytes(link.output)
         e = end.search(out)
@@ -332,7 +489,17 @@ def main():
     ap.add_argument('command', nargs='*')
     a = ap.parse_args()
 
-    link = Link(a.output, show_log=(a.mode not in ('cmd', 'dump', 'dumpdtb', 'push', 'pull', 'run', 'bootrec')))
+    oneshot = a.mode not in ('interactive', 'log')
+    link = Link(a.output, show_log=not oneshot, reconnect=not oneshot)
+    if a.mode == 'interactive':
+        try:
+            import viva_link_tui
+        except ImportError as e:
+            print('(plain mode, %s: python3 -m pip install textual for the full-screen interface)' % e, file=sys.stderr)
+        else:
+            viva_link_tui.run(link, sys.modules[__name__])     # attaches by itself, shows the wait
+            return
+    link.connect()
     threading.Thread(target=link.pump, daemon=True).start()
     if a.mode == 'push':
         if len(a.command) < 2:
@@ -371,6 +538,11 @@ def main():
     if a.mode == 'log':
         threading.Event().wait()
     print('type a phone command and Enter (help for the list, Ctrl-D quits)', file=sys.stderr)
+    plain_loop(link)
+
+
+def plain_loop(link):
+    """The line mode of old: log and replies interleaved on stdout."""
     for line in sys.stdin:
         line = line.strip()
         if line:
@@ -396,6 +568,8 @@ if __name__ == '__main__':
             code = 1
         else:
             code = e.code or 0
+    for l in LINKS:
+        l.bye()
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(code)

@@ -119,7 +119,7 @@ jobs:
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
-      - name: vivad (phone helper for the USB link, iOS arm64)
+      - name: vivad + vivausbd (phone helpers for the USB link / std persona, iOS arm64)
         if: always()
         run: bash tools/vivad/build.sh out/vivad || echo "vivad build failed"
 

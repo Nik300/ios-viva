@@ -716,3 +716,25 @@ Guess for TX: the firmware's TX block-ack session (UPDATE_STA_RECORD ucTxAmpdu =
 RX: when the entry the driver waits on reads empty but the DMA is past it and the next one is done, give it back and
 move on (counted). `wifi ring`: both RX rings (hardware/driver indexes, every descriptor's d1), TX 0/15, GLO_CFG,
 INT_STA. NOT tested.
+
+### 0182: standard USB persona (iPhone-like PTP + usbmux) and Viva Link heartbeat
+User request 2026-11-06: the link must count only when the host tool is really there; a computer without the tool
+must see a normal phone; charging at full input unless the tool is active; the island announces the link.
+Contract (kernel / vivausbd / viva-link.py / SpringBoard tweak): `docs/VIVA-USB-PERSONA.md`.
+- Personas: `link` (1209:0002, as before) from boot; `std` (05ac:12a8 "iPhone", serial = UDID) once vivausbd opens
+  `/dev/vivaptp` + `/dev/vivamux` and issues VIVAUSB_ATTACH: soft disconnect 300 ms, new enumeration with PTP (if0,
+  ep2 bulk + ep3 interrupt), usbmux (if1, ep4), link (if2, ep1). FIFO RAM: ep0..ep4 use 3200 bytes (size printed at
+  start: `VIVA LINK: FIFO RAM N bytes`). `vivausbstd=0` = never switch.
+- ep0 now has OUT data stages (PTP CANCEL_REQUEST), PTP class requests (GET_DEVICE_STATUS OK/busy, DEVICE_RESET),
+  Microsoft OS descriptor (string 0xEE, vendor 0x50 compat ID "MTP" for interface 0), Apple vendor OUT requests acked.
+- Functions: per direction a 128 KiB ring + transfer-end marks; OUT packets that do not fit stay in the FIFO (NAK).
+  /dev/vivaptp writes: the kernel ends the IN transfer only at the end of the PTP container (length from its header),
+  so a data phase may span several ≤ 64 KiB writes. Bus reset / SET_CONFIGURATION / disconnect: read() returns
+  ECONNRESET once; PTP cancel: ECANCELED.
+- Viva Link active = vendor request 0x41/0x56 wValue 1 (tool heartbeat, 1 s; 4 s timeout; wValue 0 = bye).
+  viva_usb_host_configured() (VivaBattery input limit) is now "tool active": a computer without the tool gets
+  `vivachargein` (2000 mA) like a wall charger; the battery polls at once when the state changes.
+  `sysctl kern.viva_linkstate`: 0 no host, 1 standard, 2 Viva Link. `stat` shows persona, heartbeats, function counters.
+- Risk: a computer port advertising less than 2 A (USB-C 1.5 A, USB-A 500/900 mA) may cut power instead of sagging
+  into VINDPM: then boot with `vivachargein=500` or a lower value.
+NOT tested on the phone. Compile-checked locally (xnu-cc.py, bt0154 + 0180's viva_sysctl.c).

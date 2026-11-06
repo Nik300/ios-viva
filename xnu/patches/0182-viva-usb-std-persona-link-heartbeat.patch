@@ -1,0 +1,992 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -136,6 +136,15 @@
+  * state machine follow Linux drivers/usb/musb (musb_regs.h,
+  * musb_gadget_ep0.c). The thread never prints in steady state: its output
+  * would feed the log it streams.
++ *
++ * 0182 (fork/docs/VIVA-USB-PERSONA.md): two personas. "link" (above) from boot; "std" once the daemon vivausbd
++ * (tools/vivad/vivausbd.c) attaches: an iPhone-like composite device 05ac:12a8 with PTP (if0, ep2 bulk + ep3
++ * interrupt), usbmux (if1, ep4) and the link (if2, ep1, unchanged). The PTP and usbmux protocols live in vivausbd:
++ * the kernel moves their transfers through /dev/vivaptp and /dev/vivamux and answers ep0 (PTP class requests, the
++ * Microsoft OS descriptor that binds Windows' MTP driver, Apple vendor requests). The link counts as "active" only
++ * while the host tool sends its heartbeat (vendor request 0x41/0x56, wValue 1, every second; 4 s timeout): only
++ * then does the charger keep the 500 mA USB input limit (viva_usb_host_configured). Boot-arg vivausbstd=0: never
++ * leave the link persona.
+  */
+ #define U3P_USBPHYACR5  0x014
+ #define U3P_USBPHYACR7  0x01c
+@@ -186,8 +195,15 @@
+ #define RXCSR_FLUSHFIFO 0x0010
+ #define RXCSR_CLRDATATOG 0x0080
+ 
++#define MUSB_RAMINFO    0x79            /* 8: [3:0] FIFO RAM address bits (32-bit words) */
++
+ #define EP1_TXFIFO      64              /* after the fixed 64-byte ep0 FIFO */
+ #define EP1_RXFIFO      (64 + 512)
++#define EP2_TXFIFO      (64 + 1024)     /* std persona: PTP bulk */
++#define EP2_RXFIFO      (64 + 1536)
++#define EP3_TXFIFO      (64 + 2048)     /* PTP interrupt, 64 bytes */
++#define EP4_TXFIFO      (64 + 2112)     /* usbmux bulk */
++#define EP4_RXFIFO      (64 + 2624)     /* ends at 3200 */
+ 
+ #define TOPRGU_PA       0x10007000u
+ #define WDT_MODE        0x00
+@@ -198,13 +214,23 @@
+ 	vm_offset_t musb;
+ 	vm_offset_t toprgu;
+ 	int         sleep_chan;
+-	enum { EP0_IDLE, EP0_IN, EP0_STATUS } ep0;
++	enum { EP0_IDLE, EP0_IN, EP0_OUT, EP0_STATUS } ep0;
+ 	const uint8_t *in_data;         /* ep0 IN data stage */
+ 	uint32_t    in_left;
+ 	bool        in_zlp;
++	uint8_t     setup[8];           /* request whose OUT data stage is being received */
++	uint32_t    out_len, out_got;
+ 	uint8_t     new_addr;           /* SET_ADDRESS, applied after the status stage */
+ 	bool        configured;
+ 	bool        hs;
++	enum { P_LINK, P_STD } persona;
++	bool        std_allowed;        /* boot-arg vivausbstd */
++	bool        want_std;           /* VIVAUSB_ATTACH */
++	uint8_t     link_if;            /* the link's interface number: 0 (link), 2 (std) */
++	char        serial[64];         /* std persona serial number (the UDID, from vivausbd) */
++	bool        tool_active;        /* host tool heartbeat seen in the last VL_TOOL_MS */
++	uint64_t    tool_ms;
++	uint64_t    heartbeats;
+ 	uint8_t     ep0_buf[256];
+ 	char        cmd[512];
+ 	char        reply[4096];
+@@ -233,14 +259,40 @@
+ extern void viva_disp_link(const char *args, char *out, size_t outLen);      /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+ extern int sweet_console_muted;                                             /* osfmk/console/serial_console.c */
+ 
+-/* VivaBattery.cpp: a USB host has configured the link (the cable is a computer, not a charger). */
++extern void viva_battery_usb_changed(void);                                  /* VivaBattery.cpp: poll now */
++
++#define VL_TOOL_MS      4000            /* the link is active this long after the last heartbeat */
++static uint64_t vl_now_ms(void);
++
++/*
++ * VivaBattery.cpp: the host tool keeps the link active, so the cable is a computer that wants the USB 500 mA limit.
++ * A computer without the tool (or a wall charger) gets the charger's full input limit (0182).
++ */
+ int
+ viva_usb_host_configured(void)
+ {
+-	return vl.configured ? 1 : 0;
++	return vl.configured && vl.tool_active ? 1 : 0;
+ }
+ 
++/* kern.viva_linkstate (viva_sysctl.c), VIVAUSB_STATE: 0 no host, 1 configured (standard), 2 Viva Link active. */
++int
++viva_usb_state(void)
++{
++	return !vl.configured ? 0 : vl.tool_active ? 2 : 1;
++}
++
+ static void
++vl_tool_set(bool active)
++{
++	if (vl.tool_active == active) {
++		return;
++	}
++	vl.tool_active = active;
++	printf("VIVA LINK: host tool %s\n", active ? "active (Viva Link)" : "gone");
++	viva_battery_usb_changed();
++}
++
++static void
+ vl_sleep_ms(unsigned ms)
+ {
+ 	uint64_t deadline;
+@@ -290,6 +342,36 @@
+ };
+ static const char *const vl_strings[] = { NULL, "ios-viva", "viva iOS link", "0001" };
+ 
++/* std persona (0182): 05ac:12a8 like an iPhone, PTP + usbmux + link. */
++static const uint8_t vl_std_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
++	0xac, 0x05, 0xa8, 0x12, 0x01, 0x16, 1, 2, 3, 1,
++};
++static uint8_t vl_std_cfg_desc[85] = {
++	9, 2, 85, 0, 3, 1, 0, 0x80, 250,                /* config: 3 interfaces, 500 mA */
++	9, 4, 0, 0, 3, 0x06, 0x01, 0x01, 4,             /* PTP (still image) */
++	7, 5, 0x82, 2, 0x00, 0x02, 0,                   /* bulk IN 2 */
++	7, 5, 0x02, 2, 0x00, 0x02, 0,                   /* bulk OUT 2 */
++	7, 5, 0x83, 3, 64, 0, 8,                        /* interrupt IN 3 */
++	9, 4, 1, 0, 2, 0xff, 0xfe, 0x02, 5,             /* usbmux */
++	7, 5, 0x84, 2, 0x00, 0x02, 0,                   /* bulk IN 4 */
++	7, 5, 0x04, 2, 0x00, 0x02, 0,                   /* bulk OUT 4 */
++	9, 4, 2, 0, 2, 0xff, 0x56, 0x01, 6,             /* viva link */
++	7, 5, 0x81, 2, 0x00, 0x02, 0,                   /* bulk IN 1 */
++	7, 5, 0x01, 2, 0x00, 0x02, 0,                   /* bulk OUT 1 */
++};
++static const uint8_t vl_std_bulk_mps_at[] = { 22, 29, 52, 59, 75, 82 };  /* wMaxPacketSize of the bulk endpoints */
++static const char *const vl_std_strings[] = { NULL, "Apple Inc.", "iPhone", NULL /* serial */, "PTP",
++	                                      "Apple USB Multiplexor", "viva iOS link" };
++#define VL_MS_VENDOR    0x50            /* Microsoft OS descriptor vendor code */
++static const uint8_t vl_ms_os_string[18] = {
++	18, 3, 'M', 0, 'S', 0, 'F', 0, 'T', 0, '1', 0, '0', 0, '0', 0, VL_MS_VENDOR, 0,
++};
++static const uint8_t vl_ms_compat_id[40] = {
++	40, 0, 0, 0, 0x00, 0x01, 0x04, 0x00, 1, 0, 0, 0, 0, 0, 0, 0,    /* header: length, bcd 1.00, index 4, 1 function */
++	0, 1, 'M', 'T', 'P', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /* interface 0: "MTP" */
++};
++
+ static uint32_t
+ vl_mps(void)
+ {
+@@ -303,10 +385,22 @@
+ 		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;   /* en-US */
+ 		return 4;
+ 	}
+-	if (idx >= sizeof(vl_strings) / sizeof(vl_strings[0])) {
+-		return 0;
++	const char *str;
++	if (vl.persona == P_STD) {
++		if (idx == 0xee) {
++			memcpy(out, vl_ms_os_string, sizeof(vl_ms_os_string));
++			return sizeof(vl_ms_os_string);
++		}
++		if (idx >= sizeof(vl_std_strings) / sizeof(vl_std_strings[0])) {
++			return 0;
++		}
++		str = idx == 3 ? vl.serial : vl_std_strings[idx];
++	} else {
++		if (idx >= sizeof(vl_strings) / sizeof(vl_strings[0])) {
++			return 0;
++		}
++		str = vl_strings[idx];
+ 	}
+-	const char *str = vl_strings[idx];
+ 	uint32_t n = 2;
+ 	for (; *str && n < 126; str++) {
+ 		out[n++] = (uint8_t)*str;
+@@ -317,27 +411,42 @@
+ 	return n;
+ }
+ 
+-/* Bulk endpoint 1, both directions, for the current speed. */
++/* One endpoint pair for the current speed: IN at txfifo (txmps bytes), OUT at rxfifo (0 = no OUT). */
+ static void
+-vl_ep1_config(void)
++vl_ep_config(unsigned ep, uint32_t txfifo, uint16_t txmps, uint32_t rxfifo)
+ {
+ 	uint16_t mps = (uint16_t)vl_mps();
+-	wr8(vl.musb, MUSB_INDEX, 1);
+-	wr16(vl.musb, MUSB_TXMAXP, mps);
+-	wr8(vl.musb, MUSB_TXFIFOSZ, 6);                 /* 512 bytes, single buffered */
+-	wr16(vl.musb, MUSB_TXFIFOADD, EP1_TXFIFO >> 3);
++	wr8(vl.musb, MUSB_INDEX, (uint8_t)ep);
++	wr16(vl.musb, MUSB_TXMAXP, txmps);
++	wr8(vl.musb, MUSB_TXFIFOSZ, txmps > 64 ? 6 : 3);        /* 512 or 64 bytes, single buffered */
++	wr16(vl.musb, MUSB_TXFIFOADD, (uint16_t)(txfifo >> 3));
+ 	wr16(vl.musb, MUSB_TXCSR, TXCSR_MODE | TXCSR_CLRDATATOG);
+ 	if (rd16(vl.musb, MUSB_TXCSR) & TXCSR_FIFONOTEMPTY) {
+ 		wr16(vl.musb, MUSB_TXCSR, TXCSR_MODE | TXCSR_FLUSHFIFO);
+ 	}
+-	wr16(vl.musb, MUSB_RXMAXP, mps);
+-	wr8(vl.musb, MUSB_RXFIFOSZ, 6);
+-	wr16(vl.musb, MUSB_RXFIFOADD, EP1_RXFIFO >> 3);
+-	wr16(vl.musb, MUSB_RXCSR, RXCSR_FLUSHFIFO | RXCSR_CLRDATATOG);
+-	wr16(vl.musb, MUSB_RXCSR, RXCSR_FLUSHFIFO | RXCSR_CLRDATATOG);
++	if (rxfifo != 0) {
++		wr16(vl.musb, MUSB_RXMAXP, mps);
++		wr8(vl.musb, MUSB_RXFIFOSZ, 6);
++		wr16(vl.musb, MUSB_RXFIFOADD, (uint16_t)(rxfifo >> 3));
++		wr16(vl.musb, MUSB_RXCSR, RXCSR_FLUSHFIFO | RXCSR_CLRDATATOG);
++		wr16(vl.musb, MUSB_RXCSR, RXCSR_FLUSHFIFO | RXCSR_CLRDATATOG);
++	}
+ 	wr8(vl.musb, MUSB_INDEX, 0);
+ }
+ 
++/* Endpoints of the configuration just set. */
++static void
++vl_eps_config(void)
++{
++	uint16_t mps = (uint16_t)vl_mps();
++	vl_ep_config(1, EP1_TXFIFO, mps, EP1_RXFIFO);
++	if (vl.persona == P_STD) {
++		vl_ep_config(2, EP2_TXFIFO, mps, EP2_RXFIFO);
++		vl_ep_config(3, EP3_TXFIFO, 64, 0);
++		vl_ep_config(4, EP4_TXFIFO, mps, EP4_RXFIFO);
++	}
++}
++
+ /* Next ep0 IN packet; the last one carries DATAEND. Index must be 0. */
+ static void
+ vl_ep0_in_next(void)
+@@ -352,9 +461,99 @@
+ 	}
+ 	wr16(vl.musb, MUSB_CSR0, CSR0_TXPKTRDY | (last ? CSR0_DATAEND : 0));
+ 	vl.ep0 = last ? EP0_STATUS : EP0_IN;
++}
++
++/* ---- std persona functions (0182): PTP (index 0, ep2 + ep3) and usbmux (index 1, ep4) ---- */
++
++#define VF_RING         (128u << 10)    /* bytes queued per direction */
++#define VF_MARKS        256             /* transfer ends queued per direction */
++#define VF_WRITE_MAX    (64u << 10)
++#define VF_EVENTS       8
++
++struct vfn {
++	const char *name;
++	uint8_t     ep;                     /* bulk IN and OUT endpoint */
++	bool        open;
++	int         pending_err;            /* ECONNRESET / ECANCELED, returned once by read() */
++	uint32_t    gen;                    /* bumped by every reset: writers waiting for room give up */
++	uint8_t    *rx, *tx;                /* rings, VF_RING each (allocated with the device nodes) */
++	uint32_t    rx_head, rx_tail, tx_head, tx_tail;     /* free-running */
++	uint32_t    rx_mark[VF_MARKS], tx_mark[VF_MARKS];   /* ring positions where transfers end */
++	uint32_t    rx_mhead, rx_mtail, tx_mhead, tx_mtail;
++	uint32_t    rx_xfer;                /* bytes of the OUT transfer in progress */
++	bool        tx_zlp;                 /* the last IN transfer ended on a full packet */
++	uint32_t    tx_cont_left;           /* ptp: bytes of the container being written still to come */
++	uint64_t    rx_bytes, tx_bytes, rx_xfers, tx_xfers, resets;
++};
++static struct vfn vfn[2] = { { .name = "vivaptp", .ep = 2 }, { .name = "vivamux", .ep = 4 } };
++static struct {
++	uint8_t     data[64];
++	uint32_t    len;
++} vf_ev[VF_EVENTS];
++static uint32_t vf_ev_head, vf_ev_tail;
++LCK_GRP_DECLARE(vf_grp, "vivausb");
++LCK_MTX_DECLARE(vf_mtx, &vf_grp);
++
++/* Drop everything queued in both directions; read() reports err once. vf_mtx held. */
++static void
++vf_reset_locked(struct vfn *f, int err)
++{
++	f->rx_tail = f->rx_head;
++	f->rx_mtail = f->rx_mhead;
++	f->rx_xfer = 0;
++	f->tx_tail = f->tx_head;
++	f->tx_mtail = f->tx_mhead;
++	f->tx_zlp = false;
++	f->tx_cont_left = 0;
++	f->pending_err = err;
++	f->gen++;
++	f->resets++;
++	wakeup(&f->rx_head);
++	wakeup(&f->tx_tail);
+ }
+ 
+ static void
++vf_reset_all(int err)
++{
++	lck_mtx_lock(&vf_mtx);
++	for (unsigned i = 0; i < 2; i++) {
++		vf_reset_locked(&vfn[i], err);
++	}
++	vf_ev_tail = vf_ev_head;
++	lck_mtx_unlock(&vf_mtx);
++}
++
++/* PTP cancel / device reset (ep0): the transaction in flight is dropped on both sides. */
++static void
++vf_ptp_cancel(int err)
++{
++	lck_mtx_lock(&vf_mtx);
++	vf_reset_locked(&vfn[0], err);
++	lck_mtx_unlock(&vf_mtx);
++	wr8(vl.musb, MUSB_INDEX, 2);
++	wr16(vl.musb, MUSB_TXCSR, TXCSR_MODE | TXCSR_FLUSHFIFO);
++	wr8(vl.musb, MUSB_INDEX, 0);
++}
++
++static bool
++vf_ptp_busy(void)
++{
++	return vfn[0].pending_err == ECANCELED;
++}
++
++/* A control request with an OUT data stage, all data received (vl.setup, vl.ep0_buf). */
++static void
++vl_setup_out_done(void)
++{
++	uint8_t type = vl.setup[0], req = vl.setup[1];
++	if (type == 0x21 && req == 0x64) {              /* PTP CANCEL_REQUEST: 0x4001 + transaction id */
++		vf_ptp_cancel(ECANCELED);
++	}
++	/* vendor OUT requests with data (Apple's): accepted, ignored */
++}
++
++/* SETUP packet on ep0 (index 0, RXPKTRDY set). */
++static void
+ vl_setup(void)
+ {
+ 	uint8_t st[8];
+@@ -365,24 +564,64 @@
+ 	}
+ 	vl_fifo_read(0, st, 8);
+ 	vl.setups++;
+-	uint8_t type = st[0], req = st[1];
++	uint8_t type = st[0], req = st[1], kind = type & 0x60, rcpt = type & 0x1f;
+ 	uint16_t value = (uint16_t)(st[2] | st[3] << 8);
+ 	uint16_t index = (uint16_t)(st[4] | st[5] << 8);
+ 	uint16_t length = (uint16_t)(st[6] | st[7] << 8);
+ 	const uint8_t *data = NULL;
+ 	uint32_t n = 0;
+-	bool ok = true;
++	bool ok = true, std = vl.persona == P_STD;
+ 
+-	if ((type & 0x60) != 0) {       /* only standard requests */
++	if (kind == 0x40 && req == 0x56 && rcpt == 1 && (index & 0xff) == vl.link_if && length == 0) {
++		/* host tool heartbeat (1) / bye (0) */
++		vl.heartbeats++;
++		vl.tool_ms = vl_now_ms();
++		vl_tool_set(value != 0 && vl.configured);
++	} else if (kind == 0x40 && type == 0xc0 && req == VL_MS_VENDOR && std && index == 4) {
++		data = vl_ms_compat_id; n = sizeof(vl_ms_compat_id);   /* Windows: interface 0 is MTP */
++	} else if (kind == 0x40) {
++		ok = !(type & 0x80);    /* Apple's vendor OUT requests (charging current, ...): acked, no effect */
++	} else if (kind == 0x20 && std && rcpt == 1 && (index & 0xff) == 0) {
++		switch (req) {
++		case 0x64:                                      /* CANCEL_REQUEST, 6 data bytes */
++			ok = !(type & 0x80) && length == 6;
++			break;
++		case 0x66:                                      /* DEVICE_RESET */
++			ok = type == 0x21 && length == 0;
++			if (ok) {
++				vf_ptp_cancel(ECONNRESET);
++			}
++			break;
++		case 0x67:                                      /* GET_DEVICE_STATUS: OK or busy */
++			vl.ep0_buf[0] = 4; vl.ep0_buf[1] = 0;
++			vl.ep0_buf[2] = vf_ptp_busy() ? 0x19 : 0x01; vl.ep0_buf[3] = 0x20;
++			data = vl.ep0_buf; n = 4;
++			ok = (type & 0x80) != 0;
++			break;
++		default:
++			ok = false;
++			break;
++		}
++	} else if (kind != 0) {
+ 		ok = false;
+ 	} else if (req == 6 && (type & 0x80)) {         /* GET_DESCRIPTOR */
++		vl.hs = (rd8(vl.musb, MUSB_POWER) & POWER_HSMODE) != 0;
+ 		switch (value >> 8) {
+-		case 1: data = vl_dev_desc; n = sizeof(vl_dev_desc); break;
++		case 1:
++			data = std ? vl_std_dev_desc : vl_dev_desc; n = sizeof(vl_dev_desc);
++			break;
+ 		case 2:
+-			vl.hs = (rd8(vl.musb, MUSB_POWER) & POWER_HSMODE) != 0;
+-			vl_cfg_desc[22] = vl_cfg_desc[29] = (uint8_t)vl_mps();
+-			vl_cfg_desc[23] = vl_cfg_desc[30] = (uint8_t)(vl_mps() >> 8);
+-			data = vl_cfg_desc; n = sizeof(vl_cfg_desc);
++			if (std) {
++				for (unsigned i = 0; i < sizeof(vl_std_bulk_mps_at); i++) {
++					vl_std_cfg_desc[vl_std_bulk_mps_at[i]] = (uint8_t)vl_mps();
++					vl_std_cfg_desc[vl_std_bulk_mps_at[i] + 1] = (uint8_t)(vl_mps() >> 8);
++				}
++				data = vl_std_cfg_desc; n = sizeof(vl_std_cfg_desc);
++			} else {
++				vl_cfg_desc[22] = vl_cfg_desc[29] = (uint8_t)vl_mps();
++				vl_cfg_desc[23] = vl_cfg_desc[30] = (uint8_t)(vl_mps() >> 8);
++				data = vl_cfg_desc; n = sizeof(vl_cfg_desc);
++			}
+ 			break;
+ 		case 3: n = vl_string(value & 0xff, vl.ep0_buf); data = vl.ep0_buf; ok = n != 0; break;
+ 		case 6: data = vl_qual_desc; n = sizeof(vl_qual_desc); break;
+@@ -392,10 +631,14 @@
+ 		vl.new_addr = (uint8_t)(value & 0x7f);
+ 	} else if (req == 9 && type == 0x00) {          /* SET_CONFIGURATION */
+ 		vl.configured = value != 0;
++		if (!vl.configured) {
++			vl_tool_set(false);
++		}
++		vl.hs = (rd8(vl.musb, MUSB_POWER) & POWER_HSMODE) != 0;
++		vl_eps_config();
++		vf_reset_all(ECONNRESET);
+ 		if (vl.configured) {
+-			vl.hs = (rd8(vl.musb, MUSB_POWER) & POWER_HSMODE) != 0;
+-			vl_ep1_config();
+-			printf("VIVA LINK: configured, %s speed\n", vl.hs ? "high" : "full");
++			printf("VIVA LINK: configured, %s speed, %s persona\n", vl.hs ? "high" : "full", std ? "std" : "link");
+ 		}
+ 	} else if (req == 8 && (type & 0x80)) {         /* GET_CONFIGURATION */
+ 		vl.ep0_buf[0] = vl.configured ? 1 : 0; data = vl.ep0_buf; n = 1;
+@@ -405,8 +648,9 @@
+ 		vl.ep0_buf[0] = 0; data = vl.ep0_buf; n = 1;
+ 	} else if (req == 11 && type == 0x01) {         /* SET_INTERFACE */
+ 	} else if (req == 1 && type == 0x02) {          /* CLEAR_FEATURE(ENDPOINT_HALT): reset the toggle */
+-		if ((index & 0x7f) == 1) {
+-			wr8(vl.musb, MUSB_INDEX, 1);
++		unsigned ep = index & 0x7f;
++		if (ep >= 1 && ep <= (std ? 4u : 1u)) {
++			wr8(vl.musb, MUSB_INDEX, (uint8_t)ep);
+ 			if (index & 0x80) {
+ 				wr16(vl.musb, MUSB_TXCSR, TXCSR_MODE | TXCSR_CLRDATATOG);
+ 			} else {
+@@ -417,7 +661,19 @@
+ 	} else {
+ 		ok = false;
+ 	}
+-	if (!ok || (!(type & 0x80) && length != 0)) {   /* no OUT data stages */
++	if (ok && !(type & 0x80) && length != 0) {     /* OUT data stage: vl_ep0 collects it */
++		if (length > sizeof(vl.ep0_buf)) {
++			ok = false;
++		} else {
++			memcpy(vl.setup, st, 8);
++			vl.out_len = length;
++			vl.out_got = 0;
++			wr16(vl.musb, MUSB_CSR0, CSR0_SVDRXPKTRDY);
++			vl.ep0 = EP0_OUT;
++			return;
++		}
++	}
++	if (!ok) {
+ 		wr16(vl.musb, MUSB_CSR0, CSR0_SVDRXPKTRDY | CSR0_SENDSTALL);
+ 		vl.ep0 = EP0_IDLE;
+ 		return;
+@@ -459,6 +715,21 @@
+ 			vl_ep0_in_next();
+ 		}
+ 		return;
++	case EP0_OUT:                   /* data stage of a control write */
++		if (csr & CSR0_RXPKTRDY) {
++			uint32_t n = rd16(vl.musb, MUSB_COUNT0);
++			uint32_t take = MIN(n, vl.out_len - vl.out_got);
++			vl_fifo_read(0, vl.ep0_buf + vl.out_got, take);
++			vl.out_got += take;
++			if (vl.out_got >= vl.out_len || n < 64) {
++				wr16(vl.musb, MUSB_CSR0, CSR0_SVDRXPKTRDY | CSR0_DATAEND);
++				vl.ep0 = EP0_STATUS;
++				vl_setup_out_done();
++			} else {
++				wr16(vl.musb, MUSB_CSR0, CSR0_SVDRXPKTRDY);
++			}
++		}
++		return;
+ 	case EP0_STATUS:                /* status stage done */
+ 		if (vl.new_addr) {
+ 			wr8(vl.musb, MUSB_FADDR, vl.new_addr);
+@@ -880,6 +1151,344 @@
+ 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+ };
+ 
++/* ---- /dev/vivaptp (minor 0), /dev/vivamux (minor 1): the std persona's functions for vivausbd ---- */
++
++struct vivausb_serial { char s[64]; };
++struct vivausb_event { uint32_t len; uint8_t data[64]; };
++#define VIVAUSB_SET_SERIAL      _IOW('V', 1, struct vivausb_serial)
++#define VIVAUSB_ATTACH          _IO('V', 2)
++#define VIVAUSB_STATE           _IOR('V', 3, int)
++#define VIVAUSB_PTP_EVENT       _IOW('V', 4, struct vivausb_event)
++
++static int
++vf_open(dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	int m = minor(dev), err = 0;
++	if (m > 1) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&vf_mtx);
++	if (vfn[m].open) {
++		err = EBUSY;
++	} else if (vfn[m].rx == NULL) {
++		err = ENOMEM;
++	} else {
++		vfn[m].open = true;
++		vf_reset_locked(&vfn[m], 0);    /* a new daemon starts clean */
++	}
++	lck_mtx_unlock(&vf_mtx);
++	return err;
++}
++
++static int
++vf_close(dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	lck_mtx_lock(&vf_mtx);
++	vfn[minor(dev)].open = false;
++	lck_mtx_unlock(&vf_mtx);
++	return 0;
++}
++
++/* Bytes of one OUT transfer at most; blocks until there are some. */
++static int
++vf_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	struct vfn *f = &vfn[minor(dev)];
++	uint8_t chunk[1024];
++	int err = 0;
++	bool got = false, end = false;
++
++	while (!end && err == 0 && uio_resid(uio) > 0) {
++		uint32_t n = 0;
++		lck_mtx_lock(&vf_mtx);
++		while (!got) {
++			if (f->pending_err) {
++				err = f->pending_err;
++				f->pending_err = 0;
++				break;
++			}
++			/* a transfer end at the read position: its bytes were read before its ZLP came */
++			while (f->rx_mtail != f->rx_mhead && f->rx_mark[f->rx_mtail % VF_MARKS] == f->rx_tail) {
++				f->rx_mtail++;
++			}
++			if (f->rx_head != f->rx_tail) {
++				break;
++			}
++			err = msleep(&f->rx_head, &vf_mtx, PCATCH | PSOCK, "vivausb", NULL);
++			if (err) {
++				break;
++			}
++		}
++		if (err == 0 && f->rx_head != f->rx_tail) {
++			uint32_t lim = f->rx_head - f->rx_tail;
++			bool ends = false;
++			if (f->rx_mtail != f->rx_mhead && f->rx_mark[f->rx_mtail % VF_MARKS] - f->rx_tail <= lim) {
++				lim = f->rx_mark[f->rx_mtail % VF_MARKS] - f->rx_tail;
++				ends = true;
++			}
++			n = (uint32_t)MIN((user_ssize_t)MIN(lim, (uint32_t)sizeof(chunk)), uio_resid(uio));
++			for (uint32_t i = 0; i < n; i++) {
++				chunk[i] = f->rx[(f->rx_tail + i) % VF_RING];
++			}
++			f->rx_tail += n;
++			if (ends && n == lim) {
++				f->rx_mtail++;
++				end = true;
++			}
++		}
++		lck_mtx_unlock(&vf_mtx);
++		if (n == 0) {
++			break;
++		}
++		err = uiomove((caddr_t)chunk, (int)n, uio);
++		got = true;
++	}
++	return err;
++}
++
++/* One IN transfer (ptp: part of a container, see VIVA-USB-PERSONA.md); blocks while the queue is full. */
++static int
++vf_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	struct vfn *f = &vfn[minor(dev)];
++	user_ssize_t len = uio_resid(uio);
++	if (len == 0) {
++		return 0;
++	}
++	if (len > VF_WRITE_MAX) {
++		return EMSGSIZE;
++	}
++	uint32_t n = (uint32_t)len;
++	uint8_t *buf = kalloc_data(n, Z_WAITOK);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	int err = uiomove((caddr_t)buf, (int)n, uio);
++	lck_mtx_lock(&vf_mtx);
++	uint32_t gen = f->gen;
++	while (err == 0) {
++		if (!vl.configured || vl.persona != P_STD) {
++			err = ENXIO;
++		} else if (f->gen != gen) {
++			err = ECONNRESET;
++		} else if (VF_RING - (f->tx_head - f->tx_tail) >= n && f->tx_mhead - f->tx_mtail < VF_MARKS) {
++			break;
++		} else {
++			err = msleep(&f->tx_tail, &vf_mtx, PCATCH | PSOCK, "vivausbw", NULL);
++		}
++	}
++	if (err == 0) {
++		for (uint32_t i = 0; i < n; i++) {
++			f->tx[(f->tx_head + i) % VF_RING] = buf[i];
++		}
++		f->tx_head += n;
++		bool end = true;
++		if (f == &vfn[0]) {             /* PTP: a data phase over several writes is one transfer */
++			if (f->tx_cont_left == 0 && n >= 4) {
++				uint32_t clen = (uint32_t)buf[0] | (uint32_t)buf[1] << 8 | (uint32_t)buf[2] << 16 |
++				    (uint32_t)buf[3] << 24;
++				f->tx_cont_left = clen >= 12 ? clen : n;
++			}
++			f->tx_cont_left -= MIN(f->tx_cont_left, n);
++			end = f->tx_cont_left == 0;
++		}
++		if (end) {
++			f->tx_mark[f->tx_mhead++ % VF_MARKS] = f->tx_head;
++			f->tx_xfers++;
++		}
++	}
++	lck_mtx_unlock(&vf_mtx);
++	kfree_data(buf, n);
++	return err;
++}
++
++static int
++vf_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused proc_t p)
++{
++	switch (cmd) {
++	case VIVAUSB_SET_SERIAL: {
++		struct vivausb_serial *s = (struct vivausb_serial *)data;
++		size_t i = 0;
++		for (; i < sizeof(vl.serial) - 1 && s->s[i] > ' ' && s->s[i] < 0x7f; i++) {
++			vl.serial[i] = s->s[i];
++		}
++		vl.serial[i] = 0;
++		return 0;
++	}
++	case VIVAUSB_ATTACH:
++		if (!vl.std_allowed) {
++			return EPERM;
++		}
++		vl.want_std = true;
++		return 0;
++	case VIVAUSB_STATE:
++		*(int *)data = viva_usb_state();
++		return 0;
++	case VIVAUSB_PTP_EVENT: {
++		struct vivausb_event *e = (struct vivausb_event *)data;
++		int err = 0;
++		if (e->len == 0 || e->len > sizeof(e->data)) {
++			return EINVAL;
++		}
++		lck_mtx_lock(&vf_mtx);
++		if (vf_ev_head - vf_ev_tail >= VF_EVENTS) {
++			err = ENOBUFS;
++		} else {
++			memcpy(vf_ev[vf_ev_head % VF_EVENTS].data, e->data, e->len);
++			vf_ev[vf_ev_head++ % VF_EVENTS].len = e->len;
++		}
++		lck_mtx_unlock(&vf_mtx);
++		return err;
++	}
++	default:
++		return ENOTTY;
++	}
++}
++
++static const struct cdevsw vivausb_cdevsw = {
++	.d_open = vf_open, .d_close = vf_close, .d_read = vf_read, .d_write = vf_write,
++	.d_ioctl = vf_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++/* OUT packets of one function into its ring; a packet that does not fit stays in the FIFO (the host gets NAKs). */
++static void
++vf_service_rx(struct vfn *f)
++{
++	static uint8_t pkt[512];
++	wr8(vl.musb, MUSB_INDEX, f->ep);
++	for (int k = 0; k < 32; k++) {
++		if (!(rd16(vl.musb, MUSB_RXCSR) & RXCSR_RXPKTRDY)) {
++			break;
++		}
++		uint32_t n = MIN((uint32_t)rd16(vl.musb, MUSB_RXCOUNT), (uint32_t)sizeof(pkt));
++		bool last = n < vl_mps();
++		lck_mtx_lock(&vf_mtx);
++		bool room = VF_RING - (f->rx_head - f->rx_tail) >= n && f->rx_mhead - f->rx_mtail < VF_MARKS;
++		lck_mtx_unlock(&vf_mtx);
++		if (!room) {
++			break;
++		}
++		vl_fifo_read(f->ep, pkt, n);
++		wr16(vl.musb, MUSB_RXCSR, 0);
++		lck_mtx_lock(&vf_mtx);
++		for (uint32_t i = 0; i < n; i++) {
++			f->rx[(f->rx_head + i) % VF_RING] = pkt[i];
++		}
++		f->rx_head += n;
++		f->rx_xfer += n;
++		f->rx_bytes += n;
++		if (last && f->rx_xfer != 0) {
++			f->rx_mark[f->rx_mhead++ % VF_MARKS] = f->rx_head;
++			f->rx_xfer = 0;
++			f->rx_xfers++;
++		}
++		wakeup(&f->rx_head);
++		lck_mtx_unlock(&vf_mtx);
++	}
++	wr8(vl.musb, MUSB_INDEX, 0);
++}
++
++/* IN packets while the FIFO takes them: data up to the next transfer end, then a short packet or a ZLP. */
++static void
++vf_service_tx(struct vfn *f)
++{
++	static uint8_t pkt[512];
++	uint32_t mps = vl_mps();
++	wr8(vl.musb, MUSB_INDEX, f->ep);
++	for (int k = 0; k < 64; k++) {
++		uint16_t csr = rd16(vl.musb, MUSB_TXCSR);
++		if (csr & (TXCSR_UNDERRUN | TXCSR_SENTSTALL)) {
++			wr16(vl.musb, MUSB_TXCSR, TXCSR_MODE);
++			csr = rd16(vl.musb, MUSB_TXCSR);
++		}
++		if (csr & (TXCSR_TXPKTRDY | TXCSR_FIFONOTEMPTY)) {
++			delay(10);              /* the host usually takes it within a microframe */
++			if (rd16(vl.musb, MUSB_TXCSR) & (TXCSR_TXPKTRDY | TXCSR_FIFONOTEMPTY)) {
++				break;
++			}
++		}
++		uint32_t n = 0;
++		bool send = false;
++		lck_mtx_lock(&vf_mtx);
++		if (f->tx_zlp) {
++			f->tx_zlp = false;
++			send = true;
++		} else if (f->tx_head != f->tx_tail) {
++			uint32_t avail = f->tx_head - f->tx_tail;
++			bool marked = f->tx_mtail != f->tx_mhead;
++			uint32_t lim = marked ? f->tx_mark[f->tx_mtail % VF_MARKS] - f->tx_tail : avail;
++			n = MIN(lim, mps);
++			if (marked || n == mps) {       /* an unfinished PTP container only goes out in full packets */
++				for (uint32_t i = 0; i < n; i++) {
++					pkt[i] = f->tx[(f->tx_tail + i) % VF_RING];
++				}
++				f->tx_tail += n;
++				f->tx_bytes += n;
++				if (marked && n == lim) {
++					f->tx_mtail++;
++					f->tx_zlp = n == mps;
++				}
++				send = true;
++				wakeup(&f->tx_tail);
++			}
++		}
++		lck_mtx_unlock(&vf_mtx);
++		if (!send) {
++			break;
++		}
++		vl_fifo_write(f->ep, pkt, n);
++		wr16(vl.musb, MUSB_TXCSR, TXCSR_MODE | TXCSR_TXPKTRDY);
++	}
++	wr8(vl.musb, MUSB_INDEX, 0);
++}
++
++/* PTP events on the interrupt endpoint 3. */
++static void
++vf_service_events(void)
++{
++	wr8(vl.musb, MUSB_INDEX, 3);
++	uint16_t csr = rd16(vl.musb, MUSB_TXCSR);
++	if (csr & (TXCSR_UNDERRUN | TXCSR_SENTSTALL)) {
++		wr16(vl.musb, MUSB_TXCSR, TXCSR_MODE);
++		csr = rd16(vl.musb, MUSB_TXCSR);
++	}
++	if (!(csr & (TXCSR_TXPKTRDY | TXCSR_FIFONOTEMPTY))) {
++		lck_mtx_lock(&vf_mtx);
++		if (vf_ev_head != vf_ev_tail) {
++			uint32_t i = vf_ev_tail++ % VF_EVENTS;
++			vl_fifo_write(3, vf_ev[i].data, vf_ev[i].len);
++			wr16(vl.musb, MUSB_TXCSR, TXCSR_MODE | TXCSR_TXPKTRDY);
++		}
++		lck_mtx_unlock(&vf_mtx);
++	}
++	wr8(vl.musb, MUSB_INDEX, 0);
++}
++
++/* The switch to the std persona (VIVAUSB_ATTACH): soft disconnect, then enumerate again with the new descriptors. */
++static void
++vl_persona_std(void)
++{
++	printf("VIVA LINK: switching to the standard persona 05ac:12a8 (serial %s)\n", vl.serial);
++	wr8(vl.musb, MUSB_POWER, rd8(vl.musb, MUSB_POWER) & ~POWER_SOFTCONN);
++	vl.configured = false;
++	vl_tool_set(false);
++	vl.ep0 = EP0_IDLE;
++	vl.new_addr = 0;
++	vf_reset_all(ECONNRESET);
++	vl_sleep_ms(300);
++	vl.persona = P_STD;
++	vl.link_if = 2;
++	wr8(vl.musb, MUSB_INTRUSB, rd8(vl.musb, MUSB_INTRUSB));
++	wr16(vl.musb, MUSB_INTRTX, rd16(vl.musb, MUSB_INTRTX));
++	wr16(vl.musb, MUSB_INTRRX, rd16(vl.musb, MUSB_INTRRX));
++	wr8(vl.musb, MUSB_FADDR, 0);
++	wr8(vl.musb, MUSB_INDEX, 0);
++	wr16(vl.musb, MUSB_INTRTXE, 0x001f);            /* ep0..4 (the line stays masked: polled) */
++	wr16(vl.musb, MUSB_INTRRXE, 0x0016);            /* ep1, 2, 4 OUT */
++	wr8(vl.musb, MUSB_POWER, POWER_HSENAB | POWER_SOFTCONN);
++}
++
+ /* Once the root is mounted (devfs is up): /dev/vivalink, root only. */
+ static void
+ vl_vivad_node(void)
+@@ -892,6 +1501,21 @@
+ 	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "vivalink") == NULL) {
+ 		printf("VIVA LINK: no /dev/vivalink (major %d)\n", major);
+ 	}
++	/* std persona functions (0182) */
++	for (unsigned i = 0; i < 2; i++) {
++		vfn[i].rx = kalloc_data(VF_RING, Z_WAITOK);
++		vfn[i].tx = kalloc_data(VF_RING, Z_WAITOK);
++		if (vfn[i].rx == NULL || vfn[i].tx == NULL) {
++			printf("VIVA LINK: no memory for /dev/%s\n", vfn[i].name);
++			return;
++		}
++	}
++	major = cdevsw_add(-1, &vivausb_cdevsw);
++	for (unsigned i = 0; i < 2 && major >= 0; i++) {
++		if (devfs_make_node(makedev(major, i), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, vfn[i].name) == NULL) {
++			printf("VIVA LINK: no /dev/%s\n", vfn[i].name);
++		}
++	}
+ }
+ 
+ /* Queue "ID TEXT" for vivad; 0 if nobody reads or the queue is full. */
+@@ -968,6 +1592,15 @@
+ 	    vl.log_bytes);
+ 	ST("usb: %llu resets, %llu setups, %llu commands, %llu IN packets, %llu OUT packets\n", vl.resets, vl.setups,
+ 	    vl.cmds, vl.tx_pkts, vl.rx_pkts);
++	ST("persona %s (%s), host %s, Viva Link %s (%llu heartbeats)\n", vl.persona == P_STD ? "std 05ac:12a8" :
++	    "link 1209:0002", vl.std_allowed ? (vl.want_std ? "attached" : "waiting for vivausbd") : "vivausbstd=0",
++	    vl.configured ? "configured" : "none", vl.tool_active ? "active" : "inactive", vl.heartbeats);
++	for (unsigned i = 0; i < 2; i++) {
++		ST("%s: %s, out %llu bytes / %llu transfers (%u queued), in %llu bytes / %llu transfers (%u queued), "
++		    "%llu resets\n", vfn[i].name, vfn[i].open ? "open" : "closed", vfn[i].rx_bytes, vfn[i].rx_xfers,
++		    vfn[i].rx_head - vfn[i].rx_tail, vfn[i].tx_bytes, vfn[i].tx_xfers, vfn[i].tx_head - vfn[i].tx_tail,
++		    vfn[i].resets);
++	}
+ 	ST("vivad: %s (last opener pid %d), %llu output bytes dropped%s\n", vd_readers ? "waiting for commands" :
+ 	    "not reading", vd_pid, vd_out_dropped, vd_node ? "" : ", /dev/vivalink not created yet");
+ #undef ST
+@@ -992,7 +1625,7 @@
+ 	if (IS("ping")) {
+ 		vl_reply("pong\n");
+ 	} else if (IS("stat")) {
+-		static char stat_reply[1024];
++		static char stat_reply[2048];
+ 		viva_link_stat(stat_reply, sizeof(stat_reply));
+ 		vl_reply("%s", stat_reply);
+ 	} else if (IS("peek") && vl_arg(&rest, &a)) {
+@@ -1253,13 +1886,24 @@
+ 			vl.ep0 = EP0_IDLE;
+ 			vl.new_addr = 0;
+ 			vl.configured = false;
++			vl_tool_set(false);
++			vf_reset_all(ECONNRESET);
+ 			vl.hs = (rd8(vl.musb, MUSB_POWER) & POWER_HSMODE) != 0;
+ 			wr8(vl.musb, MUSB_FADDR, 0);
+ 			printf("VIVA LINK: bus reset (%s speed)\n", vl.hs ? "high" : "full");
+ 		}
+ 		if (usb & INTR_DISCON) {
+ 			vl.configured = false;
++			vl_tool_set(false);
++			vf_reset_all(ECONNRESET);
+ 		}
++		if (vl.tool_active && vl_now_ms() - vl.tool_ms > VL_TOOL_MS) {
++			vl_tool_set(false);
++		}
++		if (vl.want_std && vl.persona == P_LINK) {
++			vl_persona_std();
++			continue;
++		}
+ 		/* ep0: on its interrupt, and on a waiting SETUP in case the bit was missed */
+ 		wr8(vl.musb, MUSB_INDEX, 0);
+ 		if ((tx & 1) || (vl.ep0 == EP0_IDLE && (rd16(vl.musb, MUSB_CSR0) & CSR0_RXPKTRDY))) {
+@@ -1282,6 +1926,13 @@
+ 				}
+ 			}
+ 			wr8(vl.musb, MUSB_INDEX, 0);
++			if (vl.persona == P_STD) {
++				for (unsigned i = 0; i < 2; i++) {
++					vf_service_rx(&vfn[i]);
++					vf_service_tx(&vfn[i]);
++				}
++				vf_service_events();
++			}
+ 		}
+ 		vl_sleep_ms(1);
+ 	}
+@@ -1295,6 +1946,12 @@
+ 	vl.musb = musb;
+ 	vl.toprgu = ml_io_map(TOPRGU_PA, 0x1000);
+ 	vl.log_pos = 0;                 /* whole ring: the boot so far */
++	uint32_t std = 1;
++	PE_parse_boot_argn("vivausbstd", &std, sizeof(std));
++	vl.std_allowed = std != 0;
++	strlcpy(vl.serial, "0000000000000000000000000000000000000000", sizeof(vl.serial));
++	printf("VIVA LINK: FIFO RAM %u bytes, standard persona %s\n", 4u << (rd8(musb, MUSB_RAMINFO) & 0xf),
++	    vl.std_allowed ? "when vivausbd attaches" : "off (vivausbstd=0)");
+ 
+ 	/* T-PHY u2: MediaTek usb_phy_recover (leave suspend, USB function, no BC1.1) */
+ 	clr32(tphy, U3P_USBPHYACR7, 1u << 12);          /* PUPD_BIST_EN */
+diff --git a/bsd/dev/viva_sysctl.c b/bsd/dev/viva_sysctl.c
+--- a/bsd/dev/viva_sysctl.c
++++ b/bsd/dev/viva_sysctl.c
+@@ -11,6 +11,7 @@
+  *   active slot's boot partition (androidboot.slot_suffix, else boot_b): read by everybody, written by root
+  *   (bsd/dev/sweet_ufs.c sweet_ufs_bootargs: one 4 KiB block, checked, read back).
+  * kern.viva_nextbootargs_orig: what that partition held the first time either sysctl was used (for "restore").
++ * kern.viva_linkstate (0182): USB state for the SpringBoard island: 0 no host, 1 standard, 2 Viva Link active.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -135,6 +136,20 @@
+ SYSCTL_PROC(_kern, OID_AUTO, viva_link, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     0, 0, sysctl_viva_link, "-", "viva link commands (KA1)");
+ 
++/* kern.viva_linkstate (0182): 0 no USB host, 1 a host configured the device (standard), 2 Viva Link active. */
++extern int viva_usb_state(void);                                            /* bsd/dev/viva_usb.c */
++
++static int
++sysctl_viva_linkstate SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int state = viva_usb_state();
++	return SYSCTL_OUT(req, &state, sizeof(state));
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, viva_linkstate, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_viva_linkstate, "I", "USB: 0 no host, 1 standard, 2 Viva Link active");
++
+ /* ---- KA2 ---- */
+ 
+ static char viva_bootargs_orig[BOOTARGS_MAX + 1];
+diff --git a/iokit/Kernel/arm/VivaBattery.cpp b/iokit/Kernel/arm/VivaBattery.cpp
+--- a/iokit/Kernel/arm/VivaBattery.cpp
++++ b/iokit/Kernel/arm/VivaBattery.cpp
+@@ -33,8 +33,8 @@
+  * WATCHDOG are ever written, read-modify-write, each one read back. Gauge
+  * values outside 3800..4500 mV / 0..6000 mA, or an unknown PN: no writes.
+  * Input limit (boot-arg vivachargein, default 2000 mA, 0 = off): D+/D- are on the USB PHY, so BC1.2 says "unknown
+- * adapter" (500 mA); with no USB host on the link the cable is a wall charger and REG00 IINLIM goes to that value
+- * (VINDPM protects a weak adapter); a host configuring the link brings it back to 500 mA.
++ * adapter" (500 mA); unless the Viva Link host tool is active (0182: its heartbeat, not just a configured USB host)
++ * REG00 IINLIM goes to that value (VINDPM protects a weak adapter or port); the tool brings it back to 500 mA.
+  * Charge limit (boot-arg vivachargelimit=N, sysctl kern.viva_chargelimit,
+  * default 100 = off): CHG_CONFIG off at N %, back on below N - 5 %.
+  *
+@@ -409,8 +409,8 @@
+ 	}
+ 	/*
+ 	 * Input limit. D+/D- go to the USB PHY (usb_switch GPIOs left as LK set them), so the charger's BC1.2 detection
+-	 * sees an "unknown adapter" and stays at 500 mA. Without a USB host on the link it is a wall charger: 2000 mA
+-	 * (fInputMa); the charger's VINDPM backs off if the adapter sags. With a host (or SDP/CDP detected): untouched.
++	 * sees an "unknown adapter" and stays at 500 mA. Unless the Viva Link tool is active it gets 2000 mA (fInputMa),
++	 * also from a computer (0182); the charger's VINDPM backs off if the source sags. SDP/CDP detected: untouched.
+ 	 */
+ 	uint32_t vbusStat = s->r[CHG_REG0B] >> 5;
+ 	bool pg = (s->r[CHG_REG0B] & 0x04) != 0;
+@@ -419,7 +419,7 @@
+ 		uint32_t steps = MIN((fInputMa - 100) / 50, (uint32_t)R00_IINLIM);
+ 		chgUpdate(CHG_REG00, R00_IINLIM, (uint8_t)steps);
+ 	} else if (fInputMa != 0 && pg && viva_usb_host_configured() && (s->r[CHG_REG00] & R00_IINLIM) > 8) {
+-		chgUpdate(CHG_REG00, R00_IINLIM, 8);            /* a computer after a charger: back to 500 mA */
++		chgUpdate(CHG_REG00, R00_IINLIM, 8);            /* the Viva Link tool came: back to 500 mA */
+ 	}
+ 	/* charge limit with 5 % hysteresis */
+ 	bool hold = fLimitHold;
+@@ -645,6 +645,15 @@
+ 	pollNow();
+ }
+ 
++/* viva_usb.c: the Viva Link tool came or went (input limit). */
++extern "C" void
++viva_battery_usb_changed(void)
++{
++	if (gVivaBattery != NULL) {
++		gVivaBattery->pollNow();
++	}
++}
++
+ bool
+ VivaBattery::start(IOService *provider)
+ {
