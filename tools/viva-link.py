@@ -11,6 +11,10 @@
   viva-link.py pull PATH [LOCAL]       copy a file from the phone
   viva-link.py run PROGRAM [ARGS..]    run it through vivad, print its output, exit with its status
                                        (PROGRAM without '/' is in /private/var/root/viva-tests)
+  viva-link.py bootrec [hex|show]      edit the VIVABOOT block (next boot's boot-args in userdata, patch 0180)
+                                       in $EDITOR (default vim; EDITOR=nano ...): fields and command line, or
+                                       with `hex` the raw 4096 bytes; written when saved changed. Needs
+                                       /private/var/root/viva-tests/vbootrec (xnu-kernel artifact, tools/vivad)
 
 The phone shows up as 1209:0002 "viva iOS link" (vendor class, bulk 0x81 IN,
 0x01 OUT). Every IN packet is a frame: 'V', type, u16 length, payload with
@@ -74,6 +78,7 @@ class Link:
         self.file = bytearray()             # 'F' frames of a pull
         self.output = bytearray()           # 'O' frames (vivad)
         self.output_event = threading.Event()
+        self.echo_output = True             # print 'O' frames (run_capture turns it off)
         self.lock = threading.Lock()
 
     def frames(self):
@@ -108,8 +113,9 @@ class Link:
                     if self.log:
                         self.log.write(data)
                         self.log.flush()
-                    sys.stdout.buffer.write(data)
-                    sys.stdout.flush()
+                    if self.echo_output:
+                        sys.stdout.buffer.write(data)
+                        sys.stdout.flush()
                     with self.lock:
                         self.output += data
                     self.output_event.set()
@@ -188,6 +194,117 @@ def run(link, args):
             sys.exit(int(e.group(2)) if e.group(1) == b'exit' else 128 + int(e.group(2)))
 
 
+def run_capture(link, args):
+    """Run through vivad; return (output without the "[id] " prefixes, exit status)."""
+    with link.lock:
+        link.output = bytearray()
+    link.echo_output = False
+    reply = link.command('run ' + ' '.join('"%s"' % a if ' ' in a else a for a in args))
+    m = re.search(r'vivad: (\d+) queued', reply)
+    if not m:
+        sys.exit(reply.strip())
+    tag = b'[%s] ' % m.group(1).encode()
+    end = re.compile(rb'\[%s\] (exit|signal) (-?\d+)' % m.group(1).encode())
+    while True:
+        link.output_event.wait(30)
+        link.output_event.clear()
+        with link.lock:
+            out = bytes(link.output)
+        e = end.search(out)
+        if e:
+            break
+    lines = [l[len(tag):] for l in out.split(b'\n') if l.startswith(tag) and not end.match(l)]
+    status = int(e.group(2)) if e.group(1) == b'exit' else 128 + int(e.group(2))
+    return b'\n'.join(lines).decode(errors='replace') + '\n', status
+
+
+TESTS = '/private/var/root/viva-tests'
+
+
+def edit(text, suffix):
+    """Open text in $EDITOR (default vim); return the saved text."""
+    import shlex, subprocess, tempfile
+    with tempfile.NamedTemporaryFile('w', suffix=suffix, delete=False) as f:
+        f.write(text)
+        path = f.name
+    try:
+        subprocess.call(shlex.split(os.environ.get('EDITOR') or 'vim') + [path])
+        return open(path).read()
+    finally:
+        os.unlink(path)
+
+
+def hexdump(data):
+    return ''.join('%04x: %s  |%s|\n' % (o, ' '.join('%02x' % b for b in data[o:o + 16]),
+                   ''.join(chr(b) if 32 <= b < 127 else '.' for b in data[o:o + 16]))
+                   for o in range(0, len(data), 16))
+
+
+def unhexdump(text):
+    out = bytearray()
+    for line in text.splitlines():
+        if not line.strip() or line.startswith('#'):
+            continue
+        body = line.split(':', 1)[1].split('|', 1)[0]
+        out += bytes(int(w, 16) for w in body.split())
+    return bytes(out)
+
+
+def bootrec(link, args):
+    """The VIVABOOT record (shim/vivaboot.h) in an editor; written through vbootrec on the phone."""
+    import tempfile
+    mode = args[0] if args else 'edit'
+    if mode in ('edit', 'show'):
+        text, st = run_capture(link, ['vbootrec', 'text'])
+        if st:
+            sys.exit(text.strip() or 'vbootrec text: exit %d' % st)
+        if mode == 'show':
+            sys.stdout.write(text)
+            return
+        new = edit(text, '.vivaboot.txt')
+        if new == text:
+            print('no changes: nothing written')
+            return
+        local = tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False)
+        local.write(new)
+        local.close()
+        push(link, local.name, TESTS + '/vbootrec-edit.txt', 0o600)
+        os.unlink(local.name)
+        out, st = run_capture(link, ['vbootrec', 'put-text', TESTS + '/vbootrec-edit.txt'])
+    elif mode == 'hex':
+        out, st = run_capture(link, ['vbootrec', 'raw', TESTS + '/vbootrec.bin'])
+        if st:
+            sys.exit(out.strip())
+        local = tempfile.NamedTemporaryFile(suffix='.bin', delete=False)
+        local.close()
+        pull(link, TESTS + '/vbootrec.bin', local.name)
+        data = open(local.name, 'rb').read()
+        text = ('# VIVABOOT block, 4096 bytes (layout: fork/shim/vivaboot.h). Edit the hex bytes; the |ascii| column\n'
+                '# is ignored. Written exactly as saved: line_hash (+0x20) is NOT recomputed here (use `bootrec`).\n'
+                + hexdump(data))
+        new = edit(text, '.vivaboot.hex')
+        if new == text:
+            os.unlink(local.name)
+            print('no changes: nothing written')
+            return
+        raw = unhexdump(new)
+        if len(raw) != 4096:
+            os.unlink(local.name)
+            sys.exit('%d bytes after editing, need 4096: nothing written' % len(raw))
+        open(local.name, 'wb').write(raw)
+        push(link, local.name, TESTS + '/vbootrec.bin', 0o600)
+        os.unlink(local.name)
+        out, st = run_capture(link, ['vbootrec', 'put-raw', TESTS + '/vbootrec.bin'])
+    else:
+        sys.exit('bootrec [hex|show]')
+    sys.stdout.write(out)
+    if st:
+        sys.exit(st)
+    text, _ = run_capture(link, ['vbootrec', 'text'])
+    print('\nnow:')
+    sys.stdout.write(''.join(l + '\n' for l in text.splitlines() if not l.startswith('# Save') and not l.startswith('# flags')))
+
+
 def dump(link, pa, size):
     """Read physical memory with peek (64 words per command)."""
     out = bytearray()
@@ -211,11 +328,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('-o', '--output', help='append the console log to this file')
     ap.add_argument('mode', nargs='?', default='interactive',
-                    choices=('interactive', 'log', 'cmd', 'dump', 'dumpdtb', 'push', 'pull', 'run'))
+                    choices=('interactive', 'log', 'cmd', 'dump', 'dumpdtb', 'push', 'pull', 'run', 'bootrec'))
     ap.add_argument('command', nargs='*')
     a = ap.parse_args()
 
-    link = Link(a.output, show_log=(a.mode not in ('cmd', 'dump', 'dumpdtb', 'push', 'pull', 'run')))
+    link = Link(a.output, show_log=(a.mode not in ('cmd', 'dump', 'dumpdtb', 'push', 'pull', 'run', 'bootrec')))
     threading.Thread(target=link.pump, daemon=True).start()
     if a.mode == 'push':
         if len(a.command) < 2:
@@ -226,6 +343,9 @@ def main():
         if not a.command:
             sys.exit('pull PATH [LOCAL]')
         pull(link, a.command[0], a.command[1] if len(a.command) > 1 else os.path.basename(a.command[0]))
+        return
+    if a.mode == 'bootrec':
+        bootrec(link, a.command)
         return
     if a.mode == 'run':
         if not a.command:

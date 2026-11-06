@@ -11,3 +11,6 @@ file "$OUT"
 # vln (symbolic links: iOS has no ln), next to vivad
 xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -o "$(dirname "$OUT")/vln" "$HERE/vln.c"
 codesign -s - -f "$(dirname "$OUT")/vln"
+# vbootrec (raw VIVABOOT record, tools/viva-link.py bootrec), next to vivad
+xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -O2 -Wall -o "$(dirname "$OUT")/vbootrec" "$HERE/vbootrec.c"
+codesign -s - -f "$(dirname "$OUT")/vbootrec"

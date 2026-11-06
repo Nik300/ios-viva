@@ -622,6 +622,13 @@ write-protects the boot partitions in a normal boot (fastboot can still flash th
   (FNV-1a 64) and saved against this payload's line (base_hash). Anything else = the payload's line, as before; the
   screen says `BOOTFILE ...`. Escape hatches: flashing boot_b with another command line drops the record (other
   base); `vivabootfile=0` in the payload ignores it. Host test: `cc shim/vivaboot_test.c -o shim/out/vt && shim/out/vt`.
+- Edit the block from the Mac: `tools/viva-link.py bootrec` opens it in `$EDITOR` (default vim, `EDITOR=nano`) as
+  key=value fields + `cmdline=`; saved changes are written (line_hash recomputed, seq + 1, `base_hash=payload` = hash of
+  the boot partition's line). `bootrec hex` = the raw 4096 bytes as a hex dump, written exactly as saved; `bootrec show`
+  prints it. Phone side: `vbootrec` (tools/vivad/vbootrec.c, built into the xnu-kernel artifact next to vivad; push it
+  to /private/var/root/viva-tests/vbootrec 755): raw pread/pwrite of /dev/rufsroot0 (writable with ufsrw=1), HFS+
+  overlap check, read back; if the raw device refuses writing it goes through kern.viva_nextbootargs.
+- An empty line through kern.viva_nextbootargs disables the record and is never written into the boot partition.
 
 ### 0146: Viva Manager sysctls (KA1 kern.viva_link, KA2 kern.viva_nextbootargs)
 Spec and behaviour: gpu/docs/RICHIESTE-KERNEL.md (KA1, KA2, "Stato KA1/KA2"). New bsd/dev/viva_sysctl.c; `gpu kv` /

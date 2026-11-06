@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 427dae7..08d7a10 100644
+index 427dae7..c2f7c4d 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -254,6 +254,16 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
@@ -19,6 +19,17 @@ index 427dae7..08d7a10 100644
  		return EIO;
  	}
  	return 0;
+@@ -457,8 +467,8 @@ sweet_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len)
+ 		uint32_t no = 0;
+ 		PE_parse_boot_argn("vivanobootargswrite", &no, sizeof(no));
+ 		size_t n = strnlen(cmdline, len);
+-		if (no || n == len || n >= PAYLOAD_CMDLINE_LEN) {
+-			return no ? EPERM : EINVAL;
++		if (no || n == 0 || n == len || n >= PAYLOAD_CMDLINE_LEN) {
++			return no ? EPERM : EINVAL;       /* 0180: never an empty command line */
+ 		}
+ 		for (size_t i = 0; i < n; i++) {
+ 			if (cmdline[i] < 0x20 || cmdline[i] > 0x7e) {
 @@ -533,9 +543,135 @@ sweet_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len)
  	}
  	printf("SWEET UFS: %s: next boot-args %s (block 0x%llx): \"%s\"\n", part, error ? "NOT written" : "written", lba,
@@ -157,7 +168,7 @@ index 427dae7..08d7a10 100644
  	lck_mtx_unlock(&sweet_ufs_lock);
  	return error;
 diff --git a/bsd/dev/viva_sysctl.c b/bsd/dev/viva_sysctl.c
-index b102c54..f1f5e29 100644
+index b102c54..b4a2144 100644
 --- a/bsd/dev/viva_sysctl.c
 +++ b/bsd/dev/viva_sysctl.c
 @@ -28,6 +28,8 @@ extern void viva_gpu_link(const char *args, char *out, size_t len);         /* i
@@ -203,8 +214,8 @@ index b102c54..f1f5e29 100644
 +viva_next_line_set(char *want, size_t len, const char *payload)
 +{
 +	uint64_t base = sweet_vivaboot_hash(payload);
-+	if (strcmp(want, payload) == 0) {
-+		/* the payload's own line: a record would only repeat it */
++	if (want[0] == 0 || strcmp(want, payload) == 0) {
++		/* empty = back to the payload's line: never an empty command line in the boot partition */
 +		char old[BOOTARGS_MAX + 1];
 +		if (sweet_ufs_bootfile(false, base, old, sizeof(old)) == 0) {
 +			char none[1] = "";
