@@ -1,0 +1,18 @@
+diff --git a/iokit/Kernel/arm/VivaBattery.cpp b/iokit/Kernel/arm/VivaBattery.cpp
+--- a/iokit/Kernel/arm/VivaBattery.cpp
++++ b/iokit/Kernel/arm/VivaBattery.cpp
+@@ -410,12 +410,11 @@
+ 	/*
+ 	 * Input limit. D+/D- go to the USB PHY (usb_switch GPIOs left as LK set them), so the charger's BC1.2 detection
+ 	 * sees an "unknown adapter" and stays at 500 mA. Unless the Viva Link tool is active it gets 2000 mA (fInputMa),
+-	 * also from a computer (0182); the charger's VINDPM backs off if the source sags. SDP/CDP detected: untouched.
++	 * also from a computer (0182), whatever BC1.2 says (0186: a Mac port reads CDP); VINDPM backs off if it sags.
+ 	 */
+ 	uint32_t vbusStat = s->r[CHG_REG0B] >> 5;
+ 	bool pg = (s->r[CHG_REG0B] & 0x04) != 0;
+-	if (fInputMa != 0 && pg && !viva_usb_host_configured() &&
+-	    (vbusStat == VBUS_UNKNOWN || vbusStat == VBUS_NONSTD || vbusStat == VBUS_DCP || vbusStat == VBUS_HVDCP)) {
++	if (fInputMa != 0 && pg && !viva_usb_host_configured() && vbusStat != VBUS_NONE && vbusStat != VBUS_OTG) {
+ 		uint32_t steps = MIN((fInputMa - 100) / 50, (uint32_t)R00_IINLIM);
+ 		chgUpdate(CHG_REG00, R00_IINLIM, (uint8_t)steps);
+ 	} else if (fInputMa != 0 && pg && viva_usb_host_configured() && (s->r[CHG_REG00] & R00_IINLIM) > 8) {

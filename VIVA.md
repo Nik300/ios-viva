@@ -761,3 +761,11 @@ reached the governor's thresholds); 42.9 ms per frame, 32.7 with the clocks fixe
   (`SWEET SURF: WxH fmt pitch A -> B`). Boot-arg `vivasurfpitch=0` = as the client asked. Fixes the GPU copying
   the 1125x2436 pitch-4512 snapshot in and out (23 ms stalls).
 NOT tested on the phone. Compile-checked locally (xnu-cc.py, bt0154 tree with 0182).
+
+0182 on the phone (2026-11-06 night): `FIFO RAM 8192 bytes`; heartbeat seen (`Viva Link active`), without it `inactive`
+after 4 s. vivausbd (launchd com.viva.vivausbd, /usr/libexec/vivausbd) switches to 05ac:12a8: the Mac asked "allow
+accessory" (until allowed the device stays `!registered`), then PTP / Apple USB Multiplexor / viva iOS link interfaces
+matched, macOS usbmuxd lists the device with the UDID, usbmux Connect to 62078 succeeds; viva-link.py reattaches on if2.
+Open: **lockdownd never answers** (also locally on 127.0.0.1:62078 and /var/run/lockdown.sock; no crash): Finder/Image
+Capture need it. VivaIsland tweak works (system island, "Viva Link · USB"). Charger: a Mac port reads vbus_stat 2 (CDP),
+so 0182 left 500 mA -> **0186**: full input on any detected port while the tool is not active.
