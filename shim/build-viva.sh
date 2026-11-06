@@ -8,14 +8,14 @@ STOCK=${1:?usage: build-viva.sh STOCK_BOOT_IMG [PAYLOAD]}
 CFLAGS="--target=aarch64-none-elf -O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -DVIVA"
 mkdir -p out/viva
 OBJS=()
-for f in start.S viva.c console.c fdt.c loader.c; do
+for f in start.S viva.c console.c fdt.c loader.c vivaboot.c; do
 	o=out/viva/${f%.*}.o
 	clang $CFLAGS -c $f -o $o
 	OBJS+=($o)
 done
 # LK puts the Image wherever it likes and nothing relocates it: no absolute
 # pointers may appear in the C objects (start.o's image_size is the exception).
-python3 ../tools/viva-check-abs.py out/viva/viva.o out/viva/console.o out/viva/fdt.o out/viva/loader.o
+python3 ../tools/viva-check-abs.py out/viva/viva.o out/viva/console.o out/viva/fdt.o out/viva/loader.o out/viva/vivaboot.o
 ld.lld -T shim.ld --build-id=none -N "${OBJS[@]}" -o out/viva/shim.elf
 ld.lld -T shim.ld --build-id=none -N "${OBJS[@]}" --oformat=binary -o out/viva/Image
 size=$(python3 ../tools/viva-check-abs.py --symbol _end out/viva/shim.elf)

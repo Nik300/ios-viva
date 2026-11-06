@@ -1,0 +1,277 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 427dae7..08d7a10 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -254,6 +254,16 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+ 		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
++		/* CHECK CONDITION: the fixed-format sense data in the response UPIU's data segment (length at 32, data at 34) */
++		if (!ocs && ucd->resp[0] == 0x21 && ucd->resp[7] == 0x02 && (ucd->resp[32] << 8 | ucd->resp[33]) >= 14) {
++			const uint8_t *sense = &ucd->resp[34];
++			unsigned key = sense[2] & 0xf;
++			printf("SWEET UFS: sense key 0x%x asc 0x%02x ascq 0x%02x%s\n", key, sense[12], sense[13],
++			    key == 0x7 ? " (DATA PROTECT: write-protected)" : "");
++			if (key == 0x7) {
++				return EROFS;
++			}
++		}
+ 		return EIO;
+ 	}
+ 	return 0;
+@@ -533,9 +543,135 @@ sweet_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len)
+ 	}
+ 	printf("SWEET UFS: %s: next boot-args %s (block 0x%llx): \"%s\"\n", part, error ? "NOT written" : "written", lba,
+ 	    cmdline);
+-	if (error && error != EPERM) {
++	if (error && error != EPERM && error != EROFS) {
++		error = EIO;
++	}
++out:
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
++/*
++ * 0180: the VIVABOOT record (fork/shim/vivaboot.h, same layout), because LK write-protects boot_a/boot_b while iOS
++ * runs (WRITE(10) -> CHECK CONDITION, DATA PROTECT). The first 4 KiB block of the root partition's last MiB, outside
++ * the HFS+ volume (checked from its header before every write); the shim reads it before XNU and uses its command line
++ * while the boot partition's payload still holds base_hash's. Writes need ufsrw=1 and go through ufs_write_blocks(),
++ * so they stay inside the root partition; the block is read back and compared.
++ */
++#define VIVABOOT_TAIL_BLOCKS    256u
++#define VIVABOOT_LINE           608
++
++struct vivaboot_rec {
++	char magic[8];
++	uint32_t version;
++	uint32_t flags;                         /* bit 0: enabled */
++	uint64_t base_hash;                     /* FNV-1a 64 of the payload command line it replaces */
++	uint64_t seq;
++	uint64_t line_hash;                     /* FNV-1a 64 of cmdline */
++	uint8_t reserved[24];
++	char cmdline[VIVABOOT_LINE];
++};
++_Static_assert(sizeof(struct vivaboot_rec) == 672, "VIVABOOT layout (shim/vivaboot.h)");
++
++uint64_t sweet_vivaboot_hash(const char *s);
++int sweet_ufs_bootfile(bool write, uint64_t base, char *cmdline, size_t len);
++
++uint64_t
++sweet_vivaboot_hash(const char *s)
++{
++	uint64_t h = 0xcbf29ce484222325ULL;
++	for (unsigned i = 0; i < VIVABOOT_LINE && s[i]; i++) {
++		h ^= (uint8_t)s[i];
++		h *= 0x100000001b3ULL;
++	}
++	return h;
++}
++
++/*
++ * Read: the record's command line into cmdline when it is enabled, valid and for base (else ENOENT).
++ * Write: cmdline (empty = disable the record) for base. EROFS without ufsrw=1, ENOSPC when the HFS+ volume
++ * reaches the record's block, EINVAL for a bad string, EIO.
++ */
++int
++sweet_ufs_bootfile(bool write, uint64_t base, char *cmdline, size_t len)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	static uint8_t blk[UFS_BLOCK];
++	int error = 0;
++
++	if (!su.ready || su.nblocks <= VIVABOOT_TAIL_BLOCKS) {
++		return ENXIO;
++	}
++	size_t n = strnlen(cmdline, len);
++	if (write) {
++		if (!su.writable) {
++			return EROFS;
++		}
++		if (n == len || n >= VIVABOOT_LINE) {
++			return EINVAL;
++		}
++		for (size_t i = 0; i < n; i++) {
++			if (cmdline[i] < 0x20 || cmdline[i] > 0x7e) {
++				return EINVAL;
++			}
++		}
++	}
++	uint64_t lba = su.first_block + su.nblocks - VIVABOOT_TAIL_BLOCKS;
++	lck_mtx_lock(&sweet_ufs_lock);
++	if (write) {
++		/* HFS+/HFSX volume header at +1024: block size (BE32 @40), total blocks (BE32 @44) */
++		if ((error = ufs_read_blocks(su.first_block, 1)) != 0) {
++			goto out;
++		}
++		const uint8_t *vh = b + 1024;
++		uint16_t sig = (uint16_t)(vh[0] << 8 | vh[1]);
++		uint64_t bsize = (uint64_t)vh[40] << 24 | vh[41] << 16 | vh[42] << 8 | vh[43];
++		uint64_t total = (uint64_t)vh[44] << 24 | vh[45] << 16 | vh[46] << 8 | vh[47];
++		if ((sig != 0x482b && sig != 0x4858) || bsize == 0 || bsize * total > (lba - su.first_block) * UFS_BLOCK) {
++			printf("SWEET UFS: VIVABOOT: volume 0x%x of %llu bytes reaches the record's block\n", sig, bsize * total);
++			error = ENOSPC;
++			goto out;
++		}
++	}
++	if ((error = ufs_read_blocks(lba, 1)) != 0) {
++		goto out;
++	}
++	struct vivaboot_rec rec;
++	memcpy(&rec, b, sizeof(rec));
++	if (!write) {
++		bool ok = memcmp(rec.magic, "VIVABOOT", 8) == 0 && rec.version == 1 && (rec.flags & 1) && rec.base_hash == base &&
++		    strnlen(rec.cmdline, VIVABOOT_LINE) < VIVABOOT_LINE && sweet_vivaboot_hash(rec.cmdline) == rec.line_hash;
++		if (!ok) {
++			error = ENOENT;
++			goto out;
++		}
++		strlcpy(cmdline, rec.cmdline, len);
++		goto out;
++	}
++	uint64_t seq = memcmp(rec.magic, "VIVABOOT", 8) == 0 ? rec.seq + 1 : 1;
++	bzero(&rec, sizeof(rec));
++	memcpy(rec.magic, "VIVABOOT", 8);
++	rec.version = 1;
++	rec.flags = n ? 1 : 0;
++	rec.base_hash = base;
++	rec.seq = seq;
++	memcpy(rec.cmdline, cmdline, n);
++	rec.line_hash = sweet_vivaboot_hash(rec.cmdline);
++	bzero(blk, sizeof(blk));
++	memcpy(blk, &rec, sizeof(rec));
++	memcpy((void *)(su.dma + DMA_BOUNCE), blk, UFS_BLOCK);
++	error = ufs_write_blocks(lba, 1);
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	if (!error) {
++		error = ufs_read_blocks(lba, 1);
++	}
++	if (!error && memcmp(b, blk, UFS_BLOCK) != 0) {
+ 		error = EIO;
+ 	}
++	printf("SWEET UFS: VIVABOOT %s (block 0x%llx, seq %llu): \"%s\"\n", error ? "NOT written" : n ? "written" : "disabled",
++	    lba, seq, n ? cmdline : "");
+ out:
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	return error;
+diff --git a/bsd/dev/viva_sysctl.c b/bsd/dev/viva_sysctl.c
+index b102c54..f1f5e29 100644
+--- a/bsd/dev/viva_sysctl.c
++++ b/bsd/dev/viva_sysctl.c
+@@ -28,6 +28,8 @@ extern void viva_gpu_link(const char *args, char *out, size_t len);         /* i
+ extern void viva_cpufreq_link(const char *args, char *out, size_t len);     /* osfmk/arm64/viva_cpufreq.c */
+ extern void viva_disp_link(const char *args, char *out, size_t len);        /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+ extern int sweet_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len); /* bsd/dev/sweet_ufs.c */
++extern int sweet_ufs_bootfile(bool write, uint64_t base, char *cmdline, size_t len);     /* bsd/dev/sweet_ufs.c, 0180 */
++extern uint64_t sweet_vivaboot_hash(const char *s);
+ 
+ #define VL_CMD_MAX      256
+ #define VL_REPLY_MAX    8192
+@@ -158,17 +160,70 @@ viva_bootargs_remember(void)
+ 	}
+ }
+ 
++/*
++ * 0180: LK write-protects the boot partitions while iOS runs, so a line that cannot go into the payload goes into the
++ * VIVABOOT record in userdata (sweet_ufs_bootfile), which the shim reads before XNU while the payload still holds the
++ * line it was saved against. viva_bootargs_src: where the next boot's line comes from.
++ */
++static int viva_bootpart_wp = -1;               /* boot partition: -1 unknown, 0 writable, 1 write-protected */
++static const char *viva_bootargs_src = "payload";
++
++/* viva_sysctl_mtx held. The next boot's command line: the VIVABOOT record if it applies, else the payload's. */
++static int
++viva_next_line(char *cur, size_t len, char *payload, size_t plen)
++{
++	int error = sweet_ufs_bootargs(viva_boot_part(), false, payload, plen);
++	if (error) {
++		return error;
++	}
++	if (sweet_ufs_bootfile(false, sweet_vivaboot_hash(payload), cur, len) == 0) {
++		viva_bootargs_src = "vivaboot";
++	} else {
++		strlcpy(cur, payload, len);
++		viva_bootargs_src = "payload";
++	}
++	return 0;
++}
++
++/* viva_sysctl_mtx held. Payload first (it fails while LK's write protection is on), else the VIVABOOT record. */
++static int
++viva_next_line_set(char *want, size_t len, const char *payload)
++{
++	uint64_t base = sweet_vivaboot_hash(payload);
++	if (strcmp(want, payload) == 0) {
++		/* the payload's own line: a record would only repeat it */
++		char old[BOOTARGS_MAX + 1];
++		if (sweet_ufs_bootfile(false, base, old, sizeof(old)) == 0) {
++			char none[1] = "";
++			return sweet_ufs_bootfile(true, base, none, sizeof(none));
++		}
++		return 0;
++	}
++	int error = viva_bootpart_wp == 1 ? EROFS : sweet_ufs_bootargs(viva_boot_part(), true, want, len);
++	if (error == 0) {
++		viva_bootpart_wp = 0;
++		return 0;               /* the payload changed: an old record no longer applies (other base) */
++	}
++	if (error != EROFS && error != EIO) {
++		return error;
++	}
++	if (error == EROFS) {
++		viva_bootpart_wp = 1;
++	}
++	return sweet_ufs_bootfile(true, base, want, len);
++}
++
+ static int
+ sysctl_viva_nextbootargs SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(oidp, arg1, arg2)
+-	char cur[BOOTARGS_MAX + 1], want[BOOTARGS_MAX + 1];
++	char cur[BOOTARGS_MAX + 1], want[BOOTARGS_MAX + 1], payload[BOOTARGS_MAX + 1];
+ 	int error;
+ 
+ 	bzero(cur, sizeof(cur));
+ 	lck_mtx_lock(&viva_sysctl_mtx);
+ 	viva_bootargs_remember();
+-	error = sweet_ufs_bootargs(viva_boot_part(), false, cur, sizeof(cur));
++	error = viva_next_line(cur, sizeof(cur), payload, sizeof(payload));
+ 	lck_mtx_unlock(&viva_sysctl_mtx);
+ 	if (error) {
+ 		return error;
+@@ -194,11 +249,31 @@ sysctl_viva_nextbootargs SYSCTL_HANDLER_ARGS
+ 		want[--n] = 0;
+ 	}
+ 	lck_mtx_lock(&viva_sysctl_mtx);
+-	error = sweet_ufs_bootargs(viva_boot_part(), true, want, sizeof(want));
++	error = sweet_ufs_bootargs(viva_boot_part(), false, payload, sizeof(payload));
++	if (!error) {
++		error = viva_next_line_set(want, sizeof(want), payload);
++	}
+ 	lck_mtx_unlock(&viva_sysctl_mtx);
+ 	return error;
+ }
+ 
++static int
++sysctl_viva_nextbootargs_src SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char cur[BOOTARGS_MAX + 1], payload[BOOTARGS_MAX + 1], out[96];
++	lck_mtx_lock(&viva_sysctl_mtx);
++	int error = viva_next_line(cur, sizeof(cur), payload, sizeof(payload));
++	snprintf(out, sizeof(out), "%s %s", error ? "error" : viva_bootargs_src,
++	    viva_bootpart_wp == 1 ? "boot-partition-write-protected" : viva_bootpart_wp == 0 ? "boot-partition-writable" :
++	    "boot-partition-untested");
++	lck_mtx_unlock(&viva_sysctl_mtx);
++	return SYSCTL_OUT(req, out, strlen(out) + 1);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, viva_nextbootargs_src, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, sysctl_viva_nextbootargs_src, "A", "where the next boot's command line comes from (0180)");
++
+ SYSCTL_PROC(_kern, OID_AUTO, viva_nextbootargs, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     0, 0, sysctl_viva_nextbootargs, "A", "boot-args of the next boot (KA2)");
+ 

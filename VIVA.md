@@ -605,6 +605,24 @@ Patch 0144 (NOT tested), the iOS pipeline as hakios-xnu-kernel / ios-sapphire do
 - Link: `wifi up`, `wifi join SSID [PASSPHRASE]` (SSID without spaces), `wifi leave`, `wifi sta` (counters + what
   wifid asked), `wifi off`.
 
+### 0180: boot-args of the next boot in userdata (VIVABOOT), read by the shim
+Found on the phone (2026-11-06): writing boot_b from iOS fails, `SWEET UFS: command 0x2a failed: ocs 0x0 upiu 0x21
+response 0x1 status 0x2` (CHECK CONDITION) on every Viva Manager save, while root writes on the same LUN 2 work: LK
+write-protects the boot partitions in a normal boot (fastboot can still flash them).
+- Kernel (0180, bsd/dev/sweet_ufs.c): a CHECK CONDITION prints the sense data (`sense key 0x7 ... DATA PROTECT`) and
+  returns EROFS. `sweet_ufs_bootfile()` reads/writes the VIVABOOT record: the first 4 KiB block of the last MiB of the
+  root partition (`userdata`), written only if the HFS+ volume header says the volume ends before it (16 GiB image vs
+  109735 MiB partition), through `ufs_write_blocks()` (ufsrw=1, root partition bounds), read back and compared.
+- `kern.viva_nextbootargs` (viva_sysctl.c): write tries the payload in boot_b first; on EROFS (remembered for the boot)
+  or EIO it writes the record instead; the payload's own line disables the record. Read = the line the next boot uses.
+  `kern.viva_nextbootargs_src` = `vivaboot|payload boot-partition-write-protected|writable|untested`.
+- Shim (shim/vivaboot.c, .h = layout and validation shared with the kernel): before copying XNU it takes the UFS
+  request list from LK (as sweet_ufs.c, READ(10) only, 1 s timeouts, LK's list given back), finds `ufsroot=`
+  (default userdata) on `ufslun=` (default 2) in the GPT, reads the record and uses its line if it is enabled, intact
+  (FNV-1a 64) and saved against this payload's line (base_hash). Anything else = the payload's line, as before; the
+  screen says `BOOTFILE ...`. Escape hatches: flashing boot_b with another command line drops the record (other
+  base); `vivabootfile=0` in the payload ignores it. Host test: `cc shim/vivaboot_test.c -o shim/out/vt && shim/out/vt`.
+
 ### 0146: Viva Manager sysctls (KA1 kern.viva_link, KA2 kern.viva_nextbootargs)
 Spec and behaviour: gpu/docs/RICHIESTE-KERNEL.md (KA1, KA2, "Stato KA1/KA2"). New bsd/dev/viva_sysctl.c; `gpu kv` /
 `disp kv` in VivaGPU.cpp / SweetFramebuffer.cpp (also on the USB link); `stat` moved to viva_link_stat() in

@@ -11,6 +11,9 @@
 #include "console.h"
 #include "fdt.h"
 #include "loader.h"
+#ifdef VIVA
+const char *viva_bootfile(const char *payload_cmdline);	/* vivaboot.c */
+#endif
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
@@ -96,6 +99,11 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex("VIRT", p->virt_base);
 	con_hex("ENTRY", p->entry_va);
 
+#ifdef VIVA
+	/* boot-args saved by Viva Manager in userdata (VIVABOOT), read before the kernel is copied anywhere */
+	const char *cmdline = viva_bootfile(p->cmdline);
+#endif
+
 	/* The payload must not overlap where the kernel goes. */
 	if (rd_end > p->phys_base && rd_start < p->phys_base + p->mem_size)
 		return "ramdisk overlaps kernel memory";
@@ -131,8 +139,13 @@ const char *loader_boot(uintptr_t dtb)
 	ba->Video.v_depth = 32;
 	ba->deviceTreeP = adt_pa - pa_of_va_base;	/* xnu reads it with the MMU on: a VA */
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
+#ifdef VIVA
+	const char *line = cmdline;
+#else
+	const char *line = p->cmdline;
+#endif
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
-		ba->CommandLine[i] = p->cmdline[i];
+		ba->CommandLine[i] = line[i];
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
