@@ -1,0 +1,379 @@
+diff --git a/iokit/Kernel/arm/VivaMDP.cpp b/iokit/Kernel/arm/VivaMDP.cpp
+--- a/iokit/Kernel/arm/VivaMDP.cpp
++++ b/iokit/Kernel/arm/VivaMDP.cpp
+@@ -1,25 +1,368 @@
+ /*
+- * viva (MT6781): MDP backend of AppleM2ScalerCSCDriver (VivaScaler.h). Placeholder until the engine sequence is
+- * validated on the phone (gpu/docs/MDP-MT6781.md): no engine is touched, every transfer is left to the CPU.
++ * viva (MT6781): MDP backend of AppleM2ScalerCSCDriver (VivaScaler.h): NV12 (420v/420f) -> BGRA at the same size on
++ * the MDP engines RDMA0 -> WROT0, without the GCE command queue and without the SCP (MediaTek's userspace
++ * libdpframework normally programs these engines; nothing public describes MT6781's values).
++ *
++ * Everything below was found by hand on the phone over the USB link (2026-11-06, gpu/docs/MDP-MT6781.md §10):
++ * - MDP sits in the display's power domain (DIS): only usable while the panel is on (SPM status bit 21); when the
++ *   screen goes off the domain loses the clocks and every register, so each transfer sets everything up again.
++ * - clocks: MDPSYS_CG_CLR0 (0x1B000108) = 0xBC1 (RDMA0, SMI0, APB, WROT0, RSZ0, MUTEX0).
++ * - larb2: CMD_THRT 0x370256, SW_FLAG 1, OSTD 6/6/6/6/1, ports 0 (RDMA0), 1 and 2 (WROT0) = 0x8 (out of the M4U:
++ *   physical addresses below 4 GiB).
++ * - engine reset: the system reset MMSYS_SW0_RST_B (0x1B000700) = ~0x301 then all ones. WROT's own soft reset
++ *   (0x1B00A010) sticks forever when the engine never finished a frame.
++ * - routing RDMA0 -> WROT0 directly: RDMA0_MOUT_EN (0x1B000F20) = 0x2, WROT0_SEL_IN (0x1B000F70) = 0.
++ * - RDMA source format codes on this chip differ from the MML/mdp3 sources: SRC_CON = 0x60E for BGRA,
++ *   0x201 for NV12 4:2:0 (code 1, chroma interpolated horizontally), code 5 = NV16.
++ * - WROT writes BGRA with VIDO_CTRL 0xA0005002; YUV -> RGB with VIDO_MAT_CTRL (mat_sel << 4) | 1: 4 = BT.601 full
++ *   range, 6 = BT.601 video, 7 = BT.709 video.
++ * - start: MUTEX0 MOD0 = RDMA0 | WROT0 (0x81), SOF = 0 (single), EN = 1; end: VIDO_INT_EN = 0x300 selects the
++ *   debug word 0x1B00A0D0 whose bit 0 = frame done.
++ * Frames are done in vertical strips of at most 512 pixels (WROT's single-tile width, MT6893 value; MT6781's is
++ * not known). Surfaces that are not physically contiguous below 4 GiB go through bounce buffers.
++ *
++ * Boot-arg vivascaler=2 enables it (VivaScaler.cpp); vivamdpmax = largest frame in pixels for the bounce buffers
++ * (default 1920x1088).
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++
+ #include "VivaScaler.h"
++#include "SweetSurface.h"
+ 
++#define FOURCC(a, b, c, d)      (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
++#define PF_BGRA                 FOURCC('B', 'G', 'R', 'A')
++#define PF_420V                 FOURCC('4', '2', '0', 'v')
++#define PF_420F                 FOURCC('4', '2', '0', 'f')
++
++#define PA_SPM                  0x10006000ull
++#define PA_MDPSYS               0x1B000000ull   /* config, mutex, larb2, RDMA0 ... WROT0: one 64 KiB window */
++#define SPM_PWR_STATUS          0x16c
++#define DIS_STATUS              (1u << 21)
++
++/* mdpsys_config */
++#define CG_CON0                 0x0100
++#define CG_CLR0                 0x0108
++#define CG_MDP                  0xbc1
++#define SW0_RST_B               0x0700
++#define MOUT_RST                0x0f00
++#define RDMA0_MOUT_EN           0x0f20
++#define WROT0_SEL_IN            0x0f70
++/* mutex 0 */
++#define MUTEX0_EN               0x1020
++#define MUTEX0_SOF              0x102c
++#define MUTEX0_MOD0             0x1030
++#define MUTEX0_MOD1             0x1034
++/* larb2 */
++#define LARB_CMD_THRT           0x2024
++#define LARB_SW_FLAG            0x2040
++#define LARB_OSTD(p)            (0x2200 + 4 * (p))
++#define LARB_PORT(p)            (0x2380 + 4 * (p))
++/* RDMA0 */
++#define RDMA_EN                 0x3000
++#define RDMA_CON                0x3020
++#define RDMA_GMCIF_CON          0x3028
++#define RDMA_SRC_CON            0x3030
++#define RDMA_COMP_CON           0x3038
++#define RDMA_MF_BKGD            0x3060
++#define RDMA_MF_SRC_SIZE        0x3070
++#define RDMA_MF_CLIP_SIZE       0x3078
++#define RDMA_MF_OFFSET_1        0x3080
++#define RDMA_SF_BKGD            0x3090
++#define RDMA_SRC_END_0          0x3100
++#define RDMA_SRC_END_1          0x3108
++#define RDMA_SRC_OFFSET_0       0x3118
++#define RDMA_SRC_OFFSET_1       0x3120
++#define RDMA_SRC_OFFSET_2       0x3128
++#define RDMA_TRANSFORM_0        0x3200
++#define RDMA_SRC_BASE_0         0x3f00
++#define RDMA_SRC_BASE_1         0x3f08
++/* RSZ0 (out of the path, kept disabled) */
++#define RSZ_ENABLE              0x8000
++/* WROT0 */
++#define WROT_CTRL               0xa000
++#define WROT_MAIN_BUF           0xa008
++#define WROT_INT_EN             0xa018
++#define WROT_CROP_OFST          0xa020
++#define WROT_TAR_SIZE           0xa024
++#define WROT_OFST_ADDR          0xa02c
++#define WROT_STRIDE             0xa030
++#define WROT_OFST_ADDR_C        0xa038
++#define WROT_STRIDE_C           0xa03c
++#define WROT_CTRL_2             0xa048
++#define WROT_DITHER             0xa054
++#define WROT_OFST_ADDR_V        0xa068
++#define WROT_STRIDE_V           0xa06c
++#define WROT_EOL_SEL            0xa070
++#define WROT_PREULTRA           0xa074
++#define WROT_IN_SIZE            0xa078
++#define WROT_ROT_EN             0xa07c
++#define WROT_MAT_CTRL           0xa084
++#define WROT_DEBUG              0xa0d0
++#define WROT_SCAN_10BIT         0xa0dc
++#define WROT_PENDING_ZERO       0xa0e0
++#define WROT_BASE               0xaf00
++#define WROT_BASE_C             0xaf04
++#define WROT_BASE_V             0xaf08
++
++#define MDP_TILE_W              512
++#define MDP_TIMEOUT_MS          100
++
++struct viva_mdp {
++	IOMemoryMap *spm, *mdp;
++	IOBufferMemoryDescriptor *srcBuf, *dstBuf;
++	uint64_t srcPA, dstPA;
++	size_t srcSize, dstSize;
++	uint64_t frames, strips, timeouts;
++};
++
++static inline uint32_t rd(IOMemoryMap *m, uint32_t off) { return *(volatile uint32_t *)(m->getVirtualAddress() + off); }
++static inline void wr(IOMemoryMap *m, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(m->getVirtualAddress() + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static IOMemoryMap *
++mapRegs(uint64_t pa, uint32_t size)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
++	IOMemoryMap *m = md != NULL ? md->map(kIOMapInhibitCache) : NULL;
++	OSSafeReleaseNULL(md);
++	return m;
++}
++
++static IOBufferMemoryDescriptor *
++contiguous(size_t size, uint64_t *pa)
++{
++	IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000fffff000ull);
++	if (b == NULL) {
++		return NULL;
++	}
++	IOByteCount len = 0;
++	*pa = b->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
++	if (*pa == 0 || len < size || *pa + size > (1ull << 32)) {
++		b->release();
++		return NULL;
++	}
++	return b;
++}
++
++static void
++cacheClean(const void *p, size_t len)
++{
++	uintptr_t a = (uintptr_t)p & ~(uintptr_t)63, end = (uintptr_t)p + len;
++	for (; a < end; a += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r"(a) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
+ struct viva_mdp *
+ viva_mdp_create(void)
+ {
+-	return NULL;
++	uint32_t maxPixels = 1920 * 1088;
++	PE_parse_boot_argn("vivamdpmax", &maxPixels, sizeof(maxPixels));
++	struct viva_mdp *m = (struct viva_mdp *)IOMallocZero(sizeof(*m));
++	if (m == NULL) {
++		return NULL;
++	}
++	m->spm = mapRegs(PA_SPM, 0x1000);
++	m->mdp = mapRegs(PA_MDPSYS, 0x10000);
++	m->srcSize = round_page((size_t)maxPixels * 3 / 2 + 4096);
++	m->dstSize = round_page((size_t)maxPixels * 4 + 4096);
++	m->srcBuf = contiguous(m->srcSize, &m->srcPA);
++	m->dstBuf = contiguous(m->dstSize, &m->dstPA);
++	if (m->spm == NULL || m->mdp == NULL || m->srcBuf == NULL || m->dstBuf == NULL) {
++		OSSafeReleaseNULL(m->spm);
++		OSSafeReleaseNULL(m->mdp);
++		OSSafeReleaseNULL(m->srcBuf);
++		OSSafeReleaseNULL(m->dstBuf);
++		IOFreeType(m, struct viva_mdp);
++		return NULL;
++	}
++	IOLog("VIVA MDP: NV12 -> BGRA on RDMA0 -> WROT0 (bounce buffers for %u pixels)\n", maxPixels);
++	return m;
+ }
+ 
++/* Clocks, larb2, engine reset, routing: every time (the DIS domain may have been off since the last frame). */
++static bool
++setup(struct viva_mdp *m)
++{
++	if (!(rd(m->spm, SPM_PWR_STATUS) & DIS_STATUS)) {
++		return false;           /* panel off: the MDP is unpowered, the CPU does it */
++	}
++	wr(m->mdp, CG_CLR0, CG_MDP);
++	if (rd(m->mdp, CG_CON0) & CG_MDP) {
++		return false;
++	}
++	wr(m->mdp, LARB_CMD_THRT, 0x00370256);
++	wr(m->mdp, LARB_SW_FLAG, 1);
++	for (uint32_t p = 0; p < 4; p++) {
++		wr(m->mdp, LARB_OSTD(p), 6);
++	}
++	wr(m->mdp, LARB_OSTD(4), 1);
++	for (uint32_t p = 0; p < 3; p++) {
++		wr(m->mdp, LARB_PORT(p), 0x8);
++	}
++	wr(m->mdp, SW0_RST_B, ~0x301u);
++	wr(m->mdp, SW0_RST_B, 0xffffffffu);
++	wr(m->mdp, RSZ_ENABLE, 0);
++	wr(m->mdp, MOUT_RST, 4);
++	wr(m->mdp, MOUT_RST, 0);
++	wr(m->mdp, RDMA0_MOUT_EN, 0x2);
++	wr(m->mdp, WROT0_SEL_IN, 0);
++	wr(m->mdp, MUTEX0_MOD0, 0x81);
++	wr(m->mdp, MUTEX0_MOD1, 0);
++	wr(m->mdp, MUTEX0_SOF, 0);
++	return true;
++}
++
++/* One strip: NV12 (y, uv at physical addresses, stride ys) -> BGRA (dst, stride ds), w x h pixels. */
++static bool
++strip(struct viva_mdp *m, uint64_t y, uint64_t uv, uint32_t ys, uint64_t dst, uint32_t ds, uint32_t w, uint32_t h,
++    uint32_t mat)
++{
++	wr(m->mdp, SW0_RST_B, ~0x301u);
++	wr(m->mdp, SW0_RST_B, 0xffffffffu);
++	wr(m->mdp, RDMA_GMCIF_CON, 0x00010071);
++	wr(m->mdp, RDMA_SRC_CON, 0x201);
++	wr(m->mdp, RDMA_COMP_CON, 0);
++	wr(m->mdp, RDMA_CON, 0x1010);
++	wr(m->mdp, RDMA_SRC_BASE_0, (uint32_t)y);
++	wr(m->mdp, RDMA_SRC_BASE_1, (uint32_t)uv);
++	wr(m->mdp, RDMA_SRC_END_0, (uint32_t)(y + (uint64_t)ys * (h - 1) + w - 1));
++	wr(m->mdp, RDMA_SRC_END_1, (uint32_t)(uv + (uint64_t)ys * (h / 2 - 1) + w - 1));
++	wr(m->mdp, RDMA_MF_BKGD, ys);
++	wr(m->mdp, RDMA_SF_BKGD, ys);
++	wr(m->mdp, RDMA_TRANSFORM_0, 0);
++	wr(m->mdp, RDMA_SRC_OFFSET_0, 0);
++	wr(m->mdp, RDMA_SRC_OFFSET_1, 0);
++	wr(m->mdp, RDMA_SRC_OFFSET_2, 0);
++	wr(m->mdp, RDMA_MF_SRC_SIZE, (h << 16) | w);
++	wr(m->mdp, RDMA_MF_CLIP_SIZE, (h << 16) | w);
++	wr(m->mdp, RDMA_MF_OFFSET_1, 0);
++	wr(m->mdp, RDMA_EN, 1);
++	wr(m->mdp, WROT_CTRL, 0xa0005002);
++	wr(m->mdp, WROT_BASE, (uint32_t)dst);
++	wr(m->mdp, WROT_BASE_C, 0);
++	wr(m->mdp, WROT_BASE_V, 0);
++	wr(m->mdp, WROT_STRIDE, ds);
++	wr(m->mdp, WROT_STRIDE_C, 0);
++	wr(m->mdp, WROT_STRIDE_V, 0);
++	wr(m->mdp, WROT_CTRL_2, 0);
++	wr(m->mdp, WROT_SCAN_10BIT, 0);
++	wr(m->mdp, WROT_PENDING_ZERO, 0);
++	wr(m->mdp, WROT_MAT_CTRL, mat);
++	wr(m->mdp, WROT_DITHER, 0xff000000);
++	wr(m->mdp, WROT_EOL_SEL, 0x80000000);
++	wr(m->mdp, WROT_PREULTRA, 0x00060010);
++	wr(m->mdp, WROT_OFST_ADDR, 0);
++	wr(m->mdp, WROT_OFST_ADDR_C, 0);
++	wr(m->mdp, WROT_OFST_ADDR_V, 0);
++	wr(m->mdp, WROT_IN_SIZE, (h << 16) | w);
++	wr(m->mdp, WROT_TAR_SIZE, (h << 16) | w);
++	wr(m->mdp, WROT_CROP_OFST, 0);
++	wr(m->mdp, WROT_MAIN_BUF, (w << 16) | (32 << 8));
++	wr(m->mdp, WROT_ROT_EN, 1);
++	wr(m->mdp, WROT_INT_EN, 0x300);
++	wr(m->mdp, MUTEX0_EN, 1);
++	uint64_t deadline;
++	clock_interval_to_deadline(MDP_TIMEOUT_MS, kMillisecondScale, &deadline);
++	bool done = false;
++	while (!(done = rd(m->mdp, WROT_DEBUG) & 1) && mach_absolute_time() < deadline) {
++		IODelay(20);
++	}
++	wr(m->mdp, WROT_ROT_EN, 0);
++	wr(m->mdp, RDMA_EN, 0);
++	wr(m->mdp, MUTEX0_EN, 0);
++	return done;
++}
++
++/* Physical address of a whole surface when it is one contiguous range below 4 GiB, else 0. */
++static uint64_t
++contiguousPA(SweetSurface *s)
++{
++	IOByteCount len = 0;
++	uint64_t pa = s->memory->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
++	return pa != 0 && len >= s->allocSize && pa + s->allocSize <= (1ull << 32) ? pa : 0;
++}
++
+ IOReturn
+-viva_mdp_transfer(__unused struct viva_mdp *mdp, __unused SweetSurface *src, __unused SweetSurface *dst,
+-    __unused uint32_t sx, __unused uint32_t sy, __unused uint32_t sw, __unused uint32_t sh, __unused uint32_t dx,
+-    __unused uint32_t dy, __unused uint32_t dw, __unused uint32_t dh, __unused uint64_t flags)
++viva_mdp_transfer(struct viva_mdp *m, SweetSurface *src, SweetSurface *dst, uint32_t sx, uint32_t sy, uint32_t sw,
++    uint32_t sh, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh, uint64_t flags)
+ {
+-	return kIOReturnUnsupported;
++	/* NV12 -> BGRA, whole surfaces, same size, no transform */
++	if ((src->pixelFormat != PF_420V && src->pixelFormat != PF_420F) || src->planeCount < 2 ||
++	    dst->pixelFormat != PF_BGRA || dst->bytesPerElement != 4 || (flags & kVivaScalerFlagTransformMask)) {
++		return kIOReturnUnsupported;
++	}
++	uint32_t w = src->width & ~1u, h = src->height & ~1u;
++	if (sx || sy || dx || dy || ((sw || sh) && (sw != (w << 16) || sh != (h << 16))) || ((dw || dh) && (dw != w || dh != h)) ||
++	    dst->width < w || dst->height < h || w < 16 || h < 16 || w > 8190 || h > 8190) {
++		return kIOReturnUnsupported;
++	}
++	uint32_t ys = src->planes[0].bytesPerRow, cs = src->planes[1].bytesPerRow, ds = dst->bytesPerRow;
++	if (ys != cs || (ys & 15) || (ds & 15)) {
++		return kIOReturnUnsupported;
++	}
++	size_t ySize = (size_t)ys * h, cSize = (size_t)ys * (h / 2), dSize = (size_t)ds * h;
++	uint64_t spa = contiguousPA(src), dpa = contiguousPA(dst);
++	uint64_t yPA, cPA, oPA;
++	bool bounceIn = spa == 0, bounceOut = dpa == 0;
++	if ((bounceIn && ySize + cSize > m->srcSize) || (bounceOut && dSize > m->dstSize)) {
++		return kIOReturnUnsupported;
++	}
++	if (!setup(m)) {
++		return kIOReturnNotReady;
++	}
++	uintptr_t sk = src->kernelAddress(), dk = dst->kernelAddress();
++	if ((bounceIn && sk == 0) || (bounceOut && dk == 0)) {
++		return kIOReturnNoMemory;
++	}
++	if (bounceIn) {
++		uint8_t *b = (uint8_t *)m->srcBuf->getBytesNoCopy();
++		memcpy(b, (const uint8_t *)sk + src->planes[0].offset, ySize);
++		memcpy(b + ySize, (const uint8_t *)sk + src->planes[1].offset, cSize);
++		cacheClean(b, ySize + cSize);
++		yPA = m->srcPA;
++		cPA = m->srcPA + ySize;
++	} else {
++		yPA = spa + src->planes[0].offset;
++		cPA = spa + src->planes[1].offset;
++	}
++	oPA = bounceOut ? m->dstPA : dpa + dst->offset;
++	if (bounceOut) {
++		cacheClean(m->dstBuf->getBytesNoCopy(), dSize);
++	}
++	/* 420f = BT.601 full range (MDP has no BT.709 full range); 420v = BT.601 / BT.709 video by height */
++	uint32_t mat = src->pixelFormat == PF_420F ? 0x41 : h >= 720 ? 0x71 : 0x61;
++	bool ok = true;
++	for (uint32_t x = 0; x < w && ok; x += MDP_TILE_W) {
++		uint32_t tw = w - x < MDP_TILE_W ? w - x : MDP_TILE_W;
++		ok = strip(m, yPA + x, cPA + x, ys, oPA + (uint64_t)x * 4, ds, tw, h, mat);
++		m->strips++;
++	}
++	if (!ok) {
++		m->timeouts++;
++		IOLog("VIVA MDP: %ux%u NV12 -> BGRA timed out (WROT debug 0x%08x, RDMA status 0x%08x)\n", w, h,
++		    rd(m->mdp, WROT_DEBUG), rd(m->mdp, 0x3408));
++		return kIOReturnTimeout;
++	}
++	if (bounceOut) {
++		cacheClean(m->dstBuf->getBytesNoCopy(), dSize);        /* drop stale lines */
++		memcpy((uint8_t *)dk + dst->offset, m->dstBuf->getBytesNoCopy(), dSize);
++		sweet_surface_cpu_wrote(dst);
++	}
++	m->frames++;
++	return kIOReturnSuccess;
+ }
+ 
+ #endif /* SWEET */
