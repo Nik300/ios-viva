@@ -738,3 +738,26 @@ Contract (kernel / vivausbd / viva-link.py / SpringBoard tweak): `docs/VIVA-USB-
 - Risk: a computer port advertising less than 2 A (USB-C 1.5 A, USB-A 500/900 mA) may cut power instead of sagging
   into VINDPM: then boot with `vivachargein=500` or a lower value.
 NOT tested on the phone. Compile-checked locally (xnu-cc.py, bt0154 + 0180's viva_sysctl.c).
+
+### 0183: CPU UI boost (P1 of gpu/docs/ANALISI-PRESTAZIONI-2026-11-06.md)
+Measured 2026-11-06 on 0180: during a Settings scroll LL/big never left 774/835 MHz (a UI thread 25 % busy never
+reached the governor's thresholds); 42.9 ms per frame, 32.7 with the clocks fixed at max.
+- `viva_cpufreq_ui_activity()` from every SwapEnd (SweetFramebuffer.cpp) and every touch report (VivaGT9896.cpp):
+  for `vivacpuboostms` (250; 0 = off) LL and big run at least at `vivacpuboost=MHz` (default: fastest OPP), under the
+  thermal (0147), Low Power Mode and link ceilings. A signal while the governor polls every 100 ms samples at once.
+- `need` targets 50 % busy of the busiest core (was 70 %).
+- A76 preference: big at least LL MHz x 1.4 / 1.46; if the big ceiling does not allow it, the preference is suspended.
+- Link `cpu boost on|off`; `cpu` shows boosts, ms boosted, signals, suspensions; `gpu kv` cpu_boost* keys.
+
+### 0184: display page pool, SwapWait reasons, 64-byte client pitches (P2, P3, P6)
+- P2: with `vivascanout=1`, AppleCLCD::start takes `vivafbpool` (4; 0 = none; max 8) physically contiguous buffers
+  below 4 GiB for 1125x2436 BGRA (11.2 MB each) before memory fragments. Display-sized surfaces take a pool buffer
+  first, then a fresh contiguous allocation, then sparse memory; freed surfaces give the buffer back. On 0180 60-70 %
+  of CA's frames were CPU-copied ("surface not contiguous"). `disp`: pool / contiguous / sparse counts.
+- P3: SwapWait answers that were not done, per reason (queued for the GPU or copy, switch pending, on screen),
+  per 100 swaps, and first-busy -> done latency per reason; `disp lat reset` clears them. `disp kv`: swapwait_busy_*.
+- P6: a client IOSurfaceBytesPerRow that is not a multiple of 64 is rounded up for single-plane surfaces (no offset,
+  no parent, and only if an explicit IOSurfaceAllocSize still holds the rows); the first 16 cases are logged
+  (`SWEET SURF: WxH fmt pitch A -> B`). Boot-arg `vivasurfpitch=0` = as the client asked. Fixes the GPU copying
+  the 1125x2436 pitch-4512 snapshot in and out (23 ms stalls).
+NOT tested on the phone. Compile-checked locally (xnu-cc.py, bt0154 tree with 0182).

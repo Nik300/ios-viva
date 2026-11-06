@@ -1,0 +1,456 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -84,6 +84,7 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void (*sweet_fb_panic_hook)(void);   /* pexpert/arm/pe_serial.c */
++extern "C" void viva_cpufreq_ui_activity(void);        /* osfmk/arm64/viva_cpufreq.c: 0183 UI boost */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -174,6 +175,19 @@
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	uint64_t      fSwapWaitBusy, fSwapWaitSlept;      /* SwapWait answered busy / had to block */
++	uint32_t      fPoolWant;                          /* 0184: vivafbpool */
++	/*
++	 * 0184 (P3 of gpu/docs/ANALISI-PRESTAZIONI-2026-11-06.md): why SwapWait was not done, by what held the swap
++	 * when it was asked (WAIT_QUEUED: waiting for the GPU or a copy; WAIT_NEXT: chosen, switch at the next frame
++	 * end; WAIT_SHOWN: the layer reads its page; WAIT_OTHER), for busy answers and blocking waits; and how long
++	 * from the first "not done" until done (busy: the next SwapWait that said done; blocking: the wait itself).
++	 */
++	enum { WAIT_QUEUED, WAIT_NEXT, WAIT_SHOWN, WAIT_OTHER, WAIT_WHY };
++	uint64_t      fWaitBusyWhy[WAIT_WHY], fWaitSleptWhy[WAIT_WHY];
++	uint32_t      fBusySwap, fBusyWhy;            /* swap of the last busy answer, 0 = none open */
++	uint64_t      fBusyAt;
++	uint32_t      waitWhy(uint32_t swap);
++	void          waitResult(uint32_t swap, bool done);
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap (redrawn when the display comes on) */
+ 	bool          fDirty;
+@@ -185,6 +199,7 @@
+ 	 * SwapEnd, last vsync notification -> SwapEnd (CoreAnimation's render time); sums, counts and maxima in mach time.
+ 	 */
+ 	struct LatStat { uint64_t sum, n, max; } fLatReady, fLatFlip, fLatSwap, fLatRender;
++	LatStat       fLatWait[4];                    /* 0184: first "not done" -> done, per WAIT_* reason */
+ 	uint64_t      fLatReadyHist[5];               /* SwapEnd -> chosen in frames: <1, <2, <3, <4, more */
+ 	uint64_t      fLastSwapAt, fLastNotifyAt, fNextChosenAt;
+ 	uint64_t      fTickPresents;                  /* 0135: frames chosen at a tick before its frame end (scanout) */
+@@ -402,6 +417,12 @@
+ 		sweet_surface_scanout_w = fLogicalW;
+ 		sweet_surface_scanout_h = fLogicalH;
+ 		fScanOn = true;
++		/* 0184: CoreAnimation's pages from a pool taken now, before memory fragments (vivafbpool, 0 = none) */
++		fPoolWant = 4;
++		PE_parse_boot_argn("vivafbpool", &fPoolWant, sizeof(fPoolWant));
++		if (fPoolWant != 0) {
++			sweet_surface_pool_init(fLogicalW, fLogicalH, fPoolWant);
++		}
+ 	}
+ 	gSweetFB = this;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -723,6 +744,7 @@
+ 	}
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++	viva_cpufreq_ui_activity();     /* 0183: frames are being drawn: CPU clusters out of the floor */
+ 	earlyKick();                    /* shown right away if the GPU has already finished it */
+ 	/* the format of every layer CoreAnimation sets (SwapSetLayer), logged when it changes */
+ 	uint32_t mask = get32(rec, 0x104);
+@@ -1324,6 +1346,47 @@
+ 		return next == 0;
+ 	default:
+ 		return true;
++	}
++}
++
++/* 0184: what holds a swap that SwapWait found not done. */
++uint32_t
++AppleCLCD::waitWhy(uint32_t swap)
++{
++	uint32_t why = WAIT_OTHER;
++	IOLockLock(fLock);
++	for (uint32_t i = 0; i < fQueueCount; i++) {
++		if (get32(fQueue[i], 0x50) == swap) {
++			why = WAIT_QUEUED;
++		}
++	}
++	IOLockUnlock(fLock);
++	if (why == WAIT_OTHER && swap != 0 && fNextSwap == swap) {
++		why = WAIT_NEXT;
++	} else if (why == WAIT_OTHER && swap != 0 && fShownSwap == swap) {
++		why = WAIT_SHOWN;
++	}
++	return why;
++}
++
++/* 0184: a non-blocking SwapWait(swap) answered done or busy. Counters only. */
++void
++AppleCLCD::waitResult(uint32_t swap, bool done)
++{
++	uint64_t now = mach_absolute_time();
++	if (!done) {
++		uint32_t why = waitWhy(swap);
++		fWaitBusyWhy[why]++;
++		if (fBusySwap != swap) {
++			fBusySwap = swap;
++			fBusyWhy = why;
++			fBusyAt = now;
++		}
++	} else if (fBusySwap == swap && swap != 0) {
++		IOLockLock(fLock);
++		latAdd(&fLatWait[fBusyWhy], now - fBusyAt);
++		IOLockUnlock(fLock);
++		fBusySwap = 0;
+ 	}
+ }
+ 
+@@ -1649,6 +1712,15 @@
+ 			fScanOn = true;
+ 			sweet_surface_scanout_w = fLogicalW;
+ 			sweet_surface_scanout_h = fLogicalH;
++			if (fPoolWant == 0) {
++				fPoolWant = 4;
++				PE_parse_boot_argn("vivafbpool", &fPoolWant, sizeof(fPoolWant));
++			}
++			if (fPoolWant != 0) {
++				IOLockUnlock(fScanLock);        /* allocates (may take a while): never under the display locks */
++				sweet_surface_pool_init(fLogicalW, fLogicalH, fPoolWant);
++				IOLockLock(fScanLock);
++			}
+ 			fDirty = true;
+ 			disp_say(&p, end, "scanout on (surfaces created from now on can be scanned out; CA allocates its "
+ 			    "framebuffers at start: boot with vivascanout=1)\n");
+@@ -1666,6 +1738,11 @@
+ 		bzero(&fLatSwap, sizeof(fLatSwap));
+ 		bzero(&fLatRender, sizeof(fLatRender));
+ 		bzero(fLatReadyHist, sizeof(fLatReadyHist));
++		bzero(fLatWait, sizeof(fLatWait));
++		bzero(fWaitBusyWhy, sizeof(fWaitBusyWhy));
++		bzero(fWaitSleptWhy, sizeof(fWaitSleptWhy));
++		fSwapWaitBusy = fSwapWaitSlept = 0;
++		fBusySwap = 0;
+ 		fTickPresents = 0;
+ 		fTickLate = fTickLateSum = fTickLateMax = fTickEarly = fTickEarlySum = fTickWidePolls = 0;
+ 		fFlips = fFlipEarly = fFlipMissed = fFlipUnsure = 0;
+@@ -1707,6 +1784,16 @@
+ 		    fCopies ? fCopyNs / fCopies / 1000 : 0);
+ 		disp_say(&p, end, "lat_swap_gpu_avg_us=%llu\nlat_chosen_screen_avg_us=%llu\nearly_shown=%llu\nflip=%d\n"
+ 		    "swapwait_busy=%llu\n", r, f, fEarlyShown, fFlipReady ? 1 : 0, fSwapWaitBusy);
++		{
++			uint32_t pb = 0, pu = 0, pk = 0;
++			uint64_t fp = 0, fc = 0, sp = 0;
++			sweet_surface_pool_stats(&pb, &pu, &fp, &fc, &sp, &pk);
++			disp_say(&p, end, "pool_buffers=%u\npool_in_use=%u\npages_pool=%llu\npages_contig=%llu\npages_sparse=%llu\n"
++			    "pitch_rounded=%llu\n", pb, pu, fp, fc, sp, sweet_surface_pitch_rounded());
++			disp_say(&p, end, "swapwait_busy_queued=%llu\nswapwait_busy_next=%llu\nswapwait_busy_shown=%llu\n"
++			    "swapwait_slept=%llu\n", fWaitBusyWhy[WAIT_QUEUED], fWaitBusyWhy[WAIT_NEXT], fWaitBusyWhy[WAIT_SHOWN],
++			    fSwapWaitSlept);
++		}
+ 	} else {
+ 		disp_say(&p, end, "display %ux%u (shown as %ux%u), scanout %s%s, layer %s, %llu frames scanned out, "
+ 		    "%llu copied%s%s\n", fWidth, fHeight, fLogicalW, fLogicalH, fScanOn ? "on" : "off",
+@@ -1735,6 +1822,23 @@
+ 		    fEarly ? "on" : "off", fEarlyRuns, fEarlyShown);
+ 		disp_say(&p, end, "SwapWait: %llu busy answers (CA keeps the page), %llu blocking waits; layer reads swap %u, "
+ 		    "next swap %u\n", fSwapWaitBusy, fSwapWaitSlept, fShownSwap, fNextSwap);
++		{
++			static const char *const kWhy[WAIT_WHY] = { "queued (GPU/copy)", "chosen, switch pending", "on screen", "other" };
++			uint64_t swaps = fLatSwap.n ? fLatSwap.n : 1;
++			disp_say(&p, end, "SwapWait not done (0184), per 100 swaps busy/blocking, first not-done -> done avg/max us:");
++			for (int w = 0; w < WAIT_WHY; w++) {
++				disp_say(&p, end, "%s %s %llu/%llu %llu/%llu", w ? ";" : "", kWhy[w], fWaitBusyWhy[w] * 100 / swaps,
++				    fWaitSleptWhy[w] * 100 / swaps, absUsFB(fLatWait[w].n ? fLatWait[w].sum / fLatWait[w].n : 0),
++				    absUsFB(fLatWait[w].max));
++			}
++			disp_say(&p, end, "\n");
++			uint32_t pb = 0, pu = 0, pk = 0;
++			uint64_t fp = 0, fc = 0, sp = 0;
++			sweet_surface_pool_stats(&pb, &pu, &fp, &fc, &sp, &pk);
++			disp_say(&p, end, "display pages (0184): pool %u x %u KiB (%u in use, vivafbpool), created from the pool %llu, "
++			    "contiguous %llu, sparse %llu; client pitches rounded to 64: %llu\n", pb, pk, pu, fp, fc, sp,
++			    sweet_surface_pitch_rounded());
++		}
+ 		uint64_t pns = 0, polls = fPolls ? fPolls : 1, pollNs;
+ 		absolutetime_to_nanoseconds(fPeriod, &pns);
+ 		absolutetime_to_nanoseconds(fPollAbs / polls, &pollNs);
+@@ -1908,14 +2012,18 @@
+ 		uint32_t ms = args->scalarInputCount > 2 ? (uint32_t)args->scalarInput[2] : 0;
+ 		uint32_t op = opts & 7;
+ 		if (fFB->swapDone(swap, op)) {
++			fFB->waitResult(swap, true);
+ 			break;
+ 		}
+ 		if (opts & 0x80000000u) {
+ 			ret = kIOReturnBusy;
+ 			fFB->fSwapWaitBusy++;
++			fFB->waitResult(swap, false);
+ 			break;
+ 		}
+ 		/* block (the calling thread only): re-check every millisecond, at most the timeout or 5 s */
++		uint32_t why = fFB->waitWhy(swap);
++		uint64_t t0 = mach_absolute_time();
+ 		ms = (ms == 0 || ms > 5000) ? 5000 : ms;
+ 		ret = kIOReturnTimeout;
+ 		for (uint32_t t = 0; t < ms; t++) {
+@@ -1926,6 +2034,12 @@
+ 			}
+ 		}
+ 		fFB->fSwapWaitSlept++;
++		fFB->fWaitSleptWhy[why]++;
++		if (ret == kIOReturnSuccess) {
++			IOLockLock(fFB->fLock);
++			AppleCLCD::latAdd(&fFB->fLatWait[why], mach_absolute_time() - t0);
++			IOLockUnlock(fFB->fLock);
++		}
+ 		break;
+ 	}
+ 	default:
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -54,6 +54,7 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <pexpert/pexpert.h>
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -105,6 +106,21 @@
+ #define SWEET_SURFACE_CONTIG_MAX        (96ull << 20)
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
++/*
++ * 0184 display page pool (SweetSurface.h). Lock-free: a buffer is published before the count that covers it, and a
++ * slot is taken / given back with a compare-and-swap (a surface may be freed with the table lock held).
++ */
++#define SWEET_SURFACE_POOL_MAX          8
++static IOBufferMemoryDescriptor *sweet_surface_pool[SWEET_SURFACE_POOL_MAX];
++static volatile UInt32 sweet_surface_pool_used[SWEET_SURFACE_POOL_MAX];
++static int           sweet_surface_pool_rc[SWEET_SURFACE_POOL_MAX];      /* retain count with only the pool holding it */
++static volatile UInt32 sweet_surface_pool_count;
++static uint32_t      sweet_surface_pool_size;
++static uint64_t      sweet_surface_from_pool, sweet_surface_from_contig, sweet_surface_sparse;
++/* 0184 (P6) */
++static int           sweet_surface_pitch64 = -1;        /* vivasurfpitch, read at the first create */
++static uint64_t      sweet_surface_pitch_rounds;
++
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+ void
+@@ -113,11 +129,15 @@
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+-	if (contig) {
++	if (contig && poolSlot < 0) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_contig);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
++	if (poolSlot >= 0) {
++		/* the pool keeps its own reference: the buffer is free again once the surface's is gone */
++		OSCompareAndSwap(1, 0, &sweet_surface_pool_used[poolSlot]);
++	}
+ 	OSSafeReleaseNULL(state);
+ 	OSSafeReleaseNULL(values);
+ 	OSSafeReleaseNULL(gpuFence);
+@@ -295,6 +315,7 @@
+ 		OSSafeReleaseNULL(s);
+ 		return NULL;
+ 	}
++	s->poolSlot = -1;
+ 	s->state = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
+ 	if (s->state == NULL) {
+@@ -428,6 +449,35 @@
+ 	}
+ 
+ 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
++	/*
++	 * 0184 (P6 of gpu/docs/ANALISI-PRESTAZIONI-2026-11-06.md): a client pitch that is not a multiple of 64 (CA's
++	 * home snapshot 1125x2436 with 4512, LA08 230x186 with 480) cannot be imported by the GPU, which copied such
++	 * surfaces in and out at every use (10.7 MB each way, 23 ms stalls on the GPU queue). Single-plane surfaces get
++	 * the pitch rounded up: clients read it back from the lock result (+0x28; CA, ImageIO, IOSurface.framework).
++	 * Not when an explicit IOSurfaceAllocSize would no longer hold the rows (the client laid the memory out
++	 * itself), nor with an offset or a parent. Boot-arg vivasurfpitch=0: never.
++	 */
++	if (sweet_surface_pitch64 < 0) {
++		int on = 1;
++		PE_parse_boot_argn("vivasurfpitch", &on, sizeof(on));
++		sweet_surface_pitch64 = on != 0;
++	}
++	if (sweet_surface_pitch64 && planes == NULL && s->offset == 0 && s->parentID == 0 &&
++	    (s->bytesPerRow & (SWEET_SURFACE_ROW_ALIGN - 1)) != 0 && props->getObject("IOSurfaceBytesPerRow") != NULL) {
++		uint64_t row = ((uint64_t)s->bytesPerRow + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1);
++		uint64_t rend = row * sweet_div_up(s->height, s->elementHeight);
++		bool ok = row <= UINT32_MAX && (alloc == 0 || rend <= alloc);
++		static volatile SInt32 logged;
++		if (OSIncrementAtomic(&logged) < 16) {
++			IOLog("SWEET SURF: %ux%u fmt 0x%x pitch %u %s %llu%s\n", s->width, s->height, s->pixelFormat,
++			    s->bytesPerRow, ok ? "->" : "kept (alloc size", ok ? row : alloc, ok ? "" : ")");
++		}
++		if (ok) {
++			s->bytesPerRow = (uint32_t)row;
++			end = rend;
++			OSIncrementAtomic64((volatile SInt64 *)&sweet_surface_pitch_rounds);
++		}
++	}
+ 	if (alloc < end) {
+ 		alloc = end;
+ 	}
+@@ -757,6 +807,84 @@
+ 		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
+ 	}
+ 	return ret;
++}
++
++uint32_t
++sweet_surface_pool_init(uint32_t w, uint32_t h, uint32_t count)
++{
++	static volatile UInt32 busy;
++	count = count > SWEET_SURFACE_POOL_MAX ? SWEET_SURFACE_POOL_MAX : count;
++	/* room for any 64-byte aligned pitch up to 256 bytes wider than the row */
++	uint32_t size = (uint32_t)round_page((uint64_t)((w * 4 + 255) & ~255u) * h);
++	uint32_t have = sweet_surface_pool_count, made = 0;
++	if ((have != 0 && sweet_surface_pool_size != size) || !OSCompareAndSwap(0, 1, &busy)) {
++		return have;            /* another size already, or another caller is filling it */
++	}
++	for (uint32_t i = have; i < count; i++) {
++		IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, size, 0x00000000ffffc000ull);
++		if (mem == NULL) {
++			break;
++		}
++		sweet_surface_pool[i] = mem;
++		sweet_surface_pool_rc[i] = mem->getRetainCount();      /* the pool's own + the kernel mapping's */
++		sweet_surface_pool_size = size;
++		OSSynchronizeIO();
++		sweet_surface_pool_count = i + 1;
++		made++;
++	}
++	busy = 0;
++	IOLog("SWEET SURF: display page pool: %u buffers of %u KiB for %ux%u (%u new, vivafbpool=%u)\n",
++	    have + made, size >> 10, w, h, made, count);
++	return have + made;
++}
++
++void
++sweet_surface_pool_stats(uint32_t *buffers, uint32_t *inUse, uint64_t *fromPool, uint64_t *fromContig,
++    uint64_t *sparse, uint32_t *poolKiB)
++{
++	*buffers = sweet_surface_pool_count;
++	*inUse = 0;
++	for (uint32_t i = 0; i < *buffers; i++) {
++		*inUse += sweet_surface_pool_used[i] != 0;
++	}
++	*fromPool = sweet_surface_from_pool;
++	*fromContig = sweet_surface_from_contig;
++	*sparse = sweet_surface_sparse;
++	*poolKiB = sweet_surface_pool_size >> 10;
++}
++
++uint64_t
++sweet_surface_pitch_rounded(void)
++{
++	return sweet_surface_pitch_rounds;
++}
++
++/*
++ * 0184: a free pool buffer for `size` bytes (retained, slot in *slot), or NULL. A buffer someone else still
++ * holds (a mapping or an import that outlived its surface) is skipped.
++ */
++static IOBufferMemoryDescriptor *
++sweet_surface_pool_take(uint32_t size, int8_t *slot)
++{
++	uint32_t n = sweet_surface_pool_count;
++	if (size > sweet_surface_pool_size) {
++		return NULL;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		if (!OSCompareAndSwap(0, 1, &sweet_surface_pool_used[i])) {
++			continue;
++		}
++		IOBufferMemoryDescriptor *mem = sweet_surface_pool[i];
++		if (mem->getRetainCount() != sweet_surface_pool_rc[i]) {
++			sweet_surface_pool_used[i] = 0;
++			continue;
++		}
++		mem->retain();
++		*slot = (int8_t)i;
++		return mem;
++	}
++	return NULL;
+ }
+ 
+ IOReturn
+@@ -801,18 +929,28 @@
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			if (sweet_surface_scanout_w != 0 && s->width == sweet_surface_scanout_w &&
+-			    s->height == sweet_surface_scanout_h && s->bytesPerElement == 4 && s->planeCount == 0 &&
+-			    sweet_surface_contig + s->allocSize <= SWEET_SURFACE_CONTIG_MAX) {
++			bool display = sweet_surface_scanout_w != 0 && s->width == sweet_surface_scanout_w &&
++			    s->height == sweet_surface_scanout_h && s->bytesPerElement == 4 && s->planeCount == 0;
++			if (display) {
++				/* 0184: the boot-time pool first (fragmentation made the allocation below fail for 60 % of pages) */
++				mem = sweet_surface_pool_take(s->allocSize, &s->poolSlot);
++				if (mem != NULL) {
++					s->contig = true;
++					sweet_surface_from_pool++;
++				}
++			}
++			if (mem == NULL && display && sweet_surface_contig + s->allocSize <= SWEET_SURFACE_CONTIG_MAX) {
+ 				/* the display's DMA has no IOMMU here: one physical range below 4 GiB, 16 KiB aligned */
+ 				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut |
+ 				    kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, s->allocSize, 0x00000000ffffc000ull);
+ 				if (mem != NULL) {
+ 					OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_contig);
+ 					s->contig = true;
++					sweet_surface_from_contig++;
+ 				}
+ 			}
+ 			if (mem == NULL) {
++				sweet_surface_sparse += display;
+ 				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
+ 			}
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -50,6 +50,7 @@
+ 
+ 	OSDictionary             *values;       /* IOSurfaceSetValue (non-bulk), under the surface table lock */
+ 	bool                      contig;       /* physically contiguous below 4 GiB (scanout candidate) */
++	int8_t                    poolSlot;     /* 0184: buffer of the display page pool, -1 = none */
+ 
+ 	/*
+ 	 * viva GPU (VivaGPU.cpp, under its gate): fence of the last GPU job that used the surface, from any
+@@ -124,6 +125,24 @@
+  */
+ extern uint32_t sweet_surface_scanout_w, sweet_surface_scanout_h;
+ 
++/*
++ * 0184 (P2 of gpu/docs/ANALISI-PRESTAZIONI-2026-11-06.md): `count` (vivafbpool, default 4, at most 8) physically
++ * contiguous buffers below 4 GiB for w x h 4-byte surfaces, taken once at boot before memory fragments. Display-sized
++ * surfaces (sweet_surface_scanout_w/h) get one of them first, a fresh contiguous allocation second, sparse memory
++ * last; a buffer goes back to the pool when its surface is freed. Called by AppleCLCD when scanout is on; returns
++ * the buffers the pool has (it only grows). Stats: pool buffers, in use, and surfaces of display size created from
++ * the pool, from a contiguous allocation, sparse; *poolKiB = size of one buffer.
++ */
++uint32_t sweet_surface_pool_init(uint32_t w, uint32_t h, uint32_t count);
++void sweet_surface_pool_stats(uint32_t *buffers, uint32_t *inUse, uint64_t *fromPool, uint64_t *fromContig,
++    uint64_t *sparse, uint32_t *poolKiB);
++
++/*
++ * 0184 (P6): client bytes-per-row values rounded up to 64 (the GPU imports only 64-byte aligned pitches; others were
++ * copied in and out at every use). Boot-arg vivasurfpitch=0: as the client asked. Count of rounded surfaces.
++ */
++uint64_t sweet_surface_pitch_rounded(void);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
