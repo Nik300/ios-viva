@@ -801,4 +801,7 @@ then two frames, then DSI_VFP_NL (0x14013028). Tried by hand with poke on 0187 (
 target at 120 Hz) and the period sent to CoreAnimation is per tick (was per panel frame), frame end calibrated again.
 Boot-arg `vivapanelhz=60|120|1` (1 = auto: 120 Hz from a swap, 60 Hz after 500 ms idle or display off), default 60;
 link `disp hz [60|120|auto]`; `disp kv` panel_hz, hz_mode, hz_switches, hz_failures. Viva Manager: SpringBoard ->
-Display. NOT tested on the phone as a kernel (only the manual poke sequence).
+Display. With 120 or auto at boot the service publishes IOMFBDisplayRefresh {displayMinRefreshInterval = 8.333 ms in
+0.32 fixed point, displayRefreshStepMachTime}: QuartzCore's AppleCLCDDisplay::heartbeat_rate() takes its vsync interval
+from it (iOS 16.7, read once when backboardd starts; CA_HEARTBEAT_RATE overrides). NOT tested on the phone as a kernel
+(only the manual poke sequence).
