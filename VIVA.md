@@ -803,5 +803,6 @@ Boot-arg `vivapanelhz=60|120|1` (1 = auto: 120 Hz from a swap, 60 Hz after 500 m
 link `disp hz [60|120|auto]`; `disp kv` panel_hz, hz_mode, hz_switches, hz_failures. Viva Manager: SpringBoard ->
 Display. With 120 or auto at boot the service publishes IOMFBDisplayRefresh {displayMinRefreshInterval = 8.333 ms in
 0.32 fixed point, displayRefreshStepMachTime}: QuartzCore's AppleCLCDDisplay::heartbeat_rate() takes its vsync interval
-from it (iOS 16.7, read once when backboardd starts; CA_HEARTBEAT_RATE overrides). NOT tested on the phone as a kernel
-(only the manual poke sequence).
+from it (iOS 16.7, read once when backboardd starts; CA_HEARTBEAT_RATE overrides).
+On the phone (2026-11-07, vivapanelhz=1): 46 switches in auto mode, 0 failures, frame end 8348 / 16696 us; user
+scrolling Settings by hand: SwapEnd every 14.7 ms on average (4086 swaps), chosen -> on screen 4.9 ms (8.7 at 60 Hz).
