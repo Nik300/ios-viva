@@ -813,3 +813,14 @@ Update 2: still a flash. By hand over the link (each poke ~0.5 s) the panel stay
 command and the porch write, both ways: panel mode and DSI timing out of step = black. Going to 60 the first two
 commands now go in VSA/VBP as the vendor does; `disp hz seq 0|1|2` (vivapanelseq) picks where the porch goes: 0 vendor
 (two frames after the commands), 1 in the blanking that carried F7 0B, 2 at the start of the frame before the commands.
+
+### 0191: brightness and Night Shift
+CoreBrightness (iOS 16.7, SetIOMFBBrightness) sets IOMFBBrightnessLevel on the IOMFB service: CFNumber SInt32, nits in
+16.16 fixed point. AppleCLCD::setProperties converts it to the panel's DCS 51 HH LL (0..2047 normal range, Xiaomi
+lcm_setbacklight_cmdq), level 2047 = `vivapanelnits` (500), sent through DSI VM_CMD at the next vsync tick. Tried by
+hand: 51 03 00 brighter than LK's 51 02 19. QuartzCore's color matrices come through selector 55
+(IOMobileFramebufferSetMatrix: scalar = matrix type, 72 bytes = 3x3 doubles row-major): converted to fixed point
+without the FPU, multiplied in type order, written to the display pipe's CCORR (0x1400b000; coefficients 1.0 = 0x800
+on MT6781, two 13-bit per register; CFG bit 0 relay / bit 1 engine; identity = relay). Tried by hand: a warm matrix
+turned the picture yellow. First 16 matrices logged (`SWEET FB: matrix T: ...`). Link `disp bl [N]`; `disp kv`
+brightness=, brightness_max=, matrix_calls=. NOT tested as a kernel.
