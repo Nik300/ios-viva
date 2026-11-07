@@ -809,3 +809,7 @@ scrolling Settings by hand: SwapEnd every 14.7 ms on average (4086 swaps), chose
 Update: the user saw a dark flash at idle switches. The switch is now locked to frame ends like the vendor's GCE
 sequence (commands after a start of frame, two frame ends, the porch written after the next start of frame, in the
 active lines) instead of arbitrary times; `vivapanelidle=ms` / `disp hz idle MS` sets the auto drop-back delay (500).
+Update 2: still a flash. By hand over the link (each poke ~0.5 s) the panel stayed black for seconds between the mode
+command and the porch write, both ways: panel mode and DSI timing out of step = black. Going to 60 the first two
+commands now go in VSA/VBP as the vendor does; `disp hz seq 0|1|2` (vivapanelseq) picks where the porch goes: 0 vendor
+(two frames after the commands), 1 in the blanking that carried F7 0B, 2 at the start of the frame before the commands.
