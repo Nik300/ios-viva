@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--viva [--ufs]]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--viva [--ufs]] [--canvas=WxH]
 """
 import hashlib, os, struct, sys
 
@@ -39,6 +39,9 @@ VTIMER_INTID = 19
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
+# --canvas=WxH: the display size IOMobileFramebuffer reads from /arm-io/disp0 (default the presented iPhone X
+# size 1125x2436; must match what AppleCLCD reports: 1080x2400 with boot-arg sweetfb_native=1).
+CANVAS = [1125, 2436]
 # --viva: Redmi Note 11 Pro 4G (MT6781). RAM is 0x40000000-0x1c0000000; every
 # LK mblock reservation is below 0xc0000000 except dramc-rk1 at 0x1bffff000.
 # start.s maps kernel RAM with 32MB cacheable blocks, so the range stops at the
@@ -379,8 +382,8 @@ def build(seed=None, qemu=False, highmem=False, viva=False, viva_ufs=False):
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436)),
+            ('canvas-width', u32(CANVAS[0])),
+            ('canvas-height', u32(CANVAS[1])),
         ])] + (viva_devices(ph, phandle, gic_ph, ecid) if viva else []))
 
     fbcon = node('sweet-fbcon', [
@@ -440,6 +443,10 @@ def build(seed=None, qemu=False, highmem=False, viva=False, viva_ufs=False):
 
 
 if __name__ == '__main__':
+    for a in sys.argv:
+        if a.startswith('--canvas='):     # presented display size (P8: 1080x2400 with sweetfb_native=1)
+            w, h = a.split('=', 1)[1].split('x')
+            CANVAS[0], CANVAS[1] = int(w), int(h)
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, viva='--viva' in sys.argv,
                  viva_ufs='--ufs' in sys.argv)
     blob = adt.serialize(root)

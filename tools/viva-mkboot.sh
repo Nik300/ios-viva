@@ -38,6 +38,8 @@ done
 echo "stage $STAGE: $CMDLINE"
 
 mkdir -p shim/out
+# VIVA_CANVAS=1080x2400 (P8, with sweetfb_native=1): the display size in the ADT
+[ -n "${VIVA_CANVAS:-}" ] && ADT_FLAGS+=("--canvas=$VIVA_CANVAS")
 python3 tools/mkadt.py shim/out/viva.adt "${ADT_FLAGS[@]}"
 python3 tools/mkpayload.py "$KERNEL" shim/out/viva.adt shim/out/viva-payload.bin --cmdline "$CMDLINE"
 # LK loads the ramdisk at 0x47c80000 and the DTB at 0x4bc80000: 64 MiB of room.
