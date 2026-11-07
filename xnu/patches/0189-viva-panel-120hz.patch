@@ -11,13 +11,13 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 + * packets sent in the video-mode blanking through DSI VM_CMD (F0 5A 5A, 60 01 for 120 Hz / 60 21 for 60 Hz, F7 0B,
 + * F0 A5 A5), two frames, then DSI_VFP_NL. The vsync tick then follows the panel (CoreAnimation gets 120 Hz with its
 + * period), the frame end is calibrated again. Auto (1): 120 Hz from the first swap, 60 Hz after 500 ms without one
-+ * or with the display off, as ProMotion does. Default 60. With 120 or auto at boot the service also publishes
++ * (vivapanelidle=ms) or with the display off, as ProMotion does; the switch is locked to frame ends. Default 60. With 120 or auto at boot the service also publishes
 + * IOMFBDisplayRefresh (min refresh interval 8.333 ms), which QuartzCore reads when backboardd starts.
 + *
   * The panel memory itself is published as an IOSurface and returned as the
   * default framebuffer surface. The kernel text console keeps drawing over
   * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
-@@ -233,8 +242,18 @@
+@@ -233,8 +242,19 @@
  
  	/* viva direct scanout (see the top) */
  	IOLock       *fScanLock;      /* scanout state: present() vs. the link command */
@@ -33,12 +33,13 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	uint64_t      fHzSwitches, fHzFailures;
 +	const char   *fHzWhy;         /* last switch failure */
 +	volatile uint64_t fLastActivity;      /* mach time of the last swap (auto mode) */
++	uint32_t      fHzIdleMs;      /* vivapanelidle: auto mode back to 60 Hz after this long without a swap */
 +	bool panelSetHz(uint32_t hz);
 +	void hzPolicy(void);
  	int           fScanOvl;       /* OVL of LK's layer (0/1), -1 = not found */
  	uint32_t      fScanAddrReg, fScanPitchReg, fScanPitchMsbReg;
  	uint32_t      fLkAddr, fLkPitch, fLkPitchMsb;
-@@ -407,6 +426,14 @@
+@@ -407,6 +427,17 @@
  	int flip = 1;
  	PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
  	fFlipAllowed = flip != 0;
@@ -50,10 +51,13 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		fHzMode = 60;
 +	}
 +	fHzWant = fHzMode == 120 ? 120 : 0;     /* done at the first vsync tick with frame ends known */
++	fHzIdleMs = 500;
++	PE_parse_boot_argn("vivapanelidle", &fHzIdleMs, sizeof(fHzIdleMs));
++	fHzIdleMs = MIN(MAX(fHzIdleMs, 100u), 60000u);
  	uint32_t us = 1000;
  	PE_parse_boot_argn("sweetfb_lead", &us, sizeof(us));        /* tick this long before the frame end */
  	nanoseconds_to_absolutetime((uint64_t)MIN(MAX(us, 200u), 4000u) * 1000, &fLead);
-@@ -430,6 +457,27 @@
+@@ -430,6 +461,27 @@
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
@@ -81,7 +85,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	registerService();
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
-@@ -440,6 +488,7 @@
+@@ -440,6 +492,7 @@
  AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  {
  	AppleCLCD *fb = (AppleCLCD *)owner;
@@ -89,7 +93,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	uint64_t count = ++fb->fVsyncCount;
  	/*
  	 * 0135, scanout: look for a finished frame before the switch, so one found now is on screen at this frame end
-@@ -456,10 +505,10 @@
+@@ -456,10 +509,10 @@
  	fb->vblankTick();               /* a pending layer switch happens at this frame end */
  	uint64_t now = mach_absolute_time();
  	fb->fLastNotifyAt = now;
@@ -103,7 +107,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
  	uint64_t values[6] = {
  		(uint32_t)count, (uint32_t)(count >> 32),
-@@ -618,7 +667,7 @@
+@@ -618,7 +671,7 @@
  AppleCLCD::rearm(IOTimerEventSource *timer)
  {
  	if (!fFlipReady) {
@@ -112,7 +116,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		return;
  	}
  	uint64_t now = mach_absolute_time(), step = fPeriod * fTickFrames, next = fLastVblank + step;
-@@ -744,6 +793,10 @@
+@@ -744,6 +797,10 @@
  	}
  	fDirty = true;
  	IOLockUnlock(fLock);
@@ -123,7 +127,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	viva_cpufreq_ui_activity();     /* 0183: frames are being drawn: CPU clusters out of the floor */
  	earlyKick();                    /* shown right away if the GPU has already finished it */
  	/* the format of every layer CoreAnimation sets (SwapSetLayer), logged when it changes */
-@@ -1048,6 +1101,18 @@
+@@ -1048,6 +1105,18 @@
  #define OVL_INTSTA              0x008   /* write 0 to a bit to clear it */
  #define OVL_INT_FME_CPL         (1u << 1)       /* frame complete */
  #define OVL_ADDCON_DBG          0x244   /* [12:0] x, [28:16] y of the pixel being blended */
@@ -142,7 +146,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  
  
  static inline uint32_t
-@@ -1104,8 +1169,8 @@
+@@ -1104,8 +1173,8 @@
  bool
  AppleCLCD::dispMap(void)
  {
@@ -153,7 +157,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		if (fDispMap[i] != NULL) {
  			continue;
  		}
-@@ -1424,7 +1489,102 @@
+@@ -1424,8 +1493,130 @@
   * bytes = 3 x 1088 x 2400 x 4). 0128: some boots LK leaves OVL0 L1 enabled on its second buffer (seen after a panic
   * reboot: L1 1080x2400 pitch 4320 at 0x7c606000); the double buffer was then off and every copy went to the buffer on
   * screen (tearing bands while scrolling). The third buffer is used instead.
@@ -162,7 +166,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 + * 0189: switch the panel to `hz` (60 or 120), see the top. fScanLock. Busy for ~3 frames (two waited for the panel to
 + * take the mode, one to calibrate the frame end again).
   */
-+bool
+ bool
 +AppleCLCD::panelSetHz(uint32_t hz)
 +{
 +	if (!dispMap()) {
@@ -186,6 +190,22 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		{ 0x0bf71521, 0 },                                      /* F7 0B */
 +		{ 0x00033923, 0x00a5a5f0 },                             /* F0 A5 A5 */
 +	};
++	/*
++	 * Frame-locked as the vendor's GCE sequence (wait SOF, commands, EOF/SOF/EOF, porch after a SOF): a porch written
++	 * while the DSI is inside the blanking gave one odd frame, a dark flash on the AMOLED (2026-11-07). The OVL frame
++	 * end is the end of the active lines; the DSI's start of frame comes the old VFP (+ VSA + VBP) later.
++	 */
++	bool applied;
++	uint64_t frame2, sofDelay, t;
++	nanoseconds_to_absolutetime(40 * NSEC_PER_MSEC, &frame2);
++	uint32_t lines = vfp + 12;                      /* VFP + VSA 2 + VBP 10 */
++	nanoseconds_to_absolutetime((uint64_t)lines * 1266ull * 1000000ull / 369469ull + 500000ull, &sofDelay);
++	bool locked = fVblankOvl >= 0;
++	if (locked && (t = vblankPoll(frame2, NULL, &applied)) != 0) {
++		while (mach_absolute_time() < t + sofDelay) {           /* into the next frame's active area */
++			IODelay(20);
++		}
++	}
 +	for (int i = 0; i < 4; i++) {
 +		if (cmds[i][1] != 0) {
 +			disp_wr(d, DSI_VM_CMD_DATA0, cmds[i][1]);
@@ -195,7 +215,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		disp_wr(d, DSI_START, disp_rd(d, DSI_START) & ~DSI_VM_CMD_START);
 +		disp_wr(d, DSI_START, disp_rd(d, DSI_START) | DSI_VM_CMD_START);
 +		bool done = false;
-+		for (int t = 0; t < 1000 && !done; t++) {      /* a VFP comes at least every 16.7 ms */
++		for (int k = 0; k < 1000 && !done; k++) {      /* a VFP comes at least every 16.7 ms */
 +			done = (disp_rd(d, DSI_INTSTA) & DSI_VM_CMD_DONE) != 0;
 +			if (!done) {
 +				IODelay(50);
@@ -208,7 +228,18 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +			return false;
 +		}
 +	}
-+	IOSleep(34);                    /* send_cmd_need_delay: two frames before the new porch */
++	/* send_cmd_need_delay: EOF, SOF, EOF; then the porch right after the following SOF */
++	t = 0;
++	for (int i = 0; locked && i < 2; i++) {
++		t = vblankPoll(frame2, NULL, &applied);
++	}
++	if (t != 0) {
++		while (mach_absolute_time() < t + sofDelay) {
++			IODelay(20);
++		}
++	} else {
++		IOSleep(34);
++	}
 +	disp_wr(d, DSI_VFP_NL, hz == 120 ? PANEL_VFP_120 : PANEL_VFP_60);
 +	fPanelHz = hz;
 +	fTickUs = hz == 120 ? 8333 : SWEET_FB_VSYNC_US;
@@ -228,7 +259,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	uint32_t want = fHzWant;
 +	if (fHzMode == 1 && fPanelHz == 120 && want == 0) {
 +		uint64_t idle;
-+		nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &idle);
++		nanoseconds_to_absolutetime((uint64_t)fHzIdleMs * NSEC_PER_MSEC, &idle);
 +		if (fPowerOff || mach_absolute_time() - fLastActivity > idle) {
 +			want = 60;
 +		}
@@ -253,10 +284,11 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	IOLockUnlock(fScanLock);
 +}
 +
- bool
++bool
  AppleCLCD::flipSetup(char **out, char *end)
  {
-@@ -1530,7 +1690,7 @@
+ 	fFlipReady = false;
+@@ -1530,7 +1721,7 @@
  				fPeriod = (t[2] - t[0]) / 2;
  				fLastVblank = t[2];
  				uint64_t tick;
@@ -265,7 +297,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  				fTickFrames = (uint32_t)MAX((tick + fPeriod / 2) / fPeriod, 1ull);
  				return true;
  			}
-@@ -1770,6 +1930,24 @@
+@@ -1770,6 +1961,30 @@
  		}
  		fDirty = true;
  		disp_say(&p, end, "double buffer off: copies go to LK's buffer on screen\n");
@@ -283,14 +315,20 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		} else if (strncmp(a, "auto", 4) == 0) {
 +			fHzMode = 1;
 +			fHzWant = 120;
++		} else if (strncmp(a, "idle ", 5) == 0) {
++			uint32_t ms = 0;
++			for (a += 5; *a >= '0' && *a <= '9'; a++) {
++				ms = ms * 10 + (uint32_t)(*a - '0');
++			}
++			fHzIdleMs = MIN(MAX(ms, 100u), 60000u);
 +		}
-+		disp_say(&p, end, "panel %u Hz, mode %s%s, %llu switches, %llu failures%s%s\n", fPanelHz,
-+		    fHzMode == 1 ? "auto" : fHzMode == 120 ? "120" : "60", fHzWant ? " (switch pending)" : "", fHzSwitches,
++		disp_say(&p, end, "panel %u Hz, mode %s (idle %u ms)%s, %llu switches, %llu failures%s%s\n", fPanelHz,
++		    fHzMode == 1 ? "auto" : fHzMode == 120 ? "120" : "60", fHzIdleMs, fHzWant ? " (switch pending)" : "", fHzSwitches,
 +		    fHzFailures, fHzWhy ? ", last: " : "", fHzWhy ? fHzWhy : "");
  	} else if (strncmp(args, "kv", 2) == 0) {
  		/* KA1 (gpu/docs/RICHIESTE-KERNEL.md): stable key=value lines for Viva Manager */
  		IOLockLock(fLock);
-@@ -1784,6 +1962,8 @@
+@@ -1784,6 +1999,8 @@
  		    fCopies ? fCopyNs / fCopies / 1000 : 0);
  		disp_say(&p, end, "lat_swap_gpu_avg_us=%llu\nlat_chosen_screen_avg_us=%llu\nearly_shown=%llu\nflip=%d\n"
  		    "swapwait_busy=%llu\n", r, f, fEarlyShown, fFlipReady ? 1 : 0, fSwapWaitBusy);
@@ -299,7 +337,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		{
  			uint32_t pb = 0, pu = 0, pk = 0;
  			uint64_t fp = 0, fc = 0, sp = 0;
-@@ -1847,7 +2027,9 @@
+@@ -1847,7 +2064,9 @@
  		    fFlipWhy ? ": " : "", fFlipWhy ? fFlipWhy : "", fShown.buf < 0 ? "surface" : "buffer ",
  		    fShown.buf < 0 ? 0 : fShown.buf, pns / 1000, fFlips, fInPlace, fFlipMissed, fFlipUnsure, fFlipEarly,
  		    pollNs / 1000);

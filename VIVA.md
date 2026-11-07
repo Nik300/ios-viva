@@ -806,3 +806,6 @@ Display. With 120 or auto at boot the service publishes IOMFBDisplayRefresh {dis
 from it (iOS 16.7, read once when backboardd starts; CA_HEARTBEAT_RATE overrides).
 On the phone (2026-11-07, vivapanelhz=1): 46 switches in auto mode, 0 failures, frame end 8348 / 16696 us; user
 scrolling Settings by hand: SwapEnd every 14.7 ms on average (4086 swaps), chosen -> on screen 4.9 ms (8.7 at 60 Hz).
+Update: the user saw a dark flash at idle switches. The switch is now locked to frame ends like the vendor's GCE
+sequence (commands after a start of frame, two frame ends, the porch written after the next start of frame, in the
+active lines) instead of arbitrary times; `vivapanelidle=ms` / `disp hz idle MS` sets the auto drop-back delay (500).
