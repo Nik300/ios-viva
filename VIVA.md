@@ -791,3 +791,14 @@ Fixes: viva-link.py one-shot modes no longer send the bye (a script is one link 
 input. Still hangs in the worst case (a fresh notice during an app transition, 20 s gaps): the tweak's system-element
 path is OFF on the phone (`vi-sb.sh off`) until fixed; the overlay path did not hang but drew nothing.
 Open: why wired memory grows that much (IOSurfaces are wired kernel memory, cap 1.5 GiB; GPU 142 MiB at the time).
+
+### 0189: panel refresh 60 / 120 Hz / auto
+The panel (Xiaomi viva-r-oss `drivers/gpu/drm/panel/dsi_k6t_38_0c_0a_dsc_vdo.c`) has a 120 Hz mode with the same
+pixel clock (369.469 MHz) and MIPI rate: VFP 2452 -> 20 lines, plus four DCS packets sent in the video-mode blanking
+through DSI VM_CMD (vendor LCM_SEND_IN_VDO / DYNFPS_DSI_VFP): F0 5A 5A, 60 01 (120) / 60 21 (60), F7 0B, F0 A5 A5,
+then two frames, then DSI_VFP_NL (0x14013028). Tried by hand with poke on 0187 (2026-11-07): frame end calibrated at
+8348 us, picture fine. AppleCLCD now: `panelSetHz()` (fScanLock, ~3 frames), vsync tick follows the panel (8333 us
+target at 120 Hz) and the period sent to CoreAnimation is per tick (was per panel frame), frame end calibrated again.
+Boot-arg `vivapanelhz=60|120|1` (1 = auto: 120 Hz from a swap, 60 Hz after 500 ms idle or display off), default 60;
+link `disp hz [60|120|auto]`; `disp kv` panel_hz, hz_mode, hz_switches, hz_failures. Viva Manager: SpringBoard ->
+Display. NOT tested on the phone as a kernel (only the manual poke sequence).

@@ -1,0 +1,283 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -75,6 +75,14 @@
+  * IOSurfaces completes, on this work loop, so a finished frame is copied off
+  * screen at once and switched at the next frame end instead of one tick later.
+  *
++ * Panel refresh (0189, boot-arg vivapanelhz=60|120|1, link "disp hz 60|120|auto"): the panel (Xiaomi
++ * dsi_k6t_38_0c_0a_dsc_vdo, DSC video mode, 369.469 MHz pixel clock) runs at 60 Hz with VFP 2452 lines and at
++ * 120 Hz with VFP 20, same clocks. The switch is the vendor's LCM_SEND_IN_VDO / DYNFPS_DSI_VFP path: four DCS
++ * packets sent in the video-mode blanking through DSI VM_CMD (F0 5A 5A, 60 01 for 120 Hz / 60 21 for 60 Hz, F7 0B,
++ * F0 A5 A5), two frames, then DSI_VFP_NL. The vsync tick then follows the panel (CoreAnimation gets 120 Hz with its
++ * period), the frame end is calibrated again. Auto (1): 120 Hz from the first swap, 60 Hz after 500 ms without one
++ * or with the display off, as ProMotion does. Default 60.
++ *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+@@ -233,8 +241,18 @@
+ 
+ 	/* viva direct scanout (see the top) */
+ 	IOLock       *fScanLock;      /* scanout state: present() vs. the link command */
+-	IOMemoryMap  *fDispMap[4];    /* OVL0, OVL0_2L, SMI larb0, larb1 */
+-	vm_offset_t   fDisp[4];
++	IOMemoryMap  *fDispMap[5];    /* OVL0, OVL0_2L, SMI larb0, larb1, DSI0 (0189) */
++	vm_offset_t   fDisp[5];
++	/* 0189 panel refresh (see the top) */
++	uint32_t      fPanelHz;       /* the panel's refresh now: 60 or 120 */
++	uint32_t      fHzMode;        /* 60, 120, 1 = auto */
++	uint32_t      fTickUs;        /* vsync tick target: 16667 (60 Hz) or 8333 (120 Hz) */
++	volatile uint32_t fHzWant;    /* a switch to this refresh is pending (done at the next vsync tick), 0 = none */
++	uint64_t      fHzSwitches, fHzFailures;
++	const char   *fHzWhy;         /* last switch failure */
++	volatile uint64_t fLastActivity;      /* mach time of the last swap (auto mode) */
++	bool panelSetHz(uint32_t hz);
++	void hzPolicy(void);
+ 	int           fScanOvl;       /* OVL of LK's layer (0/1), -1 = not found */
+ 	uint32_t      fScanAddrReg, fScanPitchReg, fScanPitchMsbReg;
+ 	uint32_t      fLkAddr, fLkPitch, fLkPitchMsb;
+@@ -407,6 +425,14 @@
+ 	int flip = 1;
+ 	PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
+ 	fFlipAllowed = flip != 0;
++	fPanelHz = 60;
++	fTickUs = SWEET_FB_VSYNC_US;
++	fHzMode = 60;
++	PE_parse_boot_argn("vivapanelhz", &fHzMode, sizeof(fHzMode));
++	if (fHzMode != 60 && fHzMode != 120 && fHzMode != 1) {
++		fHzMode = 60;
++	}
++	fHzWant = fHzMode == 120 ? 120 : 0;     /* done at the first vsync tick with frame ends known */
+ 	uint32_t us = 1000;
+ 	PE_parse_boot_argn("sweetfb_lead", &us, sizeof(us));        /* tick this long before the frame end */
+ 	nanoseconds_to_absolutetime((uint64_t)MIN(MAX(us, 200u), 4000u) * 1000, &fLead);
+@@ -440,6 +466,7 @@
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
++	fb->hzPolicy();                 /* 0189: a pending refresh switch happens here, on the work loop */
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	/*
+ 	 * 0135, scanout: look for a finished frame before the switch, so one found now is on screen at this frame end
+@@ -456,10 +483,10 @@
+ 	fb->vblankTick();               /* a pending layer switch happens at this frame end */
+ 	uint64_t now = mach_absolute_time();
+ 	fb->fLastNotifyAt = now;
+-	/* args 4/5: the refresh period (QuartzCore predicts the next vblank as time + period) */
+-	uint64_t period = fb->fPeriod;
++	/* args 4/5: the refresh period (QuartzCore predicts the next vblank as time + period): one tick, 0189 */
++	uint64_t period = fb->fPeriod * (fb->fFlipReady ? fb->fTickFrames : 1);
+ 	if (period == 0) {
+-		nanoseconds_to_absolutetime(16666667, &period);
++		nanoseconds_to_absolutetime((uint64_t)fb->fTickUs * 1000, &period);
+ 	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+@@ -618,7 +645,7 @@
+ AppleCLCD::rearm(IOTimerEventSource *timer)
+ {
+ 	if (!fFlipReady) {
+-		timer->setTimeoutUS(SWEET_FB_VSYNC_US);
++		timer->setTimeoutUS(fTickUs);
+ 		return;
+ 	}
+ 	uint64_t now = mach_absolute_time(), step = fPeriod * fTickFrames, next = fLastVblank + step;
+@@ -744,6 +771,10 @@
+ 	}
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++	fLastActivity = now;            /* 0189 auto refresh */
++	if (fHzMode == 1 && fPanelHz != 120) {
++		fHzWant = 120;
++	}
+ 	viva_cpufreq_ui_activity();     /* 0183: frames are being drawn: CPU clusters out of the floor */
+ 	earlyKick();                    /* shown right away if the GPU has already finished it */
+ 	/* the format of every layer CoreAnimation sets (SwapSetLayer), logged when it changes */
+@@ -1048,6 +1079,18 @@
+ #define OVL_INTSTA              0x008   /* write 0 to a bit to clear it */
+ #define OVL_INT_FME_CPL         (1u << 1)       /* frame complete */
+ #define OVL_ADDCON_DBG          0x244   /* [12:0] x, [28:16] y of the pixel being blended */
++/* 0189: DSI0 (Xiaomi viva-r-oss drivers/gpu/drm/mediatek/mtk_dsi.c, CONFIG_MACH_MT6781 offsets) */
++#define DISP_DSI0_PA            0x14013000ull
++#define DSI_START               0x000   /* bit 0 video start, bit 16 VM_CMD_START */
++#define DSI_VM_CMD_START        (1u << 16)
++#define DSI_INTSTA              0x00c   /* bit 5 VM_CMD_DONE (write 0 to clear) */
++#define DSI_VM_CMD_DONE         (1u << 5)
++#define DSI_MODE_CTRL           0x014   /* [1:0] 0 = command mode */
++#define DSI_VFP_NL              0x028
++#define DSI_VM_CMD_CON          0x200   /* [0] enable, [1] long packet, [5] send in VFP, [15:8] type, [31:16] data/len */
++#define DSI_VM_CMD_DATA0        0x208
++#define PANEL_VFP_60            2452
++#define PANEL_VFP_120           20
+ 
+ 
+ static inline uint32_t
+@@ -1104,8 +1147,8 @@
+ bool
+ AppleCLCD::dispMap(void)
+ {
+-	static const uint64_t pa[4] = { DISP_OVL0_PA, DISP_OVL0_2L_PA, SMI_LARB0_PA, SMI_LARB1_PA };
+-	for (int i = 0; i < 4; i++) {
++	static const uint64_t pa[5] = { DISP_OVL0_PA, DISP_OVL0_2L_PA, SMI_LARB0_PA, SMI_LARB1_PA, DISP_DSI0_PA };
++	for (int i = 0; i < 5; i++) {
+ 		if (fDispMap[i] != NULL) {
+ 			continue;
+ 		}
+@@ -1424,7 +1467,102 @@
+  * bytes = 3 x 1088 x 2400 x 4). 0128: some boots LK leaves OVL0 L1 enabled on its second buffer (seen after a panic
+  * reboot: L1 1080x2400 pitch 4320 at 0x7c606000); the double buffer was then off and every copy went to the buffer on
+  * screen (tearing bands while scrolling). The third buffer is used instead.
++ */
++/*
++ * 0189: switch the panel to `hz` (60 or 120), see the top. fScanLock. Busy for ~3 frames (two waited for the panel to
++ * take the mode, one to calibrate the frame end again).
+  */
++bool
++AppleCLCD::panelSetHz(uint32_t hz)
++{
++	if (!dispMap()) {
++		fHzWhy = "display registers not mappable";
++		return false;
++	}
++	vm_offset_t d = fDisp[4];
++	uint32_t vfp = disp_rd(d, DSI_VFP_NL);
++	if ((disp_rd(d, DSI_MODE_CTRL) & 3) == 0) {
++		fHzWhy = "DSI not in video mode";
++		return false;
++	}
++	if (vfp != PANEL_VFP_60 && vfp != PANEL_VFP_120) {
++		fHzWhy = "unknown panel timing (VFP not 2452 / 20)";
++		return false;
++	}
++	/* {VM_CMD_CON, DATA0}: enable | send in VFP, DCS long (0x39, 3 bytes) or short with a parameter (0x15) */
++	const uint32_t cmds[4][2] = {
++		{ 0x00033923, 0x005a5af0 },                             /* F0 5A 5A */
++		{ hz == 120 ? 0x01601521u : 0x21601521u, 0 },           /* 60 01 / 60 21 */
++		{ 0x0bf71521, 0 },                                      /* F7 0B */
++		{ 0x00033923, 0x00a5a5f0 },                             /* F0 A5 A5 */
++	};
++	for (int i = 0; i < 4; i++) {
++		if (cmds[i][1] != 0) {
++			disp_wr(d, DSI_VM_CMD_DATA0, cmds[i][1]);
++		}
++		disp_wr(d, DSI_VM_CMD_CON, cmds[i][0]);
++		disp_wr(d, DSI_INTSTA, disp_rd(d, DSI_INTSTA) & ~DSI_VM_CMD_DONE);
++		disp_wr(d, DSI_START, disp_rd(d, DSI_START) & ~DSI_VM_CMD_START);
++		disp_wr(d, DSI_START, disp_rd(d, DSI_START) | DSI_VM_CMD_START);
++		bool done = false;
++		for (int t = 0; t < 1000 && !done; t++) {      /* a VFP comes at least every 16.7 ms */
++			done = (disp_rd(d, DSI_INTSTA) & DSI_VM_CMD_DONE) != 0;
++			if (!done) {
++				IODelay(50);
++			}
++		}
++		disp_wr(d, DSI_START, disp_rd(d, DSI_START) & ~DSI_VM_CMD_START);
++		disp_wr(d, DSI_INTSTA, disp_rd(d, DSI_INTSTA) & ~DSI_VM_CMD_DONE);
++		if (!done) {
++			fHzWhy = "panel command not sent (VM_CMD_DONE timeout)";
++			return false;
++		}
++	}
++	IOSleep(34);                    /* send_cmd_need_delay: two frames before the new porch */
++	disp_wr(d, DSI_VFP_NL, hz == 120 ? PANEL_VFP_120 : PANEL_VFP_60);
++	fPanelHz = hz;
++	fTickUs = hz == 120 ? 8333 : SWEET_FB_VSYNC_US;
++	if (fFlipReady && !vblankCalibrate(NULL, NULL)) {
++		fFlipReady = false;
++		fFlipWhy = "no frame end after the refresh switch";
++	}
++	fHzSwitches++;
++	IOLog("SWEET FB: panel %u Hz (frame %llu us)\n", hz, fPeriod ? absUsFB(fPeriod) : 0);
++	return true;
++}
++
++/* 0189, vsync tick: the auto policy and a pending switch. */
++void
++AppleCLCD::hzPolicy(void)
++{
++	uint32_t want = fHzWant;
++	if (fHzMode == 1 && fPanelHz == 120 && want == 0) {
++		uint64_t idle;
++		nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &idle);
++		if (fPowerOff || mach_absolute_time() - fLastActivity > idle) {
++			want = 60;
++		}
++	}
++	if (want == 0 || !fFlipReady) {
++		return;                 /* switches wait for the frame end to be known (first swap) */
++	}
++	fHzWant = 0;
++	if (want == fPanelHz || (fPowerOff && want == 120)) {
++		return;
++	}
++	IOLockLock(fScanLock);
++	if (!panelSetHz(want)) {
++		fHzFailures++;
++		if (fHzFailures <= 8) {
++			IOLog("SWEET FB: panel %u Hz failed: %s\n", want, fHzWhy);
++		}
++		if (fHzMode == 1) {
++			fHzMode = 60;           /* auto off after a failure */
++		}
++	}
++	IOLockUnlock(fScanLock);
++}
++
+ bool
+ AppleCLCD::flipSetup(char **out, char *end)
+ {
+@@ -1530,7 +1668,7 @@
+ 				fPeriod = (t[2] - t[0]) / 2;
+ 				fLastVblank = t[2];
+ 				uint64_t tick;
+-				nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000, &tick);
++				nanoseconds_to_absolutetime((uint64_t)fTickUs * 1000, &tick);
+ 				fTickFrames = (uint32_t)MAX((tick + fPeriod / 2) / fPeriod, 1ull);
+ 				return true;
+ 			}
+@@ -1770,6 +1908,24 @@
+ 		}
+ 		fDirty = true;
+ 		disp_say(&p, end, "double buffer off: copies go to LK's buffer on screen\n");
++	} else if (strncmp(args, "hz", 2) == 0) {
++		const char *a = args + 2;
++		while (*a == ' ') {
++			a++;
++		}
++		if (strncmp(a, "120", 3) == 0) {
++			fHzMode = 120;
++			fHzWant = 120;
++		} else if (strncmp(a, "60", 2) == 0) {
++			fHzMode = 60;
++			fHzWant = 60;
++		} else if (strncmp(a, "auto", 4) == 0) {
++			fHzMode = 1;
++			fHzWant = 120;
++		}
++		disp_say(&p, end, "panel %u Hz, mode %s%s, %llu switches, %llu failures%s%s\n", fPanelHz,
++		    fHzMode == 1 ? "auto" : fHzMode == 120 ? "120" : "60", fHzWant ? " (switch pending)" : "", fHzSwitches,
++		    fHzFailures, fHzWhy ? ", last: " : "", fHzWhy ? fHzWhy : "");
+ 	} else if (strncmp(args, "kv", 2) == 0) {
+ 		/* KA1 (gpu/docs/RICHIESTE-KERNEL.md): stable key=value lines for Viva Manager */
+ 		IOLockLock(fLock);
+@@ -1784,6 +1940,8 @@
+ 		    fCopies ? fCopyNs / fCopies / 1000 : 0);
+ 		disp_say(&p, end, "lat_swap_gpu_avg_us=%llu\nlat_chosen_screen_avg_us=%llu\nearly_shown=%llu\nflip=%d\n"
+ 		    "swapwait_busy=%llu\n", r, f, fEarlyShown, fFlipReady ? 1 : 0, fSwapWaitBusy);
++		disp_say(&p, end, "panel_hz=%u\nhz_mode=%u\nhz_switches=%llu\nhz_failures=%llu\n", fPanelHz, fHzMode,
++		    fHzSwitches, fHzFailures);
+ 		{
+ 			uint32_t pb = 0, pu = 0, pk = 0;
+ 			uint64_t fp = 0, fc = 0, sp = 0;
+@@ -1847,7 +2005,9 @@
+ 		    fFlipWhy ? ": " : "", fFlipWhy ? fFlipWhy : "", fShown.buf < 0 ? "surface" : "buffer ",
+ 		    fShown.buf < 0 ? 0 : fShown.buf, pns / 1000, fFlips, fInPlace, fFlipMissed, fFlipUnsure, fFlipEarly,
+ 		    pollNs / 1000);
+-		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off|flip on|flip off|early on|early off|lat reset]\n");
++		disp_say(&p, end, "panel refresh (0189): %u Hz, mode %s, %llu switches, %llu failures\n", fPanelHz,
++		    fHzMode == 1 ? "auto" : fHzMode == 120 ? "120" : "60", fHzSwitches, fHzFailures);
++		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off|flip on|flip off|early on|early off|lat reset|hz 60|120|auto]\n");
+ 	}
+ 	IOLockUnlock(fScanLock);
+ }
