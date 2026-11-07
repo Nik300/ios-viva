@@ -212,13 +212,16 @@ class Link:
         port = self.port
         while True:
             try:
-                pkt = bytes(port.dev.read(port.ep_in, 512, timeout=0))
+                # Several frames per read: a full 512-byte frame does not end the transfer, so the next packets
+                # join it; a 512-byte buffer then fails with EOVERFLOW ("link lost: [Errno 84] Overflow").
+                buf = bytes(port.dev.read(port.ep_in, 16384, timeout=0))
             except USBTimeoutError:
                 continue
-            if len(pkt) < 4 or pkt[0] != ord('V'):
-                continue
-            n = pkt[2] | pkt[3] << 8
-            yield chr(pkt[1]), pkt[4:4 + n]
+            at = 0
+            while at + 4 <= len(buf) and buf[at] == ord('V'):
+                n = buf[at + 2] | buf[at + 3] << 8
+                yield chr(buf[at + 1]), buf[at + 4:at + 4 + n]
+                at += 4 + n
 
     def write(self, data, timeout=2000):
         port = self.port
