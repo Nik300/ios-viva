@@ -824,3 +824,8 @@ without the FPU, multiplied in type order, written to the display pipe's CCORR (
 on MT6781, two 13-bit per register; CFG bit 0 relay / bit 1 engine; identity = relay). Tried by hand: a warm matrix
 turned the picture yellow. First 16 matrices logged (`SWEET FB: matrix T: ...`). Link `disp bl [N]`; `disp kv`
 brightness=, brightness_max=, matrix_calls=. NOT tested as a kernel.
+Update: on the phone neither control reached the kernel (trace: no selector, no property). CoreBrightness only builds its
+display module for a service matching IOPropertyMatch {backlight-control: true} that conforms to AppleARMBacklight
+(CBDisplayContaineriOS findBacklight); DisplayCreateWithID reads IODisplayParameters.brightness {min, max, value}.
+AppleCLCD now attaches such a nub (AppleARMBacklight, max 2047); its setProperties takes brightness / IODisplayParameters
+to the panel. `disp seltrace on` logs every user client call, swap record change and property set.

@@ -1,11 +1,10 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -83,6 +83,14 @@
-  * period), the frame end is calibrated again. Auto (1): 120 Hz from the first swap, 60 Hz after 500 ms without one
+@@ -84,6 +84,14 @@
   * (vivapanelidle=ms) or with the display off, as ProMotion does; the switch is locked to frame ends. Default 60. With 120 or auto at boot the service also publishes
   * IOMFBDisplayRefresh (min refresh interval 8.333 ms), which QuartzCore reads when backboardd starts.
-+ *
+  *
 + * Brightness and Night Shift (0191). CoreBrightness sets IOMFBBrightnessLevel on this service (CFNumber, nits in 16.16
 + * fixed point; SetIOMFBBrightness in CoreBrightness, iOS 16.7): the panel takes DCS 51 HH LL, 0..2047 for its
 + * normal range (Xiaomi lcm_setbacklight_cmdq), sent through VM_CMD at the next vsync tick (fades coalesce);
@@ -13,10 +12,11 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 + * selector 55 (IOMobileFramebufferSetMatrix: scalar = which matrix, 9 doubles row-major); their product goes to the
 + * display pipe's CCORR (0x1400b000, Xiaomi mtk_disp_ccorr.c: 3x3, 1.0 = 0x800 on MT6781, 13-bit signed, two per
 + * register; CFG bit 0 relay / bit 1 engine). Identity = relay (bypass).
-  *
++ *
   * The panel memory itself is published as an IOSurface and returned as the
   * default framebuffer surface. The kernel text console keeps drawing over
-@@ -256,6 +264,23 @@
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+@@ -256,6 +264,26 @@
  	uint32_t      fHzSeq;         /* vivapanelseq / "disp hz seq N": where the porch goes relative to the commands */
  	bool panelSetHz(uint32_t hz);
  	void hzPolicy(void);
@@ -34,13 +34,38 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	uint8_t       fTraceRec[SWEET_FB_SWAP_REC_SIZE];
 +	uint32_t      fTraceLines;
 +	bool dsiSendDcs(const uint8_t *b, uint32_t n, bool vbp);
++	class AppleARMBacklight *fBacklight;
++	void backlightStart(void);
++	void traceProperties(const char *who, OSDictionary *dict);
 +	void lightTick(void);
 +	void setMatrix(uint32_t type, const uint64_t bits[9]);
 +	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
  	int           fScanOvl;       /* OVL of LK's layer (0/1), -1 = not found */
  	uint32_t      fScanAddrReg, fScanPitchReg, fScanPitchMsbReg;
  	uint32_t      fLkAddr, fLkPitch, fLkPitchMsb;
-@@ -436,6 +461,10 @@
+@@ -323,6 +351,21 @@
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ static AppleCLCD *gSweetFB;     /* for the USB link "disp" command */
++
++/*
++ * 0191: CoreBrightness (CBDisplayContaineriOS findBacklight, iOS 16.7) matches IOPropertyMatch {backlight-control: true}
++ * and keeps the service that conforms to AppleARMBacklight; DisplayCreateWithID reads IODisplayParameters.brightness
++ * {min, max, value}. Without it there is no display module: no brightness, no Night Shift. Brightness writes come back
++ * through setProperties (logged with "disp seltrace on") and go to the panel through AppleCLCD.
++ */
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	AppleCLCD *fFB;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	void publishLevel(uint32_t level);
++};
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+ volatile uint32_t sweet_fb_gpu_waits;
+ static volatile uint32_t gSweetFbDutyCap;       /* sweet_fb_set_duty_cap (Low Power Mode); 0 = sweetfb_duty */
+ 
+@@ -436,6 +479,10 @@
  		fHzMode = 60;
  	}
  	fHzWant = fHzMode == 120 ? 120 : 0;     /* done at the first vsync tick with frame ends known */
@@ -51,7 +76,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fHzIdleMs = 500;
  	PE_parse_boot_argn("vivapanelidle", &fHzIdleMs, sizeof(fHzIdleMs));
  	fHzIdleMs = MIN(MAX(fHzIdleMs, 100u), 60000u);
-@@ -464,6 +493,7 @@
+@@ -464,6 +511,7 @@
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
@@ -59,7 +84,15 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	if (fHzMode != 60) {
  		/*
  		 * 0189: QuartzCore (CA::WindowServer::AppleDisplay, iOS 16.7) reads IOMFBDisplayRefresh at start:
-@@ -496,6 +526,7 @@
+@@ -486,6 +534,7 @@
+ 		OSSafeReleaseNULL(refresh);
+ 	}
+ 	registerService();
++	backlightStart();               /* 0191 */
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
+@@ -496,6 +545,7 @@
  {
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	fb->hzPolicy();                 /* 0189: a pending refresh switch happens here, on the work loop */
@@ -67,7 +100,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	uint64_t count = ++fb->fVsyncCount;
  	/*
  	 * 0135, scanout: look for a finished frame before the switch, so one found now is on screen at this frame end
-@@ -1118,6 +1149,10 @@
+@@ -1118,6 +1168,10 @@
  #define DSI_VFP_NL              0x028
  #define DSI_VM_CMD_CON          0x200   /* [0] enable, [1] long packet, [5] send in VFP, [15:8] type, [31:16] data/len */
  #define DSI_VM_CMD_DATA0        0x208
@@ -78,12 +111,14 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  #define PANEL_VFP_60            2452
  #define PANEL_VFP_120           20
  
-@@ -1629,7 +1664,175 @@
+@@ -1627,6 +1681,268 @@
+ 		}
+ 	}
  	IOLockUnlock(fScanLock);
- }
- 
++}
++
 +/* 0191: one DCS write (1-3 bytes, write or long write) in the video-mode blanking. fScanLock. */
- bool
++bool
 +AppleCLCD::dsiSendDcs(const uint8_t *b, uint32_t n, bool vbp)
 +{
 +	if (!dispMap() || n == 0 || n > 4) {
@@ -131,6 +166,9 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		if (bl != fBlLevel && dsiSendDcs(cmd, 3, false)) {
 +			fBlLevel = bl;
 +			fBlSent++;
++			if (fBacklight != NULL) {
++				fBacklight->publishLevel(bl);
++			}
 +		}
 +	}
 +	if (matrix) {
@@ -219,23 +257,114 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	fMatrixDirty = true;
 +}
 +
++/* 0191: the AppleARMBacklight nub (see its class). */
++void
++AppleCLCD::backlightStart(void)
++{
++	AppleARMBacklight *b = OSTypeAlloc(AppleARMBacklight);
++	if (b == NULL || !b->init()) {
++		OSSafeReleaseNULL(b);
++		return;
++	}
++	b->fFB = this;
++	b->setProperty("backlight-control", true);
++	b->publishLevel(0x219);         /* LK's level */
++	if (!b->attach(this)) {
++		b->release();
++		return;
++	}
++	b->registerService();
++	fBacklight = b;
++}
++
++void
++AppleARMBacklight::publishLevel(uint32_t level)
++{
++	OSDictionary *params = OSDictionary::withCapacity(1), *bright = OSDictionary::withCapacity(3);
++	OSNumber *mn = OSNumber::withNumber(0ull, 32), *mx = OSNumber::withNumber((unsigned long long)PANEL_LEVEL_MAX, 32);
++	OSNumber *v = OSNumber::withNumber((unsigned long long)level, 32);
++	if (params != NULL && bright != NULL && mn != NULL && mx != NULL && v != NULL) {
++		bright->setObject("min", mn);
++		bright->setObject("max", mx);
++		bright->setObject("value", v);
++		params->setObject("brightness", bright);
++		setProperty("IODisplayParameters", params);
++	}
++	OSSafeReleaseNULL(mn);
++	OSSafeReleaseNULL(mx);
++	OSSafeReleaseNULL(v);
++	OSSafeReleaseNULL(bright);
++	OSSafeReleaseNULL(params);
++}
++
++/* A brightness number as CoreBrightness may send it: a number, or a dictionary with "value". */
++static bool
++sweet_fb_brightness_value(OSObject *o, uint64_t *v)
++{
++	OSNumber *n = OSDynamicCast(OSNumber, o);
++	OSDictionary *d = OSDynamicCast(OSDictionary, o);
++	if (n == NULL && d != NULL) {
++		n = OSDynamicCast(OSNumber, d->getObject("value"));
++	}
++	if (n == NULL) {
++		return false;
++	}
++	*v = n->unsigned64BitValue();
++	return true;
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	if (dict == NULL || fFB == NULL) {
++		return kIOReturnBadArgument;
++	}
++	fFB->traceProperties("backlight", dict);
++	uint64_t v = 0;
++	OSDictionary *params = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
++	bool have = sweet_fb_brightness_value(dict->getObject("brightness"), &v) ||
++	    (params != NULL && sweet_fb_brightness_value(params->getObject("brightness"), &v));
++	if (!have) {
++		return kIOReturnSuccess;        /* accepted (logged), nothing for the panel */
++	}
++	uint32_t level = (uint32_t)MIN(v, (uint64_t)PANEL_LEVEL_MAX);
++	fFB->fBlWant = level;
++	publishLevel(level);
++	return kIOReturnSuccess;
++}
++
++/* 0191, "disp seltrace on": every property a client sets on us or the backlight nub. */
++void
++AppleCLCD::traceProperties(const char *who, OSDictionary *dict)
++{
++	if (!fSelTrace || dict == NULL || fTraceLines >= 400) {
++		return;
++	}
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
++	OSSymbol *k;
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	while (it != NULL && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++		OSObject *o = dict->getObject(k);
++		OSNumber *v = OSDynamicCast(OSNumber, o);
++		fTraceLines++;
++		IOLog("SWEET FB: trace %s %s set %s = %s%llu\n", name, who, k->getCStringNoCopy(),
++		    v ? "" : OSDynamicCast(OSDictionary, o) ? "(dictionary) " : "(other) ", v ? v->unsigned64BitValue() : 0);
++		OSDictionary *sub = OSDynamicCast(OSDictionary, o);
++		if (sub != NULL) {
++			traceProperties(who, sub);
++		}
++	}
++	OSSafeReleaseNULL(it);
++}
++
 +/* 0191: CoreBrightness's IOMFBBrightnessLevel (nits << 16). */
 +IOReturn
 +AppleCLCD::setProperties(OSObject *properties)
 +{
 +	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
-+	if (fSelTrace && dict != NULL && fTraceLines < 400) {
-+		OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
-+		OSSymbol *k;
-+		char name[32];
-+		proc_selfname(name, sizeof(name));
-+		while (it != NULL && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
-+			OSNumber *v = OSDynamicCast(OSNumber, dict->getObject(k));
-+			fTraceLines++;
-+			IOLog("SWEET FB: trace %s set property %s = %llu\n", name, k->getCStringNoCopy(), v ? v->unsigned64BitValue() : 0);
-+		}
-+		OSSafeReleaseNULL(it);
-+	}
++	traceProperties("framebuffer", dict);
 +	OSNumber *n = dict != NULL ? OSDynamicCast(OSNumber, dict->getObject("IOMFBBrightnessLevel")) : NULL;
 +	if (n == NULL) {
 +		return kIOReturnUnsupported;
@@ -248,13 +377,10 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	fBlWant = (uint32_t)MIN(level, (uint64_t)PANEL_LEVEL_MAX);
 +	setProperty("IOMFBBrightnessLevel", n);
 +	return kIOReturnSuccess;
-+}
-+
-+bool
- AppleCLCD::flipSetup(char **out, char *end)
- {
- 	fFlipReady = false;
-@@ -2000,6 +2203,25 @@
+ }
+ 
+ bool
+@@ -2000,6 +2316,25 @@
  		disp_say(&p, end, "panel %u Hz, mode %s (idle %u ms, seq %u)%s, %llu switches, %llu failures%s%s\n", fPanelHz,
  		    fHzMode == 1 ? "auto" : fHzMode == 120 ? "120" : "60", fHzIdleMs, fHzSeq, fHzWant ? " (switch pending)" : "", fHzSwitches,
  		    fHzFailures, fHzWhy ? ", last: " : "", fHzWhy ? fHzWhy : "");
@@ -280,7 +406,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	} else if (strncmp(args, "kv", 2) == 0) {
  		/* KA1 (gpu/docs/RICHIESTE-KERNEL.md): stable key=value lines for Viva Manager */
  		IOLockLock(fLock);
-@@ -2016,6 +2238,7 @@
+@@ -2016,6 +2351,7 @@
  		    "swapwait_busy=%llu\n", r, f, fEarlyShown, fFlipReady ? 1 : 0, fSwapWaitBusy);
  		disp_say(&p, end, "panel_hz=%u\nhz_mode=%u\nhz_switches=%llu\nhz_failures=%llu\n", fPanelHz, fHzMode,
  		    fHzSwitches, fHzFailures);
@@ -288,11 +414,10 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		{
  			uint32_t pb = 0, pu = 0, pk = 0;
  			uint64_t fp = 0, fc = 0, sp = 0;
-@@ -2174,6 +2397,36 @@
- 	IOReturn ret = kIOReturnSuccess;
+@@ -2175,6 +2511,36 @@
  	uint64_t out[2] = { 0, 0 };
  	uint32_t outCount = 0;
-+
+ 
 +	if (fFB->fSelTrace && fFB->fTraceLines < 400) {
 +		/* 0191: what QuartzCore / CoreBrightness call (swap records: only words that changed past the layer fields) */
 +		char name[32];
@@ -322,10 +447,11 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +			    args->structureOutputSize);
 +		}
 +	}
- 
++
  	switch (selector) {
  	case kSweetFBGetLayerDefaultSurface:
-@@ -2240,6 +2493,14 @@
+ 		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
+@@ -2240,6 +2606,14 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
