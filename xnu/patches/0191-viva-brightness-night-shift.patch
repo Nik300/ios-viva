@@ -38,8 +38,8 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	volatile uint32_t fBlWant;    /* panel level to send at the next tick, 0xffffffff = none */
 +	uint32_t      fBlLevel;       /* last level sent */
 +	uint64_t      fBlSent, fMatrixCalls, fMatrixApplied;
-+	int32_t       fMatrix[8][9];  /* per matrix type, fixed point 1.0 = 0x800 */
-+	bool          fMatrixUsed[8];
++	int32_t       fMatrix[16][9]; /* per matrix type (Night Shift = 9), fixed point 1.0 = 0x800 */
++	bool          fMatrixUsed[16];
 +	volatile bool fMatrixDirty;
 +	volatile bool fSelTrace;      /* "disp seltrace on": log every user client call and swap record changes */
 +	uint8_t       fTraceRec[SWEET_FB_SWAP_REC_SIZE];
@@ -234,7 +234,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		fMatrixDirty = false;
 +		/* product of the matrices in type order, fixed point 1.0 = 0x800 */
 +		int64_t m[9] = { 0x800, 0, 0, 0, 0x800, 0, 0, 0, 0x800 };
-+		for (int t = 0; t < 8; t++) {
++		for (int t = 0; t < 16; t++) {
 +			if (!fMatrixUsed[t]) {
 +				continue;
 +			}
@@ -276,7 +276,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +AppleCLCD::setMatrix(uint32_t type, const uint64_t bits[9])
 +{
 +	fMatrixCalls++;
-+	if (type >= 8) {
++	if (type >= 16) {
 +		return;
 +	}
 +	int32_t m[9];
