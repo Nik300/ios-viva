@@ -22,7 +22,8 @@ switched it (patch 0182, docs/VIVA-USB-PERSONA.md), 05ac:12a8 (persona `std`: PT
 interface of class ff/56/01). Only the link interface is claimed; its bulk endpoints come from the descriptors.
 The interactive and `log` modes wait for the phone and reattach by themselves when it re-enumerates (persona
 switch, reboot); the one-shot modes exit when the link goes away. While attached, every mode sends the
-"Viva Link active" heartbeat (vendor request 0x41/0x56 wValue 1, every second) and a bye (wValue 0) on exit.
+"Viva Link active" heartbeat (vendor request 0x41/0x56 wValue 1, every second) and a bye (wValue 0) when the
+interactive or log mode exits (one-shot commands just stop: the phone drops "active" 4 s later).
 
 Every IN packet is a frame: 'V', type, u16 length, payload with type 'L' (console log), 'R' (command
 reply), 'E' (end of reply), 'F' (file data of a pull) or 'O' (output of programs run by vivad).
@@ -55,6 +56,7 @@ EP_IN, EP_OUT = 0x81, 0x01          # only if the descriptors say nothing
 PHONE_COMMANDS = ('ping', 'stat', 'help', 'peek', 'poke', 'pmic', 'i2c', 'i2cw', 'i2c8', 'i2c8w', 'bat', 'wifi',
                   'cpu', 'gpu', 'disp', 'push', 'pull', 'run', 'vivad', 'rewind', 'console', 'panic', 'reboot')
 LINKS = []                          # every Link, for the bye at exit
+BYE = True                          # one-shot modes leave without a bye (see main)
 
 # dev: pyusb device (or the simulator's); ifn: link interface number; persona: 'link' or 'std'
 Port = collections.namedtuple('Port', 'dev ifn ep_in ep_out persona')
@@ -490,6 +492,11 @@ def main():
     a = ap.parse_args()
 
     oneshot = a.mode not in ('interactive', 'log')
+    # A bye after every one-shot command flips the phone's link state (island, charger input limit) at each command
+    # of a script; that churn hung SpringBoard (2026-11-07). Without it the kernel drops "active" 4 s after the last
+    # heartbeat, so a run of commands is one link session.
+    global BYE
+    BYE = not oneshot
     link = Link(a.output, show_log=not oneshot, reconnect=not oneshot)
     if a.mode == 'interactive':
         try:
@@ -568,7 +575,7 @@ if __name__ == '__main__':
             code = 1
         else:
             code = e.code or 0
-    for l in LINKS:
+    for l in LINKS if BYE else []:
         l.bye()
     sys.stdout.flush()
     sys.stderr.flush()

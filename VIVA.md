@@ -775,3 +775,19 @@ so 0182 left 500 mA -> **0186**: full input on any detected port while the tool 
 0183's A76 rule held big at ~1920 MHz whenever LL ran fast (84 C). Now only during a boost. P6 left CA's 1125x2436
 snapshot (pitch 4512) and 787x1705 surfaces unaligned (explicit IOSurfaceAllocSize = pitch x height): boot-arg
 `vivasurfpitch=2` rounds those too and grows the allocation (to try: correct only if the writers read the pitch back).
+
+### Hang: `vctl open` / swipes never return, vivad "not reading" (2026-11-07, analysis)
+Reproduced with `sweetsample=SpringBoard,backboardd,vivad,vctl` and a script of one-shot viva-link commands with
+pauses (each command = heartbeat + bye = link state 2 -> 1 -> 2, and the 0182/0186 charger input limit flips 500 <->
+2000 mA). Without the VivaIsland tweak: 0 hangs in 104 commands. With it: SpringBoard's main thread never idles again
+(UIKit in-process animations, its own `_checkForHang`, `SBSystemApertureProvidedContentElement` descriptions,
+`SBFluidSwitcher...` layout): an endless System Aperture layout/animation loop when the tweak's element (alert ->
+activity, `-[VIElementPresenter noticeEnded:]`) changes during an app transition; every client of SpringBoard (vctl)
+waits forever. Wired memory meanwhile climbs from ~53k to ~237k pages (16 KiB) with repeated failed 11 MiB contiguous
+allocations; vivad then sits at the same user pc in every sample (a page fault that never completes), so the kernel
+sees no reader and refuses commands. Not a loop in vivad's code.
+Fixes: viva-link.py one-shot modes no longer send the bye (a script is one link session; the phone drops "active"
+4 s after the last heartbeat); VivaIsland debounces 2 s up / 15 s down; vivad no longer spins on EINTR and reports odd
+input. Still hangs in the worst case (a fresh notice during an app transition, 20 s gaps): the tweak's system-element
+path is OFF on the phone (`vi-sb.sh off`) until fixed; the overlay path did not hang but drew nothing.
+Open: why wired memory grows that much (IOSurfaces are wired kernel memory, cap 1.5 GiB; GPU 142 MiB at the time).

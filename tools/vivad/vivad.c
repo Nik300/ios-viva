@@ -295,6 +295,11 @@ command(char *line)
 {
     char *id = line, *text = strchr(line, ' ');
     if (text == NULL) {
+        /* diagnostic (2026-11-07): after SpringBoard hung, read() kept returning such lines in a tight loop */
+        static unsigned odd;
+        if (odd++ % 1000 == 0) {
+            say("vivad: odd input #%u (%zu bytes): \"%.60s\"\n", odd, strlen(line), line);
+        }
         return;
     }
     *text++ = 0;
@@ -387,11 +392,27 @@ main(void)
         pthread_detach(t);
     }
     char line[600];
+    unsigned eintr = 0;
     for (;;) {
         ssize_t n = read(fd, line, sizeof(line) - 1);
         if (n < 0 && errno == EINTR) {
+            /*
+             * Seen 2026-11-07 after SpringBoard hung: every read() came back EINTR at once and this loop spun at
+             * 100 % CPU (the kernel then saw no reader and refused commands). Don't spin; say once what is pending.
+             */
+            if (++eintr == 1000) {
+                sigset_t pend, mask;
+                sigpending(&pend);
+                pthread_sigmask(SIG_BLOCK, NULL, &mask);
+                say("vivad: read() interrupted %u times in a row: pending signals 0x%x, blocked 0x%x\n", eintr,
+                    (unsigned)pend, (unsigned)mask);
+            }
+            if (eintr > 100) {
+                usleep(1000);
+            }
             continue;
         }
+        eintr = 0;
         if (n <= 0) {
             sleep(1);
             continue;
@@ -399,6 +420,13 @@ main(void)
         line[n] = 0;
         if (n > 0 && line[n - 1] == '\n') {
             line[n - 1] = 0;
+        }
+        if (strchr(line, ' ') == NULL) {        /* diagnostic, see command() */
+            static unsigned bad;
+            struct stat st;
+            if (bad++ % 1000 == 0 && fstat(fd, &st) == 0) {
+                say("vivad: fd %d mode 0%o rdev 0x%x read %zd bytes\n", fd, st.st_mode, st.st_rdev, n);
+            }
         }
         command(line);
     }
