@@ -1,0 +1,57 @@
+diff --git a/osfmk/arm64/viva_cpufreq.c b/osfmk/arm64/viva_cpufreq.c
+--- a/osfmk/arm64/viva_cpufreq.c
++++ b/osfmk/arm64/viva_cpufreq.c
+@@ -31,9 +31,9 @@
+  * viva_cpufreq_ui_activity(); for vivacpuboostms (250) after the last call LL and big run at least at
+  * vivacpuboost=MHz (default: their fastest OPP), still under every ceiling (thermal 0147, Low Power Mode, link).
+  * The first signal after a quiet period samples at once instead of waiting up to 100 ms. vivacpuboostms=0 = off.
+- * With the A76 preference on (sched_viva_fast_cpus), big never runs slower than 1.4 x an A55 at LL's clock / 1.46
+- * (the A76 does ~1.46x the work per clock): a UI thread sent to an A76 must not be slower than on an A55. If the big
+- * ceiling does not allow that, the preference is suspended until it does.
++ * While boosted with the A76 preference on (sched_viva_fast_cpus), big never runs slower than 1.4 x an A55 at LL's
++ * clock / 1.46 (the A76 does ~1.46x the work per clock): a UI thread sent to an A76 must not be slower than on an A55.
++ * If the big ceiling does not allow that, the preference is suspended until it does.
+  *
+  * Boot-args: vivacpufreq=0 (never touch clocks/rails), 1 (governor, default), 2 (manual: link only);
+  *   vivacpubig=MHz / vivacpull=MHz / vivacpucci=MHz ceilings (default 2050/2000/1400); vivalpmcpu=MHz big ceiling
+@@ -387,8 +387,11 @@
+ 			}
+ 			want[d] = t;
+ 		}
+-		/* A76 preference: big at least 1.4 x LL's clock / 1.46, or the preference is suspended */
+-		if (gFast) {
++		/*
++		 * A76 preference: big at least 1.4 x LL's clock / 1.46, or the preference is suspended. Only while boosted
++		 * (0187): outside a boost it kept big at ~1920 MHz whenever LL ran fast, idle A76s included (84 C on the phone).
++		 */
++		if (gFast && boost) {
+ 			int need = idx_for_mhz(DOM_BIG, kOppLL[want[DOM_LL]].mhz * 140 / 146);
+ 			bool suspend = need < ceiling(DOM_BIG);
+ 			if (!suspend && want[DOM_BIG] > need) {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -455,18 +455,20 @@
+ 	 * surfaces in and out at every use (10.7 MB each way, 23 ms stalls on the GPU queue). Single-plane surfaces get
+ 	 * the pitch rounded up: clients read it back from the lock result (+0x28; CA, ImageIO, IOSurface.framework).
+ 	 * Not when an explicit IOSurfaceAllocSize would no longer hold the rows (the client laid the memory out
+-	 * itself), nor with an offset or a parent. Boot-arg vivasurfpitch=0: never.
++	 * itself), nor with an offset or a parent. Boot-arg vivasurfpitch=0: never; 2 (0187, to try): also those, the
++	 * allocation grown to the rounded rows (CA's 1125x2436 snapshot and 787x1705 switcher surfaces declare exactly
++	 * pitch x height and stayed unaligned: correct only if their writers read the pitch back).
+ 	 */
+ 	if (sweet_surface_pitch64 < 0) {
+ 		int on = 1;
+ 		PE_parse_boot_argn("vivasurfpitch", &on, sizeof(on));
+-		sweet_surface_pitch64 = on != 0;
++		sweet_surface_pitch64 = on;
+ 	}
+ 	if (sweet_surface_pitch64 && planes == NULL && s->offset == 0 && s->parentID == 0 &&
+ 	    (s->bytesPerRow & (SWEET_SURFACE_ROW_ALIGN - 1)) != 0 && props->getObject("IOSurfaceBytesPerRow") != NULL) {
+ 		uint64_t row = ((uint64_t)s->bytesPerRow + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1);
+ 		uint64_t rend = row * sweet_div_up(s->height, s->elementHeight);
+-		bool ok = row <= UINT32_MAX && (alloc == 0 || rend <= alloc);
++		bool ok = row <= UINT32_MAX && (alloc == 0 || rend <= alloc || sweet_surface_pitch64 == 2);
+ 		static volatile SInt32 logged;
+ 		if (OSIncrementAtomic(&logged) < 16) {
+ 			IOLog("SWEET SURF: %ux%u fmt 0x%x pitch %u %s %llu%s\n", s->width, s->height, s->pixelFormat,

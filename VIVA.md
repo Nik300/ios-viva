@@ -769,3 +769,9 @@ matched, macOS usbmuxd lists the device with the UDID, usbmux Connect to 62078 s
 Open: **lockdownd never answers** (also locally on 127.0.0.1:62078 and /var/run/lockdown.sock; no crash): Finder/Image
 Capture need it. VivaIsland tweak works (system island, "Viva Link · USB"). Charger: a Mac port reads vbus_stat 2 (CDP),
 so 0182 left 500 mA -> **0186**: full input on any detected port while the tool is not active.
+
+### 0187: A76 rule only while boosted; vivasurfpitch=2
+0186 on the phone (2026-11-07): Settings scroll 19.9 ms per frame with the UI boost (42.9 on 0180), but outside a boost
+0183's A76 rule held big at ~1920 MHz whenever LL ran fast (84 C). Now only during a boost. P6 left CA's 1125x2436
+snapshot (pitch 4512) and 787x1705 surfaces unaligned (explicit IOSurfaceAllocSize = pitch x height): boot-arg
+`vivasurfpitch=2` rounds those too and grows the allocation (to try: correct only if the writers read the pitch back).
