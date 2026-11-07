@@ -829,3 +829,7 @@ display module for a service matching IOPropertyMatch {backlight-control: true} 
 (CBDisplayContaineriOS findBacklight); DisplayCreateWithID reads IODisplayParameters.brightness {min, max, value}.
 AppleCLCD now attaches such a nub (AppleARMBacklight, max 2047); its setProperties takes brightness / IODisplayParameters
 to the panel. `disp seltrace on` logs every user client call, swap record change and property set.
+Update 2 (phone): brightness works through the nub (1476 levels sent) but the slider stuttered: each DCS write waited up
+to a frame for its blanking inside the vsync tick, holding the frames; now non-blocking (checked at the next write).
+Night Shift arrives as selector 55 type 0 during the ramp, but the 72 bytes are 9 x int64 signed 32.32 (0xD5FE7E00 =
+0.836), not doubles; converted with >> 21. CCORR mapped through dispMap.

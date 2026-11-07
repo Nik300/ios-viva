@@ -9,14 +9,25 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 + * fixed point; SetIOMFBBrightness in CoreBrightness, iOS 16.7): the panel takes DCS 51 HH LL, 0..2047 for its
 + * normal range (Xiaomi lcm_setbacklight_cmdq), sent through VM_CMD at the next vsync tick (fades coalesce);
 + * vivapanelnits (500) = the nits of level 2047; link "disp bl N". QuartzCore's color matrices arrive through
-+ * selector 55 (IOMobileFramebufferSetMatrix: scalar = which matrix, 9 doubles row-major); their product goes to the
++ * selector 55 (IOMobileFramebufferSetMatrix: scalar = which matrix, 9 x int64 signed 32.32, row-major); their product goes to the
 + * display pipe's CCORR (0x1400b000, Xiaomi mtk_disp_ccorr.c: 3x3, 1.0 = 0x800 on MT6781, 13-bit signed, two per
 + * register; CFG bit 0 relay / bit 1 engine). Identity = relay (bypass).
 + *
   * The panel memory itself is published as an IOSurface and returned as the
   * default framebuffer surface. The kernel text console keeps drawing over
   * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
-@@ -256,6 +264,26 @@
+@@ -242,8 +250,8 @@
+ 
+ 	/* viva direct scanout (see the top) */
+ 	IOLock       *fScanLock;      /* scanout state: present() vs. the link command */
+-	IOMemoryMap  *fDispMap[5];    /* OVL0, OVL0_2L, SMI larb0, larb1, DSI0 (0189) */
+-	vm_offset_t   fDisp[5];
++	IOMemoryMap  *fDispMap[6];    /* OVL0, OVL0_2L, SMI larb0, larb1, DSI0 (0189), CCORR0 (0191) */
++	vm_offset_t   fDisp[6];
+ 	/* 0189 panel refresh (see the top) */
+ 	uint32_t      fPanelHz;       /* the panel's refresh now: 60 or 120 */
+ 	uint32_t      fHzMode;        /* 60, 120, 1 = auto */
+@@ -256,6 +264,27 @@
  	uint32_t      fHzSeq;         /* vivapanelseq / "disp hz seq N": where the porch goes relative to the commands */
  	bool panelSetHz(uint32_t hz);
  	void hzPolicy(void);
@@ -33,7 +44,8 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	volatile bool fSelTrace;      /* "disp seltrace on": log every user client call and swap record changes */
 +	uint8_t       fTraceRec[SWEET_FB_SWAP_REC_SIZE];
 +	uint32_t      fTraceLines;
-+	bool dsiSendDcs(const uint8_t *b, uint32_t n, bool vbp);
++	bool dsiSendDcs(const uint8_t *b, uint32_t n, bool vbp, bool wait = true);
++	bool          fDcsInFlight;   /* a non-blocking DCS write was started (brightness) */
 +	class AppleARMBacklight *fBacklight;
 +	void backlightStart(void);
 +	void traceProperties(const char *who, OSDictionary *dict);
@@ -43,7 +55,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	int           fScanOvl;       /* OVL of LK's layer (0/1), -1 = not found */
  	uint32_t      fScanAddrReg, fScanPitchReg, fScanPitchMsbReg;
  	uint32_t      fLkAddr, fLkPitch, fLkPitchMsb;
-@@ -323,6 +351,21 @@
+@@ -323,6 +352,21 @@
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
  static AppleCLCD *gSweetFB;     /* for the USB link "disp" command */
@@ -65,7 +77,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  volatile uint32_t sweet_fb_gpu_waits;
  static volatile uint32_t gSweetFbDutyCap;       /* sweet_fb_set_duty_cap (Low Power Mode); 0 = sweetfb_duty */
  
-@@ -436,6 +479,10 @@
+@@ -436,6 +480,10 @@
  		fHzMode = 60;
  	}
  	fHzWant = fHzMode == 120 ? 120 : 0;     /* done at the first vsync tick with frame ends known */
@@ -76,7 +88,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fHzIdleMs = 500;
  	PE_parse_boot_argn("vivapanelidle", &fHzIdleMs, sizeof(fHzIdleMs));
  	fHzIdleMs = MIN(MAX(fHzIdleMs, 100u), 60000u);
-@@ -464,6 +511,7 @@
+@@ -464,6 +512,7 @@
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
@@ -84,7 +96,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	if (fHzMode != 60) {
  		/*
  		 * 0189: QuartzCore (CA::WindowServer::AppleDisplay, iOS 16.7) reads IOMFBDisplayRefresh at start:
-@@ -486,6 +534,7 @@
+@@ -486,6 +535,7 @@
  		OSSafeReleaseNULL(refresh);
  	}
  	registerService();
@@ -92,7 +104,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
  	return true;
-@@ -496,6 +545,7 @@
+@@ -496,6 +546,7 @@
  {
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	fb->hzPolicy();                 /* 0189: a pending refresh switch happens here, on the work loop */
@@ -100,7 +112,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	uint64_t count = ++fb->fVsyncCount;
  	/*
  	 * 0135, scanout: look for a finished frame before the switch, so one found now is on screen at this frame end
-@@ -1118,6 +1168,10 @@
+@@ -1118,6 +1169,10 @@
  #define DSI_VFP_NL              0x028
  #define DSI_VM_CMD_CON          0x200   /* [0] enable, [1] long packet, [5] send in VFP, [15:8] type, [31:16] data/len */
  #define DSI_VM_CMD_DATA0        0x208
@@ -111,20 +123,59 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  #define PANEL_VFP_60            2452
  #define PANEL_VFP_120           20
  
-@@ -1627,6 +1681,268 @@
+@@ -1176,8 +1231,8 @@
+ bool
+ AppleCLCD::dispMap(void)
+ {
+-	static const uint64_t pa[5] = { DISP_OVL0_PA, DISP_OVL0_2L_PA, SMI_LARB0_PA, SMI_LARB1_PA, DISP_DSI0_PA };
+-	for (int i = 0; i < 5; i++) {
++	static const uint64_t pa[6] = { DISP_OVL0_PA, DISP_OVL0_2L_PA, SMI_LARB0_PA, SMI_LARB1_PA, DISP_DSI0_PA, DISP_CCORR0_PA };
++	for (int i = 0; i < 6; i++) {
+ 		if (fDispMap[i] != NULL) {
+ 			continue;
  		}
+@@ -1509,6 +1564,12 @@
+ 		return false;
  	}
- 	IOLockUnlock(fScanLock);
+ 	vm_offset_t d = fDisp[4];
++	if (fDcsInFlight) {             /* 0191: a brightness write still waiting for its blanking */
++		for (int k = 0; k < 1000 && !(disp_rd(d, DSI_INTSTA) & DSI_VM_CMD_DONE); k++) {
++			IODelay(50);
++		}
++		fDcsInFlight = false;
++	}
+ 	uint32_t vfp = disp_rd(d, DSI_VFP_NL);
+ 	if ((disp_rd(d, DSI_MODE_CTRL) & 3) == 0) {
+ 		fHzWhy = "DSI not in video mode";
+@@ -1624,11 +1685,272 @@
+ 		}
+ 		if (fHzMode == 1) {
+ 			fHzMode = 60;           /* auto off after a failure */
++		}
++	}
++	IOLockUnlock(fScanLock);
 +}
 +
 +/* 0191: one DCS write (1-3 bytes, write or long write) in the video-mode blanking. fScanLock. */
 +bool
-+AppleCLCD::dsiSendDcs(const uint8_t *b, uint32_t n, bool vbp)
++AppleCLCD::dsiSendDcs(const uint8_t *b, uint32_t n, bool vbp, bool wait)
 +{
 +	if (!dispMap() || n == 0 || n > 4) {
 +		return false;
 +	}
 +	vm_offset_t d = fDisp[4];
++	if (fDcsInFlight) {
++		/* the previous non-blocking write: still waiting for its blanking -> try again next tick */
++		if (!(disp_rd(d, DSI_INTSTA) & DSI_VM_CMD_DONE) && (disp_rd(d, DSI_START) & DSI_VM_CMD_START)) {
++			if (!wait) {
++				return false;
++			}
++			for (int k = 0; k < 1000 && !(disp_rd(d, DSI_INTSTA) & DSI_VM_CMD_DONE); k++) {
++				IODelay(50);
++			}
++		}
++		fDcsInFlight = false;
++	}
 +	uint32_t timing = vbp ? 0x18u : 0x20u;          /* [4:3] VSA/VBP or [5] VFP */
 +	uint32_t con;
 +	if (n <= 2) {
@@ -138,13 +189,17 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	disp_wr(d, DSI_INTSTA, disp_rd(d, DSI_INTSTA) & ~DSI_VM_CMD_DONE);
 +	disp_wr(d, DSI_START, disp_rd(d, DSI_START) & ~DSI_VM_CMD_START);
 +	disp_wr(d, DSI_START, disp_rd(d, DSI_START) | DSI_VM_CMD_START);
++	if (!wait) {
++		fDcsInFlight = true;            /* goes out in the next blanking; checked at the next write */
++		return true;
++	}
 +	bool done = false;
 +	for (int k = 0; k < 1000 && !done; k++) {
 +		done = (disp_rd(d, DSI_INTSTA) & DSI_VM_CMD_DONE) != 0;
 +		if (!done) {
 +			IODelay(50);
-+		}
-+	}
+ 		}
+ 	}
 +	disp_wr(d, DSI_START, disp_rd(d, DSI_START) & ~DSI_VM_CMD_START);
 +	disp_wr(d, DSI_INTSTA, disp_rd(d, DSI_INTSTA) & ~DSI_VM_CMD_DONE);
 +	return done;
@@ -161,9 +216,13 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	}
 +	IOLockLock(fScanLock);
 +	if (bl != 0xffffffffu) {
-+		fBlWant = 0xffffffffu;
 +		uint8_t cmd[3] = { 0x51, (uint8_t)(bl >> 8), (uint8_t)bl };
-+		if (bl != fBlLevel && dsiSendDcs(cmd, 3, false)) {
++		if (bl == fBlLevel) {
++			fBlWant = 0xffffffffu;
++		} else if (dsiSendDcs(cmd, 3, false, false)) {      /* non-blocking: a fade must not hold the frames */
++			if (fBlWant == bl) {
++				fBlWant = 0xffffffffu;
++			}
 +			fBlLevel = bl;
 +			fBlSent++;
 +			if (fBacklight != NULL) {
@@ -197,12 +256,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +			c[i] = (int32_t)MIN(MAX(m[i], -4096ll), 4095ll);
 +			identity = identity && c[i] == ((i % 4) == 0 ? 0x800 : 0);
 +		}
-+		if (fCcorrMap == NULL) {
-+			IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(DISP_CCORR0_PA, 0x1000, kIODirectionInOut);
-+			fCcorrMap = md != NULL ? md->map(kIOMapInhibitCache) : NULL;
-+			OSSafeReleaseNULL(md);
-+			fCcorr = fCcorrMap != NULL ? (vm_offset_t)fCcorrMap->getVirtualAddress() : 0;
-+		}
++		fCcorr = dispMap() ? fDisp[5] : 0;
 +		if (fCcorr != 0) {
 +			disp_wr(fCcorr, CCORR_COEF(0), ((uint32_t)(c[0] & 0x1fff) << 16) | (uint32_t)(c[1] & 0x1fff));
 +			disp_wr(fCcorr, CCORR_COEF(1), ((uint32_t)(c[2] & 0x1fff) << 16) | (uint32_t)(c[3] & 0x1fff));
@@ -214,27 +268,10 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +			fMatrixApplied++;
 +		}
 +	}
-+	IOLockUnlock(fScanLock);
+ 	IOLockUnlock(fScanLock);
 +}
 +
-+/* IEEE-754 double (bits) times 0x800, rounded, clamped to +-8 (no FPU in the kernel). */
-+static int32_t
-+sweet_fb_d2fix(uint64_t b)
-+{
-+	int exp = (int)((b >> 52) & 0x7ff) - 1023;
-+	if (exp < -12 || ((b >> 52) & 0x7ff) == 0) {
-+		return 0;
-+	}
-+	if (exp > 3) {
-+		return (b >> 63) ? -0x4000 : 0x4000;
-+	}
-+	uint64_t mant = (b & ((1ull << 52) - 1)) | (1ull << 52);
-+	int shift = 52 - 11 - exp;                      /* value * 2^11 = mant * 2^(exp + 11 - 52) */
-+	int64_t v = shift > 0 ? (int64_t)((mant + (1ull << (shift - 1))) >> shift) : (int64_t)(mant << -shift);
-+	return (int32_t)((b >> 63) ? -v : v);
-+}
-+
-+/* 0191: selector 55, a color matrix of the given type (row-major doubles). */
++/* 0191: selector 55, a color matrix of the given type (row-major, signed 32.32 fixed point; seen on the phone). */
 +void
 +AppleCLCD::setMatrix(uint32_t type, const uint64_t bits[9])
 +{
@@ -245,7 +282,8 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	int32_t m[9];
 +	bool identity = true;
 +	for (int i = 0; i < 9; i++) {
-+		m[i] = sweet_fb_d2fix(bits[i]);
++		int64_t v = ((int64_t)bits[i] + (1ll << 20)) >> 21;     /* 32.32 -> 1.0 = 0x800 */
++		m[i] = (int32_t)MIN(MAX(v, -0x4000ll), 0x4000ll);
 +		identity = identity && m[i] == ((i % 4) == 0 ? 0x800 : 0);
 +	}
 +	if (fMatrixCalls <= 16) {
@@ -255,8 +293,8 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	memcpy(fMatrix[type], m, sizeof(m));
 +	fMatrixUsed[type] = !identity;
 +	fMatrixDirty = true;
-+}
-+
+ }
+ 
 +/* 0191: the AppleARMBacklight nub (see its class). */
 +void
 +AppleCLCD::backlightStart(void)
@@ -377,10 +415,12 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	fBlWant = (uint32_t)MIN(level, (uint64_t)PANEL_LEVEL_MAX);
 +	setProperty("IOMFBBrightnessLevel", n);
 +	return kIOReturnSuccess;
- }
- 
++}
++
  bool
-@@ -2000,6 +2316,25 @@
+ AppleCLCD::flipSetup(char **out, char *end)
+ {
+@@ -2000,6 +2322,25 @@
  		disp_say(&p, end, "panel %u Hz, mode %s (idle %u ms, seq %u)%s, %llu switches, %llu failures%s%s\n", fPanelHz,
  		    fHzMode == 1 ? "auto" : fHzMode == 120 ? "120" : "60", fHzIdleMs, fHzSeq, fHzWant ? " (switch pending)" : "", fHzSwitches,
  		    fHzFailures, fHzWhy ? ", last: " : "", fHzWhy ? fHzWhy : "");
@@ -406,7 +446,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	} else if (strncmp(args, "kv", 2) == 0) {
  		/* KA1 (gpu/docs/RICHIESTE-KERNEL.md): stable key=value lines for Viva Manager */
  		IOLockLock(fLock);
-@@ -2016,6 +2351,7 @@
+@@ -2016,6 +2357,7 @@
  		    "swapwait_busy=%llu\n", r, f, fEarlyShown, fFlipReady ? 1 : 0, fSwapWaitBusy);
  		disp_say(&p, end, "panel_hz=%u\nhz_mode=%u\nhz_switches=%llu\nhz_failures=%llu\n", fPanelHz, fHzMode,
  		    fHzSwitches, fHzFailures);
@@ -414,7 +454,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		{
  			uint32_t pb = 0, pu = 0, pk = 0;
  			uint64_t fp = 0, fc = 0, sp = 0;
-@@ -2175,6 +2511,36 @@
+@@ -2175,6 +2517,36 @@
  	uint64_t out[2] = { 0, 0 };
  	uint32_t outCount = 0;
  
@@ -451,11 +491,11 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	switch (selector) {
  	case kSweetFBGetLayerDefaultSurface:
  		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
-@@ -2240,6 +2606,14 @@
+@@ -2240,6 +2612,14 @@
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
  		}
  		break;
-+	case 55: {      /* 0191: IOMobileFramebufferSetMatrix(type, 3x3 doubles) */
++	case 55: {      /* 0191: IOMobileFramebufferSetMatrix(type, 3x3 signed 32.32) */
 +		if (args->scalarInputCount >= 1 && args->structureInputDescriptor == NULL && args->structureInputSize >= 72) {
 +			uint64_t bits[9];
 +			memcpy(bits, args->structureInput, sizeof(bits));
