@@ -545,12 +545,14 @@ def shot(link, a):
     out, st = run_capture(link, ['vctl', 'shot', '/private/var/tmp/vlshot'])
     found = [(m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4)))
              for m in re.finditer(r'(\S+\.png): surface (\d+) (\d+)x(\d+)', out)]
-    found = [f for f in found if (f[2], f[3]) != (int(kv.get('width', 0)), int(kv.get('height', 0)))]  # stale console
+    shown = int(kv.get('shown_surface', 0))
+    # surface 1 is the kernel console's buffer (AppleCLCD's boot framebuffer), never CoreAnimation's
+    found = [f for f in found if f[1] == shown or (f[1] != 1 and (f[2], f[3]) != (int(kv.get('width', 0)),
+             int(kv.get('height', 0))) or f[1] != 1 and kv.get('offset_x') == '0')]
     if st or not found:
         sys.exit('vctl shot: %s' % (out.strip() or 'exit %d' % st))
     dest = a.command[0] if a.command else os.path.join(SHOTS, time.strftime('shot-%Y%m%d-%H%M%S.png'))
     os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
-    shown = int(kv.get('shown_surface', 0))
     pick = [f for f in found if f[1] == shown]
     if not pick:
         if shown == 0:
