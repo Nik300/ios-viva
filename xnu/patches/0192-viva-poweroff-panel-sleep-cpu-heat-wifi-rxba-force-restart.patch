@@ -1,0 +1,3497 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -1564,7 +1564,8 @@
+  *   push SIZE MODE FNV PATH  receive a file (raw OUT data follows; written to PATH.vivapush, renamed when
+  *                     its FNV-1a matches; missing directories are created)
+  *   pull PATH         send a file ('F' frames)
+- *   disp [ARGS]       display (SweetFramebuffer.cpp): status, regs (read only), scanout on|off
++ *   disp [ARGS]       display (SweetFramebuffer.cpp): status, regs (read only), scanout on|off, kv,
++ *                     panel [off|on|tick MS|vfp N|mode 0|1] (0192: panel sleep / wake by hand, counters)
+  *   run ARGS..        run a program through vivad (output as 'O' frames, "[ID] exit N" at the end)
+  *   vivad TEXT        any other vivad command (ps, kill ID, tests)
+  *   console [on|off]  kernel text on the screen (off from the GUI's first frame with sweetfb_noconsole=1)
+diff --git a/bsd/dev/viva_wifi.c b/bsd/dev/viva_wifi.c
+--- a/bsd/dev/viva_wifi.c
++++ b/bsd/dev/viva_wifi.c
+@@ -44,6 +44,17 @@
+  *   wifi off       CONN CPU back in reset, MTCMOS off, rails and pinmux as before "wifi on".
+  *
+  * PMIC writes go through VivaPwrap::writeRegulator (VCN18/VCN33/VCN28 enable/mode bits, VCN33 = 3.3 V only).
++ *
++ * 0192 data path (each part a boot-arg and a "wifi opt NAME VALUE" toggle, counters in "wifi sta"):
++ *   - RX block ack: the STA record says ucRxAmpdu = 1 (as gen4m); the firmware answers the AP's ADDBA itself and
++ *     sends EVENT_ID_RX_ADDBA / RX_DELBA (que_mgt.c qmHandleEventRxAddBa); the host reorders by SN per TID
++ *     (qmProcessPktWithReordering: SN from RXD group 4, TID from RXD DW2), drops duplicates, flushes holes after
++ *     vivawifireorderms. TX A-MPDU stays off (0154) unless vivawifitxba=1.
++ *   - RX ring 0 of vivawifirxn entries (128; was 16: one aggregate overflowed it between two polls).
++ *   - The WFDMA interrupt (GIC SPI 0x11d level, DT wifi@18000000) wakes the worker: masked in the handler, RX
++ *     drained, unmasked before sleeping (axi.c mtk_axi_interrupt + the HIF thread). Without it: 1 ms polls while
++ *     traffic flows, vivawifiidlems when idle (was 2 ms polls with 2 x 50 us sleeps each, forever).
++ *   - Data frames go from the DMA buffer straight into the mbuf (one copy), one ifnet_input per pass.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -58,6 +69,7 @@
+ #include <sys/random.h>
+ #include <kern/locks.h>
+ #include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/proc.h>
+ #include <pexpert/device_tree.h>
+@@ -72,6 +84,9 @@
+ extern void *viva_wifi_dma_alloc(uint32_t size, uint64_t *pa);
+ extern void viva_wifi_dma_flush(uint32_t offset, uint32_t len);
+ extern void *viva_wifi_dma_uncached(void);
++extern int viva_wifi_irq_attach(uint32_t intid);                                                /* VivaWiFi.cpp */
++extern void viva_wifi_irq_enable(bool on);
++bool viva_wifi_intr(void);                                                                      /* its handler */
+ 
+ #define WIFI_FW_DIR             "/usr/share/firmware/wifi/viva/"
+ #define EMI_SIZE                0x500000
+@@ -480,6 +495,7 @@
+ }
+ 
+ static void wl_reset(void);      /* station state, defined with it */
++static void irq_off(void);       /* the WFDMA interrupt, with the worker */
+ 
+ static size_t
+ wifi_off(char *out, size_t len, size_t o)
+@@ -488,6 +504,7 @@
+ 		say("off: not on (wifi on)\n");
+ 		return o;
+ 	}
++	irq_off();                                      /* no handler touching 0x18004204 once CONN is off */
+ 	rmw(TOPRGU_SWSYSRST, 0xff001000, 0x88001000);  /* CPU back in reset first */
+ 	o = conn_off(out, len, o);
+ 	pinmux_restore();
+@@ -910,14 +927,14 @@
+ #define RING_N                  16
+ #define BUF_SZ                  0x1000
+ #define RX_BUF_LEN              3840
+-#define DMA_SIZE                0x48000
++#define DMA_SIZE                0x48000         /* 0153 layout: both RX rings of 16 */
++#define DMA_SIZE_BIG            0x148000        /* + RX ring 0 of up to RX0_MAX (VivaWiFi.cpp reserves this much) */
+ #define OFF_TX(n)               ((n) == 3 ? 0x0000u : (n) == 15 ? 0x0100u : (n) == 0 ? 0x41000u : 0x0300u)
+ #define TX0_N                   32              /* data ring: 32 entries at 0x41000, 2 KiB buffers in ring 3's area */
+ #define TX0_BUF                 0x800
+ #define RING_LEN(n)             ((n) == 0 ? TX0_N : RING_N)
+-#define OFF_RX(n)               ((n) == 0 ? 0x0400u : 0x0500u)
+ #define OFF_TXBUF               0x01000u        /* ring 3 then ring 15 buffers: 16 x 4 KiB each */
+-#define OFF_RXBUF(n)            ((n) == 1 ? 0x21000u : 0x31000u)
++#define RX0_MAX                 256             /* big layout: descriptors at 0x42000, 4 KiB buffers from 0x48000 */
+ #define WIFI_RAM_CODE           "WIFI_RAM_CODE_soc2_2_2_1.bin"
+ #define PDA_CHUNK               2048
+ 
+@@ -925,12 +942,71 @@
+ 	uint8_t *va;
+ 	uint8_t *uva;                   /* the same memory mapped write-combined (uncached): the descriptors */
+ 	uint64_t pa;
++	uint32_t size;                  /* DMA_SIZE or DMA_SIZE_BIG */
+ 	uint32_t txIdx[16], rxIdx[2];
+-	uint32_t rxGot[2], rxSkipped[2], rxSkipD1[2];
++	uint32_t rxN[2], rxDesc[2], rxBuf[2];   /* RX ring entries, descriptor and buffer offsets */
++	uint32_t rxGot[2], rxSkipped[2], rxSkipD1[2], rxStuck[2], rxNoLast[2], rxMaxPend[2];
+ 	uint8_t  seq;
+ } wd;
+ 
+ /*
++ * 0192 tunables: boot-args vivawifi<name>=N, link "wifi opt <name> N" (rxn: from the next "wifi fw"; rxba, txba:
++ * from the next join's STA record; the rest at once).
++ */
++static struct {
++	uint32_t rxba;                  /* 1: STA record ucRxAmpdu (the AP may aggregate to us) */
++	uint32_t txba;                  /* 1: STA record ucTxAmpdu (0154: TX ring 0 jammed with it) */
++	uint32_t reorder;               /* 1: reorder RX block-ack sessions by SN, drop duplicates */
++	uint32_t reorderms;             /* a hole in a BA window is given up after this long */
++	uint32_t irq;                   /* 1: WFDMA interrupt (SPI 0x11d) wakes the worker */
++	uint32_t pollus;                /* polling (no interrupt) while traffic flows */
++	uint32_t idlems;                /* polling when idle (100 ms without RX/TX) */
++	uint32_t batch;                 /* 1: one ifnet_input per worker pass */
++	uint32_t rxn;                   /* RX ring 0 entries (16..RX0_MAX) */
++	bool     loaded;
++} vt = { 1, 0, 1, 100, 1, 1000, 10, 1, 128, false };
++
++static const struct {
++	const char *name;
++	uint32_t   *v, min, max;
++} vt_names[] = {
++	{ "rxba", &vt.rxba, 0, 1 }, { "txba", &vt.txba, 0, 1 }, { "reorder", &vt.reorder, 0, 1 },
++	{ "reorderms", &vt.reorderms, 10, 2000 }, { "irq", &vt.irq, 0, 1 }, { "pollus", &vt.pollus, 100, 20000 },
++	{ "idlems", &vt.idlems, 1, 1000 }, { "batch", &vt.batch, 0, 1 }, { "rxn", &vt.rxn, 16, RX0_MAX },
++};
++
++static void
++vt_load(void)
++{
++	if (vt.loaded) {
++		return;
++	}
++	for (unsigned k = 0; k < sizeof(vt_names) / sizeof(vt_names[0]); k++) {
++		char ba[32];
++		uint32_t v;
++		snprintf(ba, sizeof(ba), "vivawifi%s", vt_names[k].name);
++		if (PE_parse_boot_argn(ba, &v, sizeof(v))) {
++			*vt_names[k].v = MIN(MAX(v, vt_names[k].min), vt_names[k].max);
++		}
++	}
++	vt.loaded = true;
++}
++
++/* Ring sizes and places: ring 0 big when the big DMA area is there. */
++static void
++rx_layout(void)
++{
++	bool big = wd.size >= DMA_SIZE_BIG;
++	vt_load();
++	wd.rxN[0] = big ? MIN(MAX(vt.rxn, (uint32_t)RING_N), (uint32_t)RX0_MAX) : RING_N;
++	wd.rxDesc[0] = big ? 0x42000u : 0x0400u;
++	wd.rxBuf[0] = big ? 0x48000u : 0x31000u;
++	wd.rxN[1] = RING_N;                             /* events, MSDU reports: 16 as gen4m SOC2_1X1 */
++	wd.rxDesc[1] = 0x0500u;
++	wd.rxBuf[1] = 0x21000u;
++}
++
++/*
+  * Ring descriptors are 16 bytes, four to a cache line: written through a cached mapping, cleaning the line of entry i
+  * also wrote back the CPU's stale copy of entries i+1..i+3 over what the DMA had just put there (DMA done + length),
+  * and the RX ring stopped for good at that entry (0151: WiFi data stalled after the first packets). Descriptors are
+@@ -945,17 +1021,19 @@
+ static void
+ wfdma_setup(void)
+ {
+-	bzero(wd.va, DMA_SIZE);
+-	viva_wifi_dma_flush(0, DMA_SIZE);               /* before any descriptor goes in through wd.uva */
++	rx_layout();
++	bzero(wd.va, wd.size);
++	viva_wifi_dma_flush(0, wd.size);                /* before any descriptor goes in through wd.uva */
+ 	static const uint32_t tx[] = { 0, 1, 3, 15 };
+ 	for (unsigned r = 0; r < 2; r++) {
+-		for (uint32_t i = 0; i < RING_N; i++) {
+-			uint32_t *d = desc(OFF_RX(r), i);
+-			d[0] = (uint32_t)(wd.pa + OFF_RXBUF(r) + BUF_SZ * i);
++		for (uint32_t i = 0; i < wd.rxN[r]; i++) {
++			uint32_t *d = desc(wd.rxDesc[r], i);
++			d[0] = (uint32_t)(wd.pa + wd.rxBuf[r] + BUF_SZ * i);
+ 			d[1] = (uint32_t)RX_BUF_LEN << 16;
+ 		}
++		wd.rxStuck[r] = wd.rxMaxPend[r] = 0;
+ 	}
+-	viva_wifi_dma_flush(0, DMA_SIZE);
++	viva_wifi_dma_flush(0, wd.size);
+ 	wr(WF_GLO_CFG, rd(WF_GLO_CFG) & ~(GLO_TX_EN | GLO_RX_EN));
+ 	(void)poll(WF_GLO_CFG, GLO_TX_BUSY | GLO_RX_BUSY, 0, 100000);
+ 	wr(WF_RST_PTR, 0xffffffff);
+@@ -968,10 +1046,10 @@
+ 		wd.txIdx[n] = 0;
+ 	}
+ 	for (unsigned r = 0; r < 2; r++) {
+-		wr(WF_RX_RING(r) + 0, (uint32_t)(wd.pa + OFF_RX(r)));
++		wr(WF_RX_RING(r) + 0, (uint32_t)(wd.pa + wd.rxDesc[r]));
+ 		wr(WF_RX_EXT(r), (uint32_t)(wd.pa >> 32));
+-		wr(WF_RX_RING(r) + 4, RING_N);
+-		wr(WF_RX_RING(r) + 8, RING_N - 1);
++		wr(WF_RX_RING(r) + 4, wd.rxN[r]);
++		wr(WF_RX_RING(r) + 8, wd.rxN[r] - 1);
+ 		wd.rxIdx[r] = 0;
+ 	}
+ 	wr(WF_INT_MSK, 0);
+@@ -1003,38 +1081,82 @@
+ 	return poll(WF_TX_RING(n) + 12, 0xfff, wd.txIdx[n], 200000);
+ }
+ 
++/*
++ * The entry the driver waits on in RX ring r, if the DMA is done with it: its buffer (cached view, the received
++ * bytes invalidated) and length; NULL if not done. rx_pop() gives it back. The descriptor is read through the
++ * uncached mapping: no flush of its line (0192: two IOKit cache operations per look less).
++ */
++static const uint8_t *
++rx_peek(uint32_t r, uint32_t *len)
++{
++	uint32_t i = wd.rxIdx[r], d1 = desc(wd.rxDesc[r], i)[1];
++	if (!(d1 & DESC_DMADONE)) {
++		return NULL;
++	}
++	uint32_t n = MIN((d1 >> 16) & 0x3fff, (uint32_t)RX_BUF_LEN), boff = wd.rxBuf[r] + BUF_SZ * i;
++	if (!(d1 & DESC_LASTSEC0)) {
++		wd.rxNoLast[r]++;                       /* a segment of a longer packet (gen4m drops them): counted */
++	}
++	viva_wifi_dma_flush(boff, n ? n : 1);           /* only what the DMA wrote (was the whole 4 KiB) */
++	wd.rxStuck[r] = 0;
++	*len = n;
++	return wd.va + boff;
++}
++
++static void
++rx_pop(uint32_t r)
++{
++	uint32_t i = wd.rxIdx[r];
++	desc(wd.rxDesc[r], i)[1] = (uint32_t)RX_BUF_LEN << 16;
++	wr(WF_RX_RING(r) + 8, i);                      /* give the entry back */
++	wd.rxIdx[r] = (i + 1) % wd.rxN[r];
++	wd.rxGot[r]++;
++}
++
++/*
++ * 0153 on the phone: RX ring 0 stopped at an entry that read empty while the DMA had filled the ten after it.
++ * Not explained yet; resynchronise: if the DMA is past this entry and the next one is done (`times` looks in a
++ * row), give this one back and move on (counted in "wifi ring").
++ */
++static void
++rx_resync(uint32_t r, uint32_t times)
++{
++	uint32_t i = wd.rxIdx[r], *d = desc(wd.rxDesc[r], i);
++	uint32_t didx = rd(WF_RX_RING(r) + 12) & 0xfff;
++	if (didx == i || (d[1] & DESC_DMADONE) || !(desc(wd.rxDesc[r], (i + 1) % wd.rxN[r])[1] & DESC_DMADONE)) {
++		wd.rxStuck[r] = 0;
++		return;
++	}
++	if (++wd.rxStuck[r] < times) {
++		return;
++	}
++	wd.rxStuck[r] = 0;
++	wd.rxSkipped[r]++;
++	wd.rxSkipD1[r] = d[1];
++	d[1] = (uint32_t)RX_BUF_LEN << 16;
++	wr(WF_RX_RING(r) + 8, i);
++	wd.rxIdx[r] = (i + 1) % wd.rxN[r];
++}
++
+ /* Next received packet on RX ring r within `us`: copied to out (max), length returned, 0 = nothing. */
+ static uint32_t
+ wfdma_rx(uint32_t r, uint8_t *out, uint32_t max, uint32_t us)
+ {
+-	uint32_t i = wd.rxIdx[r], *d = desc(OFF_RX(r), i);
+-	for (uint32_t t = 0; t <= us; t += 50) {
+-		viva_wifi_dma_flush(OFF_RX(r) + 16 * i, 16);
+-		if (d[1] & DESC_DMADONE) {
+-			uint32_t n = (d[1] >> 16) & 0x3fff, boff = OFF_RXBUF(r) + BUF_SZ * i;
+-			viva_wifi_dma_flush(boff, BUF_SZ);
+-			memcpy(out, wd.va + boff, MIN(n, max));
+-			d[1] = (uint32_t)RX_BUF_LEN << 16;
+-			viva_wifi_dma_flush(OFF_RX(r) + 16 * i, 16);
+-			wr(WF_RX_RING(r) + 8, i);              /* give the entry back */
+-			wd.rxIdx[r] = (i + 1) % RING_N;
+-			wd.rxGot[r]++;
++	for (uint32_t t = 0;; t += 50) {
++		uint32_t n;
++		const uint8_t *p = rx_peek(r, &n);
++		if (p != NULL) {
++			memcpy(out, p, MIN(n, max));
++			rx_pop(r);
+ 			return n ? n : 1;
+ 		}
++		if (t >= us) {
++			break;                          /* us 0: one look, no sleep (0192: was a 50 us sleep each) */
++		}
+ 		delay(50);
+ 	}
+-	/*
+-	 * 0153 on the phone: RX ring 0 stopped at an entry that read empty while the DMA had filled the ten after it.
+-	 * Not explained yet; resynchronise: if the DMA is past this entry and the next one is done, give this one back
+-	 * and move on (counted in "wifi ring").
+-	 */
+-	uint32_t didx = rd(WF_RX_RING(r) + 12) & 0xfff;
+-	if (didx != i && (desc(OFF_RX(r), (i + 1) % RING_N)[1] & DESC_DMADONE)) {
+-		wd.rxSkipped[r]++;
+-		wd.rxSkipD1[r] = d[1];
+-		d[1] = (uint32_t)RX_BUF_LEN << 16;
+-		wr(WF_RX_RING(r) + 8, i);
+-		wd.rxIdx[r] = (i + 1) % RING_N;
++	if (us != 0) {
++		rx_resync(r, 1);
+ 	}
+ 	return 0;
+ }
+@@ -1121,7 +1243,12 @@
+ 		say("fw: WiFi firmware already running (ready 0x%08x)\n", rd(WF_READY));
+ 		return o;
+ 	}
+-	wd.va = viva_wifi_dma_alloc(DMA_SIZE, &wd.pa);
++	wd.size = DMA_SIZE_BIG;
++	wd.va = viva_wifi_dma_alloc(DMA_SIZE_BIG, &wd.pa);
++	if (wd.va == NULL) {                            /* an older reservation: 16-entry RX rings as before */
++		wd.size = DMA_SIZE;
++		wd.va = viva_wifi_dma_alloc(DMA_SIZE, &wd.pa);
++	}
+ 	wd.uva = viva_wifi_dma_uncached();
+ 	if (wd.va == NULL || wd.uva == NULL) {
+ 		say("fw: no DMA memory\n");
+@@ -1134,7 +1261,8 @@
+ 		return o;
+ 	}
+ 	wfdma_setup();
+-	say("fw: driver own, WFDMA at PA 0x%llx, GLO_CFG 0x%08x, ready bits 0x%08x\n", wd.pa, rd(WF_GLO_CFG), rd(WF_READY));
++	say("fw: driver own, WFDMA at PA 0x%llx (RX rings %u + %u), GLO_CFG 0x%08x, ready bits 0x%08x\n", wd.pa, wd.rxN[0],
++	    wd.rxN[1], rd(WF_GLO_CFG), rd(WF_READY));
+ 
+ 	char path[160];
+ 	snprintf(path, sizeof(path), "%s%s", WIFI_FW_DIR, WIFI_RAM_CODE);
+@@ -1316,6 +1444,18 @@
+ static void wifi_frame(const uint8_t *b, uint32_t n, uint32_t foff, int kind);     /* scan table, join, EAPOL */
+ static void wifi_event(const uint8_t *ev, uint32_t got);                            /* scan done, beacon loss */
+ static void tx_report(const uint8_t *b, uint32_t n);                                /* TX ring 0 tokens */
++
++static void
++rx_handle(const uint8_t *b, uint32_t n, int kind, uint32_t foff)
++{
++	if (kind == PKT_FRAME || kind == PKT_DATA) {
++		wifi_frame(b, n, foff, kind);
++	} else if (kind == PKT_EVENT) {
++		wifi_event(b, n);
++	} else if (kind == PKT_MSDU) {
++		tx_report(b, n);
++	}
++}
+ 
+ /* Next packet from RX ring 1, then RX ring 0, within us microseconds; frames and data go to wifi_frame(). */
+ static uint32_t
+@@ -1329,13 +1469,7 @@
+ 	if (got) {
+ 		uint32_t foff = 0;
+ 		*kind = rx_classify(buf, MIN(got, max), &foff);
+-		if (*kind == PKT_FRAME || *kind == PKT_DATA) {
+-			wifi_frame(buf, MIN(got, max), foff, *kind);
+-		} else if (*kind == PKT_EVENT) {
+-			wifi_event(buf, MIN(got, max));
+-		} else if (*kind == PKT_MSDU) {
+-			tx_report(buf, MIN(got, max));
+-		}
++		rx_handle(buf, MIN(got, max), *kind, foff);
+ 	}
+ 	return got;
+ }
+@@ -1825,35 +1959,64 @@
+ 
+ static void sta_eapol(const uint8_t *eth, uint32_t len);
+ 
+-/* An 802.3 data frame from the AP: EAPOL to the supplicant, the rest to en0 (after vw_unlock()). */
+-static void
+-data_rx(const uint8_t *eth, uint32_t len)
++/* ---- received data: block-ack reorder (0192) ---- */
++
++/*
++ * gen4m que_mgt.c: the firmware accepts the AP's ADDBA itself (STA record ucRxAmpdu) and tells the host with
++ * EVENT_ID_RX_ADDBA {sta, token, u16 BA parameter set (TID 5:2, buffer 15:6), u16 timeout, u16 SSC (SN << 4)}
++ * (qmHandleEventRxAddBa, no answer). The MAC hands every subframe up as it arrives, retransmissions after the newer
++ * ones, so the host keeps a window per TID (qmInsertReorderPkt: within / ahead / behind), drops duplicates and
++ * gives a hole up after a timeout (qmHandleReorderBubbleTimeout, QM_RX_BA_ENTRY_MISS_TIMEOUT_MS 200; mac80211 100).
++ * A-MSDU subframes (RXD byte 7 [1:0]: 3 first, 2 middle, 1 last, 0 plain MSDU) share one SN.
++ */
++#define BA_TIDS                 8
++#define BA_SLOTS                64              /* the largest HT window */
++#define PF_MSDU                 0
++#define PF_LAST                 1
++#define PF_MIDDLE               2
++#define PF_FIRST                3
++#define SN_HALF                 2048
++#define EID_RX_ADDBA            0x0a
++#define EID_RX_DELBA            0x0b
++#define EID_CHECK_REORDER_BUBBLE 0x2a
++
++struct ba_slot {
++	mbuf_t   h, t;                  /* frames of this SN (nextpkt), none for an EAPOL that took it */
++	uint16_t sn;
++	uint8_t  st;                    /* 0 empty, 1 A-MSDU still open, 2 complete */
++};
++
++struct ba_tid {
++	bool     on, wait;              /* session up; head not yet set by a frame (gen4m SSN auto-advancing) */
++	bool     amsdu;                 /* subframes of the head SN went up already, its last not seen */
++	uint16_t head, win, held;       /* next SN to go up, window, slots held */
++	uint64_t since;                 /* when the hole at head started, frames held behind it */
++	struct ba_slot s[BA_SLOTS];
++};
++
++static struct {
++	struct ba_tid t[BA_TIDS];
++	uint32_t adds, dels, bubbles;   /* firmware events */
++	uint32_t direct;                /* in order, straight up */
++	uint32_t held, released;        /* out of order: kept, given up later */
++	uint32_t dups, old, lost;       /* duplicate dropped, behind the window dropped, SNs skipped */
++	uint32_t timeouts, plain;       /* holes given up; data outside a session */
++	uint32_t rxErr;                 /* FCS / ICV / cipher length errors dropped */
++} ba;
++
++/* An in-order frame: up after this pass (vw_unlock), or dropped if the link is down. */
++static void
++rx_up(mbuf_t m)
+ {
+-	if (len < 14) {
++	if (m == NULL) {
+ 		return;
+ 	}
+-	if (eth[12] == 0x88 && eth[13] == 0x8e) {
+-		sta_eapol(eth, len);
+-		return;
+-	}
+-	if (!sj.link || len > 2048) {
+-		sj.rxDrops++;
+-		return;
+-	}
+-	/* one mbuf with a 2 KiB cluster, lengths set explicitly (as sweet_usb.c; viva_wlan_input strips 14 bytes) */
+-	mbuf_t m = NULL;
+-	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0) {
+-		sj.rxDrops++;
+-		return;
+-	}
+-	if (mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < len) {
++	mbuf_setnextpkt(m, NULL);
++	if (!sj.link) {
+ 		mbuf_freem(m);
+ 		sj.rxDrops++;
+ 		return;
+ 	}
+-	memcpy(mbuf_data(m), eth, len);
+-	mbuf_setlen(m, len);
+-	mbuf_pkthdr_setlen(m, len);
+ 	if (vn.rxTail) {
+ 		mbuf_setnextpkt(vn.rxTail, m);
+ 	} else {
+@@ -1863,15 +2026,349 @@
+ 	sj.rx++;
+ }
+ 
+-/* RX dispatch for frames and data (called from rx_next). */
++static void
++ba_slot_out(struct ba_slot *s, bool up)
++{
++	mbuf_t m = s->h;
++	while (m != NULL) {
++		mbuf_t next = mbuf_nextpkt(m);
++		mbuf_setnextpkt(m, NULL);
++		if (up) {
++			ba.released++;
++			rx_up(m);
++		} else {
++			mbuf_freem(m);
++		}
++		m = next;
++	}
++	s->h = s->t = NULL;
++	s->st = 0;
++}
++
++/* Everything consecutive from head goes up; an A-MSDU still open stops it (its next subframes go straight up). */
++static void
++ba_release(struct ba_tid *t)
++{
++	uint16_t head0 = t->head;
++	while (t->held) {
++		struct ba_slot *s = &t->s[t->head % BA_SLOTS];
++		if (s->st == 0 || s->sn != t->head) {
++			break;
++		}
++		bool partial = s->st == 1;
++		ba_slot_out(s, true);
++		t->held--;
++		if (partial) {
++			t->amsdu = true;
++			break;
++		}
++		t->head = (t->head + 1) & 0xfff;
++		t->amsdu = false;
++	}
++	if (t->held == 0) {
++		t->since = 0;
++	} else if (t->head != head0 || t->since == 0) {
++		t->since = mach_absolute_time();
++	}
++}
++
++/* Head moves to `to`: what is held before it goes up in order, the holes are lost. */
++static void
++ba_skip(struct ba_tid *t, uint16_t to)
++{
++	uint32_t d = (uint32_t)(to - t->head) & 0xfff;
++	for (uint32_t k = 0; k < d && t->held; k++) {
++		uint16_t sn = (t->head + k) & 0xfff;
++		struct ba_slot *s = &t->s[sn % BA_SLOTS];
++		if (s->st != 0 && s->sn == sn) {
++			ba_slot_out(s, true);
++			t->held--;
++		} else if (k != 0 || !t->amsdu) {
++			ba.lost++;
++		}
++	}
++	t->head = to;
++	t->amsdu = false;
++	ba_release(t);
++}
++
++/* All that is held goes up (timeout, session end, a bubble the firmware reports). */
++static void
++ba_flush(struct ba_tid *t)
++{
++	for (uint32_t k = t->win; t->held && k-- > 0;) {
++		uint16_t sn = (t->head + k) & 0xfff;
++		struct ba_slot *s = &t->s[sn % BA_SLOTS];
++		if (s->st != 0 && s->sn == sn) {
++			ba_skip(t, (sn + 1) & 0xfff);
++			break;
++		}
++	}
++	t->since = 0;
++}
++
++/* A QoS data frame of a TID with a session (m NULL: an EAPOL frame that went up by itself but took the SN). */
++static void
++ba_insert(struct ba_tid *t, uint16_t sn, uint8_t pf, mbuf_t m)
++{
++	if (t->wait) {
++		if (((sn - t->head) & 0xfff) >= SN_HALF) {      /* before the SSN, nothing in the window yet: up */
++			ba.plain++;
++			rx_up(m);
++			return;
++		}
++		t->head = sn;                           /* qmInsertReorderPkt: the first frame starts the window */
++		t->wait = false;
++	}
++	uint32_t d = (uint32_t)(sn - t->head) & 0xfff;
++	if (d < SN_HALF && d >= t->win) {               /* ahead: slide so that sn is the window's last */
++		ba_skip(t, (uint16_t)((sn - t->win + 1) & 0xfff));
++		d = (uint32_t)(sn - t->head) & 0xfff;
++	}
++	if (d != 0 && d < SN_HALF && t->amsdu) {        /* a later SN ends the head A-MSDU, its last subframe lost */
++		t->amsdu = false;                       /* (qmPopOutDueToFallWithin: "SN + 1 come ... update winstart") */
++		t->head = (t->head + 1) & 0xfff;
++		ba_release(t);
++		d = (uint32_t)(sn - t->head) & 0xfff;
++	}
++	if (d >= SN_HALF) {                             /* behind: a retransmission of what went up, or stale */
++		ba.old++;
++		if (m) {
++			mbuf_freem(m);
++		}
++		return;
++	}
++	struct ba_slot *s = &t->s[sn % BA_SLOTS];
++	if (d == 0 && s->st == 0) {                     /* the one awaited */
++		if (t->amsdu && (pf == PF_FIRST || pf == PF_MSDU)) {
++			ba.dups++;                      /* this A-MSDU again */
++			if (m) {
++				mbuf_freem(m);
++			}
++			return;
++		}
++		ba.direct++;
++		rx_up(m);
++		if (pf == PF_MSDU || pf == PF_LAST) {
++			t->amsdu = false;
++			t->head = (t->head + 1) & 0xfff;
++			ba_release(t);
++		} else {
++			t->amsdu = true;
++		}
++		return;
++	}
++	if (s->st != 0 && s->sn != sn) {               /* cannot be (window <= slots): make room */
++		ba_slot_out(s, true);
++		t->held--;
++	}
++	if (s->st == 2 || (s->st == 1 && (pf == PF_FIRST || pf == PF_MSDU))) {
++		ba.dups++;
++		if (m) {
++			mbuf_freem(m);
++		}
++		return;
++	}
++	if (s->st == 0) {
++		t->held++;
++		s->sn = sn;
++	}
++	if (m) {
++		mbuf_setnextpkt(m, NULL);
++		if (s->t) {
++			mbuf_setnextpkt(s->t, m);
++		} else {
++			s->h = m;
++		}
++		s->t = m;
++	}
++	s->st = (pf == PF_MSDU || pf == PF_LAST) ? 2 : 1;
++	ba.held++;
++	if (t->since == 0) {
++		t->since = mach_absolute_time();
++	}
++}
++
++/* Holes older than vivawifireorderms given up; returns the next such deadline (0: nothing held). */
++static uint64_t
++ba_check(uint64_t now)
++{
++	uint64_t next = 0, to = ms_abs(vt.reorderms);
++	for (unsigned i = 0; i < BA_TIDS; i++) {
++		struct ba_tid *t = &ba.t[i];
++		if (!t->on || t->held == 0 || t->since == 0) {
++			continue;
++		}
++		if (now - t->since >= to) {
++			ba.timeouts++;
++			ba_flush(t);
++		}
++		if (t->held && t->since && (next == 0 || t->since + to < next)) {
++			next = t->since + to;
++		}
++	}
++	return next;
++}
++
++static void
++ba_start(uint8_t tid, uint16_t ssn, uint16_t win)
++{
++	struct ba_tid *t = &ba.t[tid & (BA_TIDS - 1)];
++	if (t->on) {
++		ba_flush(t);
++	}
++	t->on = true;
++	t->wait = true;
++	t->amsdu = false;
++	t->head = ssn & 0xfff;
++	t->win = (win == 0 || win > BA_SLOTS) ? BA_SLOTS : win;
++	t->since = 0;
++	ba.adds++;
++}
++
++static void
++ba_stop(uint8_t tid)
++{
++	struct ba_tid *t = &ba.t[tid & (BA_TIDS - 1)];
++	if (t->on) {
++		ba_flush(t);
++		t->on = false;
++		ba.dels++;
++	}
++}
++
++/* Link gone / new join: what is held is dropped, sessions forgotten (counters kept). */
++static void
++ba_reset(void)
++{
++	for (unsigned i = 0; i < BA_TIDS; i++) {
++		struct ba_tid *t = &ba.t[i];
++		for (unsigned k = 0; k < BA_SLOTS; k++) {
++			ba_slot_out(&t->s[k], false);
++		}
++		bzero(t, sizeof(*t));
++	}
++}
++
++/* ---- received data ---- */
++
++struct rxinfo {
++	uint16_t sn;
++	uint8_t  tid, pf;
++	bool     ba, eapol;
++};
++
++/* A data frame: translated by the MAC (RXD byte 6 bit 7) or 802.11 data. */
++static bool
++rx_is_data(const uint8_t *b, uint32_t n, uint32_t foff)
++{
++	uint32_t end = MIN((uint32_t)(b[0] | b[1] << 8), n);
++	return (b[6] & 0x80) || (end >= foff + 24 && (b[foff] & 0x0c) == 0x08);
++}
++
++/*
++ * A data frame (RXD at b, frame at b + foff) into one mbuf as 802.3 (the MAC's translation, or LLC/SNAP here) and
++ * what the reorder needs: TID (RXD byte 9), SN (group 4 of a translated frame, else the 802.11 header), A-MSDU
++ * position (RXD byte 7), unicast (RXD byte 4 bits 2-3 MC/BC). NULL: dropped (counted).
++ */
++static mbuf_t
++rx_data_mbuf(const uint8_t *b, uint32_t n, uint32_t foff, int kind, struct rxinfo *ri)
++{
++	uint32_t end = MIN((uint32_t)(b[0] | b[1] << 8), n), flen = end - foff, plen;
++	uint16_t ptype = (uint16_t)(b[2] | b[3] << 8), status = (uint16_t)(b[10] | b[11] << 8), fc = 0, seq = 0;
++	const uint8_t *f = b + foff, *src;
++	uint8_t eth[14];
++	bzero(ri, sizeof(*ri));
++	wl.dataFrames++;
++	if (kind == PKT_DATA && (status & 0x001a)) {    /* FCS, cipher length, ICV error (nic_rx.h; CM bit 2 ignored) */
++		ba.rxErr++;
++		return NULL;
++	}
++	if (b[6] & 0x80) {                              /* translated to 802.3: DA, SA, type */
++		if (flen < 14) {
++			return NULL;
++		}
++		if (ptype & (1u << 12)) {               /* group 4: FC, TA, SeqCtl, QoS of the 802.11 header */
++			fc = (uint16_t)(b[20] | b[21] << 8);
++			seq = (uint16_t)(b[28] | b[29] << 8);
++		}
++		ri->tid = b[9] & 0xf;
++		memcpy(eth, f, 14);
++		src = f + 14;
++		plen = flen - 14;
++	} else {
++		/* 802.11 data not translated: LLC/SNAP AA AA 03 00 00 00 + type -> 802.3 (from the AP: to-DS 0) */
++		fc = (uint16_t)(f[0] | f[1] << 8);
++		uint32_t h = 24 + ((fc & 0x80) ? 2 : 0);
++		const uint8_t *l = f + h;
++		if (flen < h + 8 || l[0] != 0xaa || l[1] != 0xaa || l[2] != 0x03) {
++			return NULL;
++		}
++		seq = (uint16_t)(f[22] | f[23] << 8);
++		ri->tid = (fc & 0x80) ? (f[24] & 0xf) : 0;
++		memcpy(eth, f + 4, 6);                  /* DA = addr1 */
++		memcpy(eth + 6, f + 16, 6);             /* SA = addr3 */
++		eth[12] = l[6];
++		eth[13] = l[7];
++		src = l + 8;
++		plen = flen - h - 8;
++	}
++	ri->eapol = eth[12] == 0x88 && eth[13] == 0x8e;
++	if ((!sj.link && !ri->eapol) || 14 + plen > 2048) {
++		sj.rxDrops++;
++		return NULL;
++	}
++	/* one mbuf with a 2 KiB cluster, lengths set explicitly (as sweet_usb.c; viva_wlan_input strips 14 bytes) */
++	mbuf_t m = NULL;
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0) {
++		sj.rxDrops++;
++		return NULL;
++	}
++	if (mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < 14 + plen) {
++		mbuf_freem(m);
++		sj.rxDrops++;
++		return NULL;
++	}
++	uint8_t *d = mbuf_data(m);
++	memcpy(d, eth, 14);
++	memcpy(d + 14, src, plen);
++	mbuf_setlen(m, 14 + plen);
++	mbuf_pkthdr_setlen(m, 14 + plen);
++	ri->pf = b[7] & 3;
++	ri->sn = seq >> 4;
++	ri->ba = kind == PKT_DATA && vt.reorder && (fc & 0x00cc) == 0x0088 &&  /* QoS data, not QoS null */
++	    !(b[4] & 0x0c) && ri->tid < BA_TIDS && ba.t[ri->tid].on;
++	return m;
++}
++
++/* EAPOL to the supplicant, a session's frames through the reorder, the rest to en0 (after vw_unlock()). */
+ static void
++rx_data_up(mbuf_t m, const struct rxinfo *ri)
++{
++	if (ri->ba) {
++		ba_insert(&ba.t[ri->tid], ri->sn, ri->pf, ri->eapol ? NULL : m);
++	} else if (!ri->eapol) {
++		ba.plain++;
++		rx_up(m);
++	}
++	if (ri->eapol) {
++		sta_eapol(mbuf_data(m), (uint32_t)mbuf_len(m));
++		mbuf_freem(m);
++	}
++}
++
++/* RX dispatch for frames and data (called from rx_next / rx_drain). */
++static void
+ wifi_frame(const uint8_t *b, uint32_t n, uint32_t foff, int kind)
+ {
+ 	const uint8_t *f = b + foff;
+ 	uint32_t total = MIN((uint32_t)(b[0] | b[1] << 8), n), flen = total - foff;
+-	if (b[6] & 0x80) {                              /* translated to 802.3: DA, SA, type */
+-		wl.dataFrames++;
+-		data_rx(f, flen);
++	if (rx_is_data(b, n, foff)) {
++		struct rxinfo ri;
++		mbuf_t m = rx_data_mbuf(b, n, foff, kind, &ri);
++		if (m != NULL) {
++			rx_data_up(m, &ri);
++		}
+ 		return;
+ 	}
+ 	if (kind != PKT_FRAME && kind != PKT_DATA) {
+@@ -1892,20 +2389,6 @@
+ 		}
+ 	} else if ((fc & 0x0c) == 0) {
+ 		join_frame(b, f, flen);
+-	} else if ((fc & 0x0c) == 0x08 && flen >= 24 + 8) {
+-		/* 802.11 data not translated: LLC/SNAP AA AA 03 00 00 00 + type -> 802.3 (from the AP: to-DS 0) */
+-		uint32_t h = 24 + ((fc & 0x80) ? 2 : 0);
+-		const uint8_t *l = f + h;
+-		if (flen >= h + 8 && l[0] == 0xaa && l[1] == 0xaa && l[2] == 0x03) {
+-			static uint8_t eth[14 + 2048];
+-			uint32_t plen = MIN(flen - h - 8, (uint32_t)2048);
+-			memcpy(eth, f + 4, 6);                  /* DA = addr1 */
+-			memcpy(eth + 6, f + 16, 6);             /* SA = addr3 */
+-			eth[12] = l[6];
+-			eth[13] = l[7];
+-			memcpy(eth + 14, l + 8, plen);
+-			data_rx(eth, 14 + plen);
+-		}
+ 	}
+ }
+ 
+@@ -1963,6 +2446,28 @@
+ 			sj.state = 0;
+ 		}
+ 		break;
++	case EID_RX_ADDBA:                              /* the firmware accepted the AP's ADDBA (que_mgt.h EVENT_RX_ADDBA) */
++		if (got >= 40) {
++			uint16_t param = (uint16_t)(d[2] | d[3] << 8), ssc = (uint16_t)(d[6] | d[7] << 8);
++			uint8_t tid = (param >> 2) & 0xf;
++			if (tid < BA_TIDS) {
++				ba_start(tid, ssc >> 4, param >> 6);
++			}
++			printf("VIVA WIFI: RX block ack TID %u, window %u, SSN %u (sta %u)\n", tid, param >> 6, ssc >> 4, d[0]);
++		}
++		break;
++	case EID_RX_DELBA:                              /* {sta, tid} */
++		if (got >= 34 && d[1] < BA_TIDS) {
++			ba_stop(d[1]);
++			printf("VIVA WIFI: RX block ack TID %u ended\n", d[1]);
++		}
++		break;
++	case EID_CHECK_REORDER_BUBBLE:                  /* {sta, tid}: the firmware will not fill the hole */
++		if (got >= 34 && d[1] < BA_TIDS && ba.t[d[1]].on) {
++			ba.bubbles++;
++			ba_flush(&ba.t[d[1]]);
++		}
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -2154,6 +2659,7 @@
+ static void
+ sta_teardown(void)
+ {
++	ba_reset();
+ 	if (sj.staRec) {
+ 		hw_pm_connected(false);
+ 		(void)hw_bss_info(false);
+@@ -2482,6 +2988,7 @@
+ hw_reset(void)
+ {
+ 	bzero(&tx0, sizeof(tx0));
++	ba_reset();
+ }
+ 
+ static inline void
+@@ -2738,8 +3245,8 @@
+ 	p[55] = 0xff;
+ 	p[68] = 3;                                      /* RTS policy legacy */
+ 	put16(p + 74, rate_code());
+-	p[76] = 0;                                      /* no TX A-MPDU (0153: the data queue stalled under load) */
+-	p[77] = 0;                                      /* no RX block ack: we do not reorder */
++	p[76] = vt.txba ? 1 : 0;                        /* TX A-MPDU: off by default (0154: the data queue stalled) */
++	p[77] = vt.rxba ? 1 : 0;                        /* RX block ack: the firmware answers ADDBA, we reorder (0192) */
+ 	put32(p + 88, 0x10);
+ 	p[92] = 0x40;
+ 	p[128] = 1;
+@@ -2967,8 +3474,175 @@
+ 		vs.cur.rssi = sj.rssi;
+ 	}
+ 	lck_mtx_unlock(&vs_mtx);
++}
++
++/* ---- RX passes and the WFDMA interrupt (0192) ---- */
++
++/*
++ * The WFDMA raises GIC SPI 0x11d (DT wifi@18000000, level high) while INT_STA & INT_MSK has a bit; gen4m's ISR
++ * (axi.c mtk_axi_interrupt) only masks it and wakes the HIF thread, which acks INT_STA, drains the rings and unmasks
++ * (cmm_asic_connac.c asicPdmaIntMaskConfig: rx_done 0/1 = bits 0/1). Here the handler masks INT_MSK and wakes the
++ * worker; the worker acks, drains, and unmasks under vw_mtx before it sleeps, so one interrupt covers a whole burst.
++ * The line is attached on the wlan nub by VivaWiFi.cpp. Never firing (frames found by the safety timer only) or
++ * firing while masked (not this line): back to polling, said once.
++ */
++#define WF_INT_RX               0x3u            /* rx_done_0 (data), rx_done_1 (events, MSDU reports) */
++#define WIFI_INTID              (32 + 0x11d)
++#define IRQ_SAFETY_MS           50              /* worker timeout with the interrupt on */
++#define HOT_MS                  100             /* fast polls this long after the last RX/TX */
++
++static struct {
++	volatile bool armed;            /* the handler may touch WFDMA registers */
++	volatile bool masked;           /* the handler masked INT_MSK, the worker has not unmasked yet */
++	volatile bool pending;          /* the handler ran since the worker last looked */
++	bool     mode;                  /* the worker relies on the interrupt */
++	bool     attached, gaveUp;      /* gaveUp: attach failed or the line misbehaved, until "wifi opt irq 1" */
++	int      err;                   /* viva_wifi_irq_attach() */
++	uint32_t count, stray, missed;  /* interrupts, interrupts while masked, frames found by the safety timer */
++	uint32_t strayRun;
++	uint32_t wIrq, wTimer, wKick;   /* worker wakeups by cause */
++	uint32_t passes, passRx, rx, maxRx, tx;
++	uint64_t last;                  /* last pass with RX or TX */
++} vi;
++
++/* GIC handler (interrupt context, CPU 0). False: not ours, the caller disables the line. */
++bool
++viva_wifi_intr(void)
++{
++	if (!vi.armed) {
++		return false;
++	}
++	if (vi.masked) {
++		vi.stray++;                             /* asserted with INT_MSK 0: another source, if it goes on */
++		if (++vi.strayRun > 8) {
++			vi.armed = false;
++			return false;
++		}
++		return true;
++	}
++	wr(WF_INT_MSK, 0);
++	(void)rd(WF_INT_MSK);                           /* the write reached the WFDMA before the GIC's EOI */
++	vi.masked = true;
++	vi.strayRun = 0;
++	vi.count++;
++	vi.pending = true;
++	wakeup(&vw_chan);
++	return true;
++}
++
++/* vw_mtx held, radio up: take the interrupt if asked for. */
++static void
++irq_on(void)
++{
++	if (vi.mode || !vt.irq || !wl.init || vi.gaveUp) {
++		return;
++	}
++	if (!vi.attached) {
++		vi.err = viva_wifi_irq_attach(WIFI_INTID);
++		vi.attached = vi.err == 0;
++		if (!vi.attached) {
++			printf("VIVA WIFI: no WFDMA interrupt (error %d), polling\n", vi.err);
++			vi.gaveUp = true;
++			return;
++		}
++	}
++	wr(WF_INT_MSK, 0);
++	wr(WF_INT_STA, WF_INT_RX);
++	vi.masked = true;                               /* the worker unmasks after its next pass */
++	vi.pending = false;
++	vi.armed = true;
++	vi.mode = true;
++	viva_wifi_irq_enable(true);
++}
++
++/* Back to polling (radio going off, "wifi opt irq 0", or the line misbehaved). */
++static void
++irq_off(void)
++{
++	bool was = vi.mode;
++	vi.armed = false;
++	vi.mode = false;
++	if (vi.attached) {
++		viva_wifi_irq_enable(false);
++	}
++	if (was && vw.on) {
++		wr(WF_INT_MSK, 0);
++	}
++	vi.masked = false;
+ }
+ 
++/* vw_mtx held: before the RX of a pass, the interrupt state is checked and its status acked. */
++static void
++irq_pass(bool timerWake)
++{
++	if (vi.mode && !vi.armed) {                     /* the handler gave the line up */
++		printf("VIVA WIFI: WFDMA interrupt fired while masked (%u times), polling\n", vi.stray);
++		irq_off();
++		vi.gaveUp = true;
++	}
++	if (vi.mode && timerWake && vi.count == 0 && vi.missed >= 32) {
++		printf("VIVA WIFI: WFDMA interrupt never fired (%u frames found by the timer), polling\n", vi.missed);
++		irq_off();
++		vi.gaveUp = true;
++	}
++	if (vi.mode) {
++		wr(WF_INT_STA, WF_INT_RX);              /* ack first: what lands after it raises the line again */
++	}
++}
++
++/* vw_mtx held, at the end of a pass: the interrupt may fire again. */
++static void
++irq_rearm(void)
++{
++	if (vi.mode && vi.armed && vw.on) {
++		vi.masked = false;
++		wr(WF_INT_MSK, WF_INT_RX);
++	}
++}
++
++static uint8_t rx_copy[RX_BUF_LEN];
++
++/*
++ * Both rings (1 then 0), up to `budget` packets. Data frames go from the DMA buffer straight into their mbuf and the
++ * entry is given back before the frame goes on (EAPOL may pump RX itself); everything else is copied out first, as
++ * rx_next() does. Returns the packets taken.
++ */
++static uint32_t
++rx_drain(uint32_t budget)
++{
++	uint32_t got = 0;
++	for (uint32_t r = 2; r-- > 0;) {
++		uint32_t didx = rd(WF_RX_RING(r) + 12) & 0xfff;
++		uint32_t pend = (didx + wd.rxN[r] - wd.rxIdx[r]) % wd.rxN[r];
++		if (pend > wd.rxMaxPend[r]) {
++			wd.rxMaxPend[r] = pend;
++		}
++		while (got < budget) {
++			uint32_t n, foff = 0;
++			const uint8_t *p = rx_peek(r, &n);
++			if (p == NULL) {
++				rx_resync(r, 2);
++				break;
++			}
++			got++;
++			int kind = n ? rx_classify(p, n, &foff) : 0;
++			if (kind == PKT_DATA && rx_is_data(p, n, foff)) {
++				struct rxinfo ri;
++				mbuf_t m = rx_data_mbuf(p, n, foff, kind, &ri);
++				rx_pop(r);
++				if (m != NULL) {
++					rx_data_up(m, &ri);
++				}
++				continue;
++			}
++			memcpy(rx_copy, p, n);
++			rx_pop(r);
++			rx_handle(rx_copy, n, kind, foff);
++		}
++	}
++	return got;
++}
++
+ /* Drop vw_mtx, then tell viva_wlan.c what happened (events, received frames). */
+ static void
+ vw_unlock(void)
+@@ -2994,6 +3668,10 @@
+ 	if (bits & NOTE_ASSOC) {
+ 		viva_wlan_assoc_done(assoc);
+ 	}
++	if (rx != NULL && vt.batch) {
++		viva_wlan_input_list(rx);               /* one ifnet_input for the pass (0192) */
++		rx = NULL;
++	}
+ 	while (rx != NULL) {
+ 		mbuf_t next = mbuf_nextpkt(rx);
+ 		mbuf_setnextpkt(rx, NULL);
+@@ -3004,9 +3682,12 @@
+ 
+ static uint8_t tx_buf[2048];
+ 
+-/* One iteration: requests, then RX, the TX queue and the timers. Returns true when there is more to do soon. */
++/*
++ * One iteration: requests, then RX, the TX queue and the timers. Returns true when there is more to do soon;
++ * *baNext: when a reorder hole times out (0: none).
++ */
+ static bool
+-sta_step(char *out, size_t len, size_t *po)
++sta_step(char *out, size_t len, size_t *po, bool timerWake, uint64_t *baNext)
+ {
+ 	size_t o = *po;
+ 	lck_mtx_lock(&vs_mtx);
+@@ -3063,11 +3744,16 @@
+ 		return false;
+ 	}
+ 
+-	/* RX: up to 64 packets */
+-	for (int k = 0; k < 64; k++) {
+-		int kind;
+-		if (rx_next(wcmd_ev, RX_BUF_LEN, 0, &kind) == 0) {
+-			break;
++	/* RX: what both rings hold (0192: was up to 64, copied twice each, a 50 us sleep per empty look) */
++	irq_pass(timerWake);
++	uint32_t got = rx_drain(4 * RX0_MAX), sent = 0;
++	vi.passes++;
++	if (got) {
++		vi.passRx++;
++		vi.rx += got;
++		vi.maxRx = MAX(vi.maxRx, got);
++		if (vi.mode && timerWake) {
++			vi.missed += got;
+ 		}
+ 	}
+ 	/* TX queue */
+@@ -3090,6 +3776,7 @@
+ 		if (sj.link && mlen >= 14 && mlen <= sizeof(tx_buf) && mbuf_copydata(m, 0, mlen, tx_buf) == 0 &&
+ 		    hw_tx(tx_buf, (uint32_t)mlen, false, sj.rsn) == 0) {
+ 			sj.tx++;
++			sent++;
+ 		} else {
+ 			sj.txDrops++;
+ 		}
+@@ -3110,31 +3797,87 @@
+ 	if (sj.state == 0 && (sj.staRec || sj.chHeld)) {
+ 		sta_teardown();                         /* the AP left us (deauth, beacon timeout) */
+ 	}
++	*baNext = ba_check(now);
++	if (got || sent) {
++		vi.last = now;
++		vi.tx += sent;
++	}
++	if (!vt.irq && vi.mode) {
++		irq_off();
++	}
++	irq_on();
++	irq_rearm();
+ 	*po = o;
+ 	return wl.scanBusy || (sj.state != 0 && !sj.link) || vs.txn;
+ }
+ 
++/*
++ * The worker sleeps until a request, a TX frame, the WFDMA interrupt or its timeout: 1 ms while something is in
++ * flight (scan, join, TX backlog); else IRQ_SAFETY_MS with the interrupt, or polls (vivawifipollus for HOT_MS after
++ * traffic, then vivawifiidlems, coalescable); never later than a reorder hole's timeout. 0154 polled every 2 ms with
++ * two 50 us sleeps per look, link up or not: ~1500 timer wakeups a second, and up to 2 ms of RX latency.
++ */
+ static void
+ vw_worker(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	static char log[2048];
++	bool timerWake = false;
++	vt_load();
+ 	for (;;) {
+ 		size_t o = 0;
++		uint64_t baNext = 0;
+ 		log[0] = 0;
+ 		lck_mtx_lock(&vw_mtx);
+-		bool busy = sta_step(log, sizeof(log), &o);
+-		bool up = wl.init, link = sj.link;
++		bool busy = sta_step(log, sizeof(log), &o, timerWake, &baNext);
++		bool up = wl.init;
+ 		vw_unlock();
+ 		if (log[0]) {
+ 			printf("VIVA WIFI: %s", log);
+ 		}
+-		struct timespec ts = { 0, (busy ? 1 : link ? 2 : 20) * NSEC_PER_MSEC };
++		uint64_t now = mach_absolute_time(), deadline = 0, leeway = 0, t;
++		if (busy) {
++			deadline = now + ms_abs(1);
++		} else if (up) {
++			if (vi.mode) {
++				deadline = now + ms_abs(IRQ_SAFETY_MS);
++				leeway = ms_abs(IRQ_SAFETY_MS / 4);
++			} else if (now - vi.last < ms_abs(HOT_MS)) {
++				nanoseconds_to_absolutetime((uint64_t)vt.pollus * NSEC_PER_USEC, &t);
++				deadline = now + t;
++			} else {
++				deadline = now + ms_abs(vt.idlems);
++				leeway = ms_abs(vt.idlems) / 4;
++			}
++			if (baNext != 0 && baNext < deadline) {
++				deadline = MAX(baNext, now + 1);
++				leeway = 0;
++			}
++		}
++		wait_result_t w;
+ 		lck_mtx_lock(&vs_mtx);
+-		if (vs.req == 0 && vs.txn == 0) {
+-			(void)msleep(&vw_chan, &vs_mtx, PZERO | PDROP, "vivawifi", up ? &ts : NULL);
++		if (deadline != 0) {
++			(void)assert_wait_deadline_with_leeway((event_t)&vw_chan, THREAD_UNINT,
++			    leeway ? TIMEOUT_URGENCY_LEEWAY : TIMEOUT_URGENCY_SYS_NORMAL, deadline, leeway);
++		} else {
++			(void)assert_wait((event_t)&vw_chan, THREAD_UNINT);
++		}
++		if (vs.req != 0 || vs.txn != 0 || vi.pending) {
++			lck_mtx_unlock(&vs_mtx);
++			(void)clear_wait(current_thread(), THREAD_AWAKENED);
++			w = THREAD_AWAKENED;
+ 		} else {
+ 			lck_mtx_unlock(&vs_mtx);
++			w = thread_block(THREAD_CONTINUE_NULL);
+ 		}
++		timerWake = w == THREAD_TIMED_OUT;
++		if (vi.pending) {
++			vi.pending = false;
++			vi.wIrq++;
++		} else if (timerWake) {
++			vi.wTimer++;
++		} else {
++			vi.wKick++;
++		}
+ 	}
+ }
+ 
+@@ -3370,12 +4113,74 @@
+ 	    tx0.firstReport[0], tx0.firstReport[1], tx0.firstReport[2], tx0.firstReport[3], tx0.firstReport[4],
+ 	    tx0.firstReport[5], tx0.firstReport[6], tx0.firstReport[7], tx0.firstReport[8], tx0.firstReport[9],
+ 	    tx0.firstReport[10], tx0.firstReport[11]);
++	say("sta: rx path: %u passes (%u with RX, %u packets, max %u, %u.%u per pass with RX), wakeups irq %u timer %u "
++	    "kick %u; tx %u; interrupt %s (attach %d, %u fired, %u while masked, %u frames found by the timer)\n",
++	    vi.passes, vi.passRx, vi.rx, vi.maxRx, vi.passRx ? vi.rx / vi.passRx : 0,
++	    vi.passRx ? (vi.rx * 10 / vi.passRx) % 10 : 0, vi.wIrq, vi.wTimer, vi.wKick, vi.tx,
++	    vi.mode ? "on" : !vt.irq ? "off (opt)" : vi.gaveUp ? "gave up (polling)" : "off (radio)", vi.err, vi.count,
++	    vi.stray, vi.missed);
++	say("sta: rings: rx0 %u entries (max %u pending, %u resynced, %u segments), rx1 %u (max %u pending, %u resynced); "
++	    "%u rx errors dropped\n", wd.rxN[0], wd.rxMaxPend[0], wd.rxSkipped[0], wd.rxNoLast[0], wd.rxN[1],
++	    wd.rxMaxPend[1], wd.rxSkipped[1], ba.rxErr);
++	say("sta: block ack: rx %u tx %u reorder %u (%u ms); ADDBA %u DELBA %u bubbles %u; in order %u, held %u, released "
++	    "%u, dups %u, behind %u, lost SNs %u, timeouts %u, outside a session %u; TIDs:", vt.rxba, vt.txba, vt.reorder,
++	    vt.reorderms, ba.adds, ba.dels, ba.bubbles, ba.direct, ba.held, ba.released, ba.dups, ba.old, ba.lost,
++	    ba.timeouts, ba.plain);
++	for (unsigned i = 0; i < BA_TIDS; i++) {
++		if (ba.t[i].on) {
++			say(" %u (win %u head %u held %u%s)", i, ba.t[i].win, ba.t[i].head, ba.t[i].held, ba.t[i].wait ? " wait" : "");
++		}
++	}
++	say("\n");
+ 	if (o < len) {
+ 		o += viva_wlan_stats(out + o, len - o);
+ 	}
+ 	return o;
+ }
+ 
++/* wifi opt [NAME VALUE]: the 0192 tunables (boot-args vivawifiNAME). */
++static size_t
++wifi_opt(const char *args, char *out, size_t len, size_t o)
++{
++	vt_load();
++	while (*args == ' ') {
++		args++;
++	}
++	for (unsigned k = 0; *args && k < sizeof(vt_names) / sizeof(vt_names[0]); k++) {
++		size_t nl = strlen(vt_names[k].name);
++		if (strncmp(args, vt_names[k].name, nl) != 0 || (args[nl] != ' ' && args[nl] != 0)) {
++			continue;
++		}
++		const char *v = args + nl;
++		while (*v == ' ') {
++			v++;
++		}
++		if (*v < '0' || *v > '9') {
++			say("opt: %s needs a number\n", vt_names[k].name);
++			return o;
++		}
++		uint32_t n = 0;
++		while (*v >= '0' && *v <= '9') {
++			n = n * 10 + (uint32_t)(*v++ - '0');
++		}
++		*vt_names[k].v = MIN(MAX(n, vt_names[k].min), vt_names[k].max);
++		if (vt_names[k].v == &vt.irq) {
++			vi.gaveUp = false;              /* try the line again (counters kept) */
++			vi.missed = 0;
++		}
++		if (!vt.reorder) {
++			for (unsigned i = 0; i < BA_TIDS; i++) {
++				ba_flush(&ba.t[i]);             /* what was held goes up now */
++			}
++		}
++		break;
++	}
++	say("opt: rxba %u txba %u (next join), reorder %u reorderms %u, irq %u pollus %u idlems %u, batch %u, rxn %u (next "
++	    "wifi fw; now %u)\n", vt.rxba, vt.txba, vt.reorder, vt.reorderms, vt.irq, vt.pollus, vt.idlems, vt.batch, vt.rxn,
++	    wd.rxN[0]);
++	return o;
++}
++
+ void
+ viva_wifi_link(const char *args, char *out, size_t len)
+ {
+@@ -3410,13 +4215,20 @@
+ 		sta_leave(out, len, &o);
+ 	} else if (strncmp(args, "sta", 3) == 0) {
+ 		o = wifi_sta(out, len, o);
++	} else if (strncmp(args, "opt", 3) == 0) {
++		o = wifi_opt(args + 3, out, len, o);
+ 	} else if (strncmp(args, "ring", 4) == 0 && wd.uva != NULL) {
+ 		for (uint32_t r = 0; r < 2; r++) {
+-			say("rx%u: hw cidx %u didx %u, driver next %u, %u taken, %u skipped (last skipped d1 0x%08x); d1:", r,
+-			    rd(WF_RX_RING(r) + 8), rd(WF_RX_RING(r) + 12), wd.rxIdx[r], wd.rxGot[r], wd.rxSkipped[r], wd.rxSkipD1[r]);
+-			for (uint32_t i = 0; i < RING_N; i++) {
+-				say(" %08x", desc(OFF_RX(r), i)[1]);
++			uint32_t done = 0;
++			for (uint32_t i = 0; i < wd.rxN[r]; i++) {
++				done += (desc(wd.rxDesc[r], i)[1] & DESC_DMADONE) ? 1 : 0;
+ 			}
++			say("rx%u: %u entries, %u done, hw cidx %u didx %u, driver next %u, %u taken, %u skipped (last skipped d1 "
++			    "0x%08x); d1 from the driver's:", r, wd.rxN[r], done, rd(WF_RX_RING(r) + 8), rd(WF_RX_RING(r) + 12),
++			    wd.rxIdx[r], wd.rxGot[r], wd.rxSkipped[r], wd.rxSkipD1[r]);
++			for (uint32_t i = 0; i < MIN(wd.rxN[r], 16u); i++) {
++				say(" %08x", desc(wd.rxDesc[r], (wd.rxIdx[r] + i) % wd.rxN[r])[1]);
++			}
+ 			say("\n");
+ 		}
+ 		say("tx0: hw cidx %u didx %u, driver next %u; tx15: cidx %u didx %u; GLO_CFG 0x%08x INT_STA 0x%08x\n",
+diff --git a/bsd/dev/viva_wlan.c b/bsd/dev/viva_wlan.c
+--- a/bsd/dev/viva_wlan.c
++++ b/bsd/dev/viva_wlan.c
+@@ -188,6 +188,42 @@
+ 	mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
+ 	(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
+ 	ifnet_input(ifp, m, &stats);
++}
++
++/* A pass's frames (linked by nextpkt) as one chain: one ifnet_input, one DLIL input wakeup (0192). */
++void
++viva_wlan_input_list(mbuf_t m)
++{
++	ifnet_t ifp = wn.ifp;
++	mbuf_t head = NULL, tail = NULL;
++	struct ifnet_stat_increment_param stats = {};
++	while (m != NULL) {
++		mbuf_t next = mbuf_nextpkt(m);
++		mbuf_setnextpkt(m, NULL);
++		if (ifp == NULL || mbuf_pkthdr_len(m) < ETHER_HDR_LEN || mbuf_len(m) < ETHER_HDR_LEN) {
++			mbuf_freem(m);
++			m = next;
++			continue;
++		}
++		stats.packets_in++;
++		stats.bytes_in += (uint32_t)mbuf_pkthdr_len(m);
++		mbuf_pkthdr_setrcvif(m, ifp);
++		bpf_tap_in(ifp, DLT_EN10MB, m, NULL, 0);
++		void *frame_header = mbuf_data(m);
++		mbuf_pkthdr_setheader(m, frame_header);
++		mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++		(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++		if (tail != NULL) {
++			mbuf_setnextpkt(tail, m);
++		} else {
++			head = m;
++		}
++		tail = m;
++		m = next;
++	}
++	if (head != NULL) {
++		ifnet_input(ifp, head, &stats);
++	}
+ }
+ 
+ /* ---- events from the station ---- */
+diff --git a/bsd/dev/viva_wlan.h b/bsd/dev/viva_wlan.h
+--- a/bsd/dev/viva_wlan.h
++++ b/bsd/dev/viva_wlan.h
+@@ -65,6 +65,7 @@
+ void viva_wlan_link(bool up, uint32_t reason);
+ void viva_wlan_power(bool on);
+ void viva_wlan_input(mbuf_t m);                         /* a received 802.3 frame */
++void viva_wlan_input_list(mbuf_t m);                    /* received 802.3 frames (nextpkt): one ifnet_input */
+ size_t viva_wlan_stats(char *out, size_t len);            /* USB link "wifi sta" */
+ 
+ /* VivaWLAN.cpp */
+diff --git a/iokit/Kernel/arm/hid/VivaGT9896.cpp b/iokit/Kernel/arm/hid/VivaGT9896.cpp
+--- a/iokit/Kernel/arm/hid/VivaGT9896.cpp
++++ b/iokit/Kernel/arm/hid/VivaGT9896.cpp
+@@ -32,7 +32,7 @@
+ #include "SweetHIDTouch.h"
+ #include "../VivaIO.h"
+ 
+-extern "C" void viva_cpufreq_ui_activity(void);        /* osfmk/arm64/viva_cpufreq.c: 0183 UI boost */
++extern "C" void viva_cpufreq_ui_touch(int contacts);   /* osfmk/arm64/viva_cpufreq.c: 0183/0192 UI boost */
+ 
+ #define GT_REG_TEST             0x4100
+ #define GT_EVENT_TOUCH          0x80
+@@ -302,7 +302,7 @@
+ 	}
+ 
+ 	fEvents++;
+-	viva_cpufreq_ui_activity();     /* 0183: the CPU clusters ramp while a finger is down */
++	viva_cpufreq_ui_touch((int)n);  /* 0183/0192: the CPU clusters ramp while a finger moves */
+ 	uint32_t map = 0;
+ 	const uint8_t *c = buf + GT_HEAD_LEN;
+ 	for (uint32_t i = 0; i < n; i++, c += GT_BYTES_PER_COORD) {
+diff --git a/iokit/Kernel/arm/hid/VivaKeypad.cpp b/iokit/Kernel/arm/hid/VivaKeypad.cpp
+--- a/iokit/Kernel/arm/hid/VivaKeypad.cpp
++++ b/iokit/Kernel/arm/hid/VivaKeypad.cpp
+@@ -28,6 +28,7 @@
+ #include "IOHIDUsageTables.h"
+ 
+ extern "C" uint64_t mach_absolute_time(void);
++extern "C" bool viva_keys_note_edge(UInt32 usage, bool down, uint64_t abstime);   /* VivaPMICKeys.cpp: force restart */
+ 
+ #define KP_STA          0x0000
+ #define KP_MEM(n)       (0x0004 + 4 * (n))      /* n = 0..4 */
+@@ -170,11 +171,13 @@
+ 			}
+ 			IOLog("VIVA KP: key 0x%x %s\n", (unsigned)usage, down ? "down" : "up");
+ 			{
+-				IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, usage, down);
++				uint64_t now = mach_absolute_time();
++				IOHIDEvent *event = IOHIDEvent::keyboardEvent(now, kHIDPage_Consumer, usage, down);
+ 				if (event != NULL) {
+ 					dispatchEvent(event);
+ 					event->release();
+ 				}
++				(void)viva_keys_note_edge(usage, down, now);
+ 			}
+ 		}
+ 	}
+diff --git a/iokit/Kernel/arm/hid/VivaPMICKeys.cpp b/iokit/Kernel/arm/hid/VivaPMICKeys.cpp
+--- a/iokit/Kernel/arm/hid/VivaPMICKeys.cpp
++++ b/iokit/Kernel/arm/hid/VivaPMICKeys.cpp
+@@ -14,6 +14,11 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IOLocks.h>
++#include <libkern/OSAtomic.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
+ 
+ #include "IOHIDEventService.h"
+ #include "IOHIDEvent.h"
+@@ -22,6 +27,67 @@
+ 
+ extern "C" uint64_t mach_absolute_time(void);
+ 
++/*
++ * 0192: force restart = VolUp click, VolDown click, hold side. Apple's button firmware recognizes it and sends
++ * keyboard event 0xFF01 (AppleVendorKeyboard) / 0x40 (WillReset); -[SpringBoard __handleHIDEvent:withUIEvent:]
++ * maps 0xFF010040 to -[SBLockHardwareButton forceResetSequenceDidBegin]: the Siri long press is cancelled and
++ * the power-off slider comes up 0.35 s later if the side button is still down. Nothing in userland recognizes
++ * the sequence itself, so we do it here from both key services (volume down is VivaKeypad). Windows (1 s per
++ * click and gap) are a guess. Holding the side button `vivaforcerestart` ms (10000; 0 = off) after the sequence
++ * restarts through the watchdog, as Apple's PMU does.
++ */
++#define kVivaHIDPage_AppleVendorKeyboard                0xFF01
++#define kVivaHIDUsage_AppleVendorKeyboard_WillReset     0x0040
++#define FR_EDGES        4
++#define FR_WINDOW_NS    1000000000ULL
++#define FR_RESTART_MS   10000
++
++static struct { UInt32 usage; bool down; uint64_t ns; } gFrEdge[FR_EDGES];
++static unsigned int gFrCount;
++static IOSimpleLock *gFrLock;
++
++/* Every key edge of both services; true when this one (side button down) completes the sequence. */
++extern "C" bool
++viva_keys_note_edge(UInt32 usage, bool down, uint64_t abstime)
++{
++	if (gFrLock == NULL) {
++		IOSimpleLock *l = IOSimpleLockAlloc();
++		if (l != NULL && !OSCompareAndSwapPtr(NULL, l, (void * volatile *)&gFrLock)) {
++			IOSimpleLockFree(l);
++		}
++		if (gFrLock == NULL) {
++			return false;
++		}
++	}
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abstime, &ns);
++	bool fire = false;
++	IOInterruptState is = IOSimpleLockLockDisableInterrupt(gFrLock);
++	if (usage == kHIDUsage_Csmr_Power && down && gFrCount >= FR_EDGES) {
++		static const UInt32 want[FR_EDGES] = { kHIDUsage_Csmr_VolumeIncrement, kHIDUsage_Csmr_VolumeIncrement,
++		    kHIDUsage_Csmr_VolumeDecrement, kHIDUsage_Csmr_VolumeDecrement };
++		uint64_t prev = 0;
++		fire = true;
++		for (unsigned int k = 0; k < FR_EDGES && fire; k++) {
++			unsigned int i = (gFrCount - FR_EDGES + k) % FR_EDGES;     /* oldest first */
++			fire = gFrEdge[i].usage == want[k] && gFrEdge[i].down == ((k & 1) == 0) &&
++			    (k == 0 || gFrEdge[i].ns - prev < FR_WINDOW_NS);
++			prev = gFrEdge[i].ns;
++		}
++		fire = fire && ns - prev < FR_WINDOW_NS;
++	}
++	if (fire) {
++		gFrCount = 0;
++	} else {
++		unsigned int i = gFrCount++ % FR_EDGES;
++		gFrEdge[i].usage = usage;
++		gFrEdge[i].down = down;
++		gFrEdge[i].ns = ns;
++	}
++	IOSimpleLockUnlockEnableInterrupt(gFrLock, is);
++	return fire;
++}
++
+ #define PMIC_KEYS       2
+ static const uint32_t kKeyDebBit[PMIC_KEYS] = { 1u << 1, 1u << 3 };    /* TOPSTATUS */
+ static const uint32_t kKeyPress[PMIC_KEYS] = { VIVA_PMIC_PSC_PWRKEY, VIVA_PMIC_PSC_HOMEKEY };
+@@ -44,8 +110,11 @@
+ 	static void pmicInterrupt(OSObject *target, uint32_t group, uint32_t index, uint32_t status);
+ 	void update(uint32_t status);
+ 	void send(unsigned int key, bool down);
++	static void forceRestartFired(OSObject *owner, IOTimerEventSource *sender);
+ 
+ 	VivaPMIC *fPMIC;
++	IOTimerEventSource *fForceRestart;
++	uint32_t  fForceRestartMS;
+ 	UInt32    fUsage[PMIC_KEYS];
+ 	bool      fDown[PMIC_KEYS];
+ 	uint32_t  fEvents;
+@@ -92,6 +161,13 @@
+ 	if (ret != kIOReturnSuccess) {
+ 		return false;
+ 	}
++	setProperty("AppleVendorSupported", kOSBooleanTrue);     /* we send AppleVendorKeyboard WillReset */
++	fForceRestartMS = FR_RESTART_MS;
++	PE_parse_boot_argn("vivaforcerestart", &fForceRestartMS, sizeof(fForceRestartMS));
++	fForceRestart = IOTimerEventSource::timerEventSource(this, &VivaPMICKeys::forceRestartFired);
++	if (fForceRestart != NULL && getWorkLoop()->addEventSource(fForceRestart) != kIOReturnSuccess) {
++		OSSafeReleaseNULL(fForceRestart);
++	}
+ 	registerService();
+ 	return true;
+ }
+@@ -111,13 +187,46 @@
+ 	fDown[k] = down;
+ 	fEvents++;
+ 	IOLog("VIVA PMIC KEYS: key 0x%x %s\n", (unsigned)fUsage[k], down ? "down" : "up");
+-	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, fUsage[k], down);
++	uint64_t now = mach_absolute_time();
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(now, kHIDPage_Consumer, fUsage[k], down);
+ 	if (event != NULL) {
+ 		dispatchEvent(event);
+ 		event->release();
+ 	}
++	if (fUsage[k] == kHIDUsage_Csmr_Power && !down && fForceRestart != NULL) {
++		fForceRestart->cancelTimeout();
++	}
++	if (viva_keys_note_edge(fUsage[k], down, now)) {
++		IOLog("VIVA PMIC KEYS: force-restart sequence -> WillReset (restart after %u ms held)\n", fForceRestartMS);
++		for (int d = 1; d >= 0; d--) {
++			IOHIDEvent *wr = IOHIDEvent::keyboardEvent(now, kVivaHIDPage_AppleVendorKeyboard,
++			    kVivaHIDUsage_AppleVendorKeyboard_WillReset, d);
++			if (wr != NULL) {
++				dispatchEvent(wr);
++				wr->release();
++			}
++		}
++		if (fForceRestart != NULL && fForceRestartMS != 0) {
++			fForceRestart->setTimeoutMS(fForceRestartMS);
++		}
++	}
+ }
+ 
++/* Work loop: the side button is still held `vivaforcerestart` ms after the force-restart sequence. */
++void
++VivaPMICKeys::forceRestartFired(OSObject *owner, IOTimerEventSource *sender __unused)
++{
++	VivaPMICKeys *self = OSDynamicCast(VivaPMICKeys, owner);
++	if (self == NULL || !self->fDown[0]) {      /* key 0 = PWRKEY */
++		return;
++	}
++	IOLog("VIVA PMIC KEYS: force restart\n");
++	VivaPwrap *pwrap = VivaPwrap::wait();
++	if (pwrap != NULL && pwrap->haltRestartReady()) {
++		pwrap->restart();
++	}
++}
++
+ /* Work loop. State from TOPSTATUS; a press and release that both happened before we looked is a tap. */
+ void
+ VivaPMICKeys::update(uint32_t status)
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -22,9 +22,12 @@
+  *      IOMobileFramebufferLegacy swap_wait_gated (gpu/docs/ANALISI-SCANOUT-RE.md). 7 GetID,
+  *      8 GetDisplaySize -> [w, h],
+  *   12 RequestPowerChange [state]: 0 = display off (backboardd, power
+- *      button / auto-lock), else on. Off fades the panel out over a few
+- *      vsyncs (halving each pixel) and keeps it black until on again;
+- *      the panel itself stays powered (AMOLED black pixels are off).
++ *      button / auto-lock), else on. 0192 (vivapaneloff=1, default): the
++ *      panel sleeps (see "Panel power" below). vivapaneloff=0 (before
++ *      0192): off fades the picture out over a few vsyncs (halving each
++ *      pixel) and keeps it black until on again; panel, DSI and display
++ *      pipe keep running at full rate (black AMOLED pixels emit nothing,
++ *      but the panel's driver IC, the DSI link and the OVL's DRAM reads do).
+  *   18 IsMainDisplay,
+  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+  * Everything else is accepted and logged once.
+@@ -91,6 +94,24 @@
+  * selector 55 (IOMobileFramebufferSetMatrix: scalar = which matrix, 9 x int64 signed 32.32, row-major); their product goes to the
+  * display pipe's CCORR (0x1400b000, Xiaomi mtk_disp_ccorr.c: 3x3, 1.0 = 0x800 on MT6781, 13-bit signed, two per
+  * register; CFG bit 0 relay / bit 1 engine). Identity = relay (bypass).
++ *
++ * Panel power (0192, boot-arg vivapaneloff=1 default, 0 = the fade above; link "disp panel off|on"). The vendor's
++ * display-off path (Xiaomi viva-r-oss mtk_dsi.c mtk_output_dsi_disable -> dsi_k6t_38_0c_0a_dsc_vdo.c lcm_disable /
++ * lcm_unprepare) sends, still in video mode through VM_CMD (mtk_dsi_host_transfer picks VM_CMD while DSI_MODE_CTRL is
++ * video): backlight off, DCS 28 (display off), 10 ms, DCS 10 (sleep in), 110 ms; only then it stops video mode,
++ * cuts reset / bias / vio1v8 (GPIOs) and puts the DSI in ULPS. Here: 120 Hz -> 60 Hz first, DCS 51 00 00, 28, 10 ms,
++ * 10, 120 ms, all through VM_CMD in the blanking with the video stream running (exactly the vendor's step 2); rails,
++ * reset and video mode are left alone (waking from a power cut needs the whole lcm_panel_init with its PPS, from
++ * command mode). While asleep the DSI keeps streaming but its VFP is raised to vivapaneloffvfp lines (32767, about
++ * 8 frames/s instead of 60: the OVL reads the framebuffer from DRAM that much less; 0 = keep), the vsync tick becomes
++ * a slow software tick (vivapaneltick ms, 200) that still notifies CoreAnimation and retires queued swaps (no frame
++ * is shown, SwapWait never waits for a frame end that is not coming), no CPU UI boost or 120 Hz request from swaps,
++ * no brightness writes (the last level comes back on wake). On: VFP back, two frame ends, DCS 11 (sleep out),
++ * 120 ms (vendor lcm_panel_init: 11, 20 ms + the init table, 100 ms, 29), 51 with the last level, 29 (display on),
++ * the frame end calibrated again, the latest frame redrawn, the tick back to the panel. Both run on the work loop
++ * (runAction: serialized with the vsync tick and each other; a repeated request is a no-op). A failed sleep (DSI not
++ * in video mode, VM_CMD timeout before 28 went out) falls back to the fade. sweet_fb_panel_off_for_halt() puts the
++ * panel to sleep before a power-off / restart.
+  *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+@@ -102,6 +123,7 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void (*sweet_fb_panic_hook)(void);   /* pexpert/arm/pe_serial.c */
+ extern "C" void viva_cpufreq_ui_activity(void);        /* osfmk/arm64/viva_cpufreq.c: 0183 UI boost */
++extern "C" void viva_cpufreq_display_power(int on);    /* 0192: display off = no boost, Low Power Mode ceilings */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -279,6 +301,21 @@
+ 	uint32_t      fTraceLines;
+ 	bool dsiSendDcs(const uint8_t *b, uint32_t n, bool vbp, bool wait = true);
+ 	bool          fDcsInFlight;   /* a non-blocking DCS write was started (brightness) */
++	/* 0192 panel power (see the top) */
++	uint32_t      fPanelMode;     /* vivapaneloff: 1 = the panel sleeps with the display off, 0 = fade only */
++	volatile bool fPanelOff;      /* asleep (28 + 10 sent): slow tick, nothing shown */
++	uint32_t      fOffTickMs;     /* vivapaneltick: tick while asleep */
++	uint32_t      fOffVfp;        /* vivapaneloffvfp: DSI VFP while asleep, 0 = unchanged */
++	uint32_t      fVfpSaved;      /* VFP before sleeping, 0 = not changed */
++	uint32_t      fBlRestore;     /* panel level to restore on wake */
++	uint64_t      fPanelOffs, fPanelOns, fPanelFails, fPanelDrained;
++	uint64_t      fPanelOffUs, fPanelOnUs, fPanelOffAt, fPanelOffTotal;     /* last durations, time asleep */
++	const char   *fPanelWhy;      /* last failure */
++	static IOReturn powerAction(OSObject *owner, void *arg0, void *arg1, void *arg2, void *arg3);
++	IOReturn requestPower(bool off, bool force = false);
++	void panelSleep(void);
++	void panelWake(void);
++	void offTick(IOTimerEventSource *timer);
+ 	class AppleARMBacklight *fBacklight;
+ 	void backlightStart(void);
+ 	void traceProperties(const char *who, OSDictionary *dict);
+@@ -489,6 +526,15 @@
+ 	fHzIdleMs = MIN(MAX(fHzIdleMs, 100u), 60000u);
+ 	PE_parse_boot_argn("vivapanelseq", &fHzSeq, sizeof(fHzSeq));
+ 	fHzSeq = MIN(fHzSeq, 2u);
++	fPanelMode = 1;
++	PE_parse_boot_argn("vivapaneloff", &fPanelMode, sizeof(fPanelMode));
++	fPanelMode = fPanelMode != 0;
++	fOffTickMs = 200;
++	PE_parse_boot_argn("vivapaneltick", &fOffTickMs, sizeof(fOffTickMs));
++	fOffTickMs = MIN(MAX(fOffTickMs, 17u), 1000u);
++	fOffVfp = 32767;
++	PE_parse_boot_argn("vivapaneloffvfp", &fOffVfp, sizeof(fOffVfp));
++	fOffVfp = fOffVfp != 0 ? MIN(MAX(fOffVfp, 2452u), 32767u) : 0;     /* at least the 60 Hz porch */
+ 	uint32_t us = 1000;
+ 	PE_parse_boot_argn("sweetfb_lead", &us, sizeof(us));        /* tick this long before the frame end */
+ 	nanoseconds_to_absolutetime((uint64_t)MIN(MAX(us, 200u), 4000u) * 1000, &fLead);
+@@ -545,6 +591,10 @@
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
++	if (fb->fPanelOff) {
++		fb->offTick(sender);    /* 0192: the panel sleeps: slow tick, no frames */
++		return;
++	}
+ 	fb->hzPolicy();                 /* 0189: a pending refresh switch happens here, on the work loop */
+ 	fb->lightTick();                /* 0191: brightness / color matrix changes */
+ 	uint64_t count = ++fb->fVsyncCount;
+@@ -851,11 +901,13 @@
+ 	}
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+-	fLastActivity = now;            /* 0189 auto refresh */
+-	if (fHzMode == 1 && fPanelHz != 120) {
+-		fHzWant = 120;
++	if (!fPanelOff) {               /* 0192: nothing is shown while the panel sleeps: no 120 Hz, no CPU boost */
++		fLastActivity = now;    /* 0189 auto refresh */
++		if (fHzMode == 1 && fPanelHz != 120) {
++			fHzWant = 120;
++		}
++		viva_cpufreq_ui_activity();     /* 0183: frames are being drawn: CPU clusters out of the floor */
+ 	}
+-	viva_cpufreq_ui_activity();     /* 0183: frames are being drawn: CPU clusters out of the floor */
+ 	earlyKick();                    /* shown right away if the GPU has already finished it */
+ 	/* the format of every layer CoreAnimation sets (SwapSetLayer), logged when it changes */
+ 	uint32_t mask = get32(rec, 0x104);
+@@ -1226,6 +1278,22 @@
+ 		disp_wr(base, fb->fScanPitchReg, fb->fLkPitch);
+ 		disp_wr(base, fb->fScanAddrReg, fb->fLkAddr);
+ 	}
++	if (fb != NULL && fb->fPanelOff && fb->fDispMap[4] != NULL) {
++		/* 0192: the panel sleeps: wake it (busy waits, no locks) so the panic text shows */
++		static const uint8_t sleepOut[1] = { 0x11 }, dispOn[1] = { 0x29 };
++		uint32_t level = fb->fBlRestore != 0 ? fb->fBlRestore : 0x219;
++		uint8_t bl[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };
++		if (fb->fVfpSaved != 0) {
++			disp_wr(fb->fDisp[4], DSI_VFP_NL, fb->fVfpSaved);
++			fb->fVfpSaved = 0;
++			IODelay(160 * 1000);
++		}
++		fb->dsiSendDcs(sleepOut, 1, false);
++		IODelay(120 * 1000);
++		fb->dsiSendDcs(bl, 3, false);
++		fb->dsiSendDcs(dispOn, 1, false);
++		fb->fPanelOff = false;
++	}
+ }
+ 
+ bool
+@@ -1745,11 +1813,11 @@
+ {
+ 	uint32_t bl = fBlWant;
+ 	bool matrix = fMatrixDirty;
+-	if (bl == 0xffffffffu && !matrix) {
++	if ((bl == 0xffffffffu || fPanelOff) && !matrix) {
+ 		return;
+ 	}
+ 	IOLockLock(fScanLock);
+-	if (bl != 0xffffffffu) {
++	if (bl != 0xffffffffu && !fPanelOff) {  /* 0192: asleep: kept for the wake */
+ 		uint8_t cmd[3] = { 0x51, (uint8_t)(bl >> 8), (uint8_t)bl };
+ 		if (bl == fBlLevel) {
+ 			fBlWant = 0xffffffffu;
+@@ -1800,11 +1868,248 @@
+ 			uint32_t cfg = disp_rd(fCcorr, CCORR_CFG);
+ 			disp_wr(fCcorr, CCORR_CFG, identity ? ((cfg | 1u) & ~2u) : ((cfg & ~1u) | 2u));
+ 			fMatrixApplied++;
++		}
++	}
++	IOLockUnlock(fScanLock);
++}
++
++/*
++ * 0192: RequestPowerChange, the link's "disp panel off|on" and sweet_fb_panel_off_for_halt. With vivapaneloff=1 the
++ * panel sequences run on the work loop (serialized with the vsync tick and with each other: a request that comes
++ * during a transition waits for it, then finds the state it asked for or does the opposite one).
++ */
++IOReturn
++AppleCLCD::requestPower(bool off, bool force)
++{
++	viva_cpufreq_display_power(!off);       /* never blocks */
++	if ((!fPanelMode && !force && !fPanelOff) || fWorkLoop == NULL) {
++		IOLockLock(fLock);
++		if (off != fPowerOff) {
++			fPowerOff = off;
++			fFadeStep = 0;
++			fDirty = true;     /* on: redraw the latest frame */
++		}
++		IOLockUnlock(fLock);
++		return kIOReturnSuccess;
++	}
++	return fWorkLoop->runAction(&AppleCLCD::powerAction, this, off ? (void *)1 : NULL);
++}
++
++IOReturn
++AppleCLCD::powerAction(OSObject *owner, void *arg0, void *arg1 __unused, void *arg2 __unused, void *arg3 __unused)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	if (arg0 != NULL) {
++		fb->panelSleep();
++	} else {
++		fb->panelWake();
++	}
++	return kIOReturnSuccess;
++}
++
++/* 0192, work loop: display off (see "Panel power" at the top). */
++void
++AppleCLCD::panelSleep(void)
++{
++	static const uint8_t blOff[3] = { 0x51, 0x00, 0x00 }, dispOff[1] = { 0x28 }, sleepIn[1] = { 0x10 };
++	IOLockLock(fLock);
++	if (!fPowerOff) {
++		fPowerOff = true;
++		fFadeStep = 0;          /* a failed sleep fades as before 0192 */
++	}
++	IOLockUnlock(fLock);
++	if (fPanelOff) {
++		return;                 /* already asleep */
++	}
++	uint64_t t0 = mach_absolute_time();
++	const char *why = NULL;
++	IOLockLock(fScanLock);
++	dropNext();                     /* a frame chosen for the next frame end: retired unseen */
++	if (!dispMap()) {
++		why = "display registers not mappable";
++	} else if ((disp_rd(fDisp[4], DSI_MODE_CTRL) & 3) == 0) {
++		why = "DSI not in video mode";
++	} else {
++		/* 120 Hz: back to 60 first (the panel takes the mode command only awake; half the DSI / OVL frames) */
++		if (fPanelHz == 120 && !panelSetHz(60)) {
++			fHzFailures++;
++		}
++		fBlRestore = fBlLevel != 0 ? fBlLevel : 0x219;  /* 0 = never set: LK's level */
++		/* vendor lcm_disable (backlight off), then lcm_unprepare: 28, 10 ms, 10, 110 ms */
++		if (!dsiSendDcs(blOff, 3, false) || !dsiSendDcs(dispOff, 1, false)) {
++			why = "display off not sent (VM_CMD_DONE timeout)";
++		}
++	}
++	IOLockUnlock(fScanLock);
++	if (why != NULL) {
++		fPanelFails++;
++		fPanelWhy = why;
++		IOLog("SWEET FB: display off, the panel stays on (%s): fade to black\n", why);
++		return;                 /* fPowerOff with fFadeStep 0: the vsync tick fades as before 0192 */
++	}
++	IOSleep(10);
++	IOLockLock(fScanLock);
++	bool slept = dsiSendDcs(sleepIn, 1, false);
++	IOLockUnlock(fScanLock);
++	IOSleep(120);                   /* vendor 110 ms; sleep out must not come within 120 ms of sleep in either */
++	IOLockLock(fScanLock);
++	fVfpSaved = 0;
++	if (fOffVfp != 0) {
++		/* nothing to show: frames at about 8/s instead of 60 (vendor DSI_VFP_IDLE_MODE does the same for idle) */
++		fVfpSaved = disp_rd(fDisp[4], DSI_VFP_NL);
++		disp_wr(fDisp[4], DSI_VFP_NL, fOffVfp);
++	}
++	IOLockUnlock(fScanLock);
++	IOLockLock(fLock);
++	fPanelOff = true;
++	fFadeStep = 7;                  /* no fade: the panel is dark */
++	IOLockUnlock(fLock);
++	if (sweet_fb_panic_hook == NULL) {
++		sweet_fb_panic_hook = sweet_fb_panic_show;      /* a panic wakes the panel to show itself */
++	}
++	if (!slept) {
++		fPanelFails++;
++		fPanelWhy = "sleep in not sent (VM_CMD_DONE timeout): display off only";
++	}
++	fPanelOffs++;
++	fPanelOffAt = mach_absolute_time();
++	fPanelOffUs = absUsFB(fPanelOffAt - t0);
++	IOLog("SWEET FB: display off: panel asleep%s in %llu us (level %u kept, VFP %u -> %u)\n",
++	    slept ? "" : " (sleep in NOT sent)", fPanelOffUs, fBlRestore, fVfpSaved, fOffVfp);
++	fVsync->setTimeoutMS(fOffTickMs);       /* the slow tick from now on (offTick) */
++}
++
++/* 0192, work loop: display on (see "Panel power" at the top). */
++void
++AppleCLCD::panelWake(void)
++{
++	static const uint8_t sleepOut[1] = { 0x11 }, dispOn[1] = { 0x29 };
++	if (!fPanelOff) {
++		IOLockLock(fLock);
++		if (fPowerOff) {        /* the fade after a failed sleep (or none at all) */
++			fPowerOff = false;
++			fFadeStep = 0;
++			fDirty = true;  /* redraw the latest frame */
+ 		}
++		IOLockUnlock(fLock);
++		return;
+ 	}
++	uint64_t t0 = mach_absolute_time();
++	IOLockLock(fScanLock);
++	vm_offset_t d = fDisp[4];
++	if (fVfpSaved != 0) {
++		disp_wr(d, DSI_VFP_NL, fVfpSaved);
++		fVfpSaved = 0;
++		/* the frame in progress may still run the long porch: two frame ends, then the timing is the panel's */
++		if (fVblankOvl >= 0) {
++			vm_offset_t b = fDisp[fVblankOvl];
++			disp_wr(b, OVL_INTSTA, disp_rd(b, OVL_INTSTA) & ~OVL_INT_FME_CPL);
++			for (int seen = 0, ms = 0; seen < 2 && ms < 300; ms += 2) {
++				IOSleep(2);
++				if (disp_rd(b, OVL_INTSTA) & OVL_INT_FME_CPL) {
++					disp_wr(b, OVL_INTSTA, disp_rd(b, OVL_INTSTA) & ~OVL_INT_FME_CPL);
++					seen++;
++				}
++			}
++		} else {
++			IOSleep(160);   /* no frame end known: one long frame and one normal */
++		}
++	}
++	bool ok = dsiSendDcs(sleepOut, 1, false);
+ 	IOLockUnlock(fScanLock);
++	IOSleep(120);                   /* vendor lcm_panel_init: 11, 20 ms, the init table, 100 ms, then 29 */
++	uint32_t want = fBlWant, level = want != 0xffffffffu && want != 0 ? want : fBlRestore;
++	if (want != 0xffffffffu) {
++		OSCompareAndSwap(want, 0xffffffffu, &fBlWant);  /* a newer one is sent by the next tick */
++	}
++	if (level == 0) {
++		level = 0x219;
++	}
++	uint8_t bl[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };
++	IOLockLock(fScanLock);
++	ok = dsiSendDcs(bl, 3, false) && ok;
++	ok = dsiSendDcs(dispOn, 1, false) && ok;
++	fBlLevel = level;
++	fBlSent++;
++	if (fFlipReady && !vblankCalibrate(NULL, NULL)) {
++		fFlipReady = false;
++		fFlipWhy = "no frame end after the panel woke";
++	}
++	IOLockUnlock(fScanLock);
++	if (fBacklight != NULL) {
++		fBacklight->publishLevel(level);
++	}
++	if (fHzMode == 120) {
++		fHzWant = 120;          /* auto: from the next swap */
++	}
++	uint64_t now = mach_absolute_time();
++	IOLockLock(fLock);
++	fPanelOff = false;
++	fPowerOff = false;
++	fFadeStep = 0;
++	fDirty = true;                  /* the latest frame (swaps while asleep were retired, not shown) */
++	IOLockUnlock(fLock);
++	fLastActivity = now;
++	if (!ok) {
++		fPanelFails++;
++		fPanelWhy = "wake command not sent (VM_CMD_DONE timeout)";
++	}
++	fPanelOns++;
++	fPanelOffTotal += now - fPanelOffAt;
++	fPanelOnUs = absUsFB(now - t0);
++	IOLog("SWEET FB: display on: panel awake%s in %llu us (level %u)\n", ok ? "" : " (a command NOT sent)",
++	    fPanelOnUs, level);
++	rearm(fVsync);                  /* the panel's tick again */
+ }
+ 
++/* 0192, the vsync timer while the panel sleeps: notifications go on slowly, queued swaps are retired unseen. */
++void
++AppleCLCD::offTick(IOTimerEventSource *timer)
++{
++	lightTick();                    /* color matrix only (brightness waits for the wake) */
++	uint64_t count = ++fVsyncCount;
++	uint64_t now = mach_absolute_time();
++	fLastNotifyAt = now;
++	uint64_t period = fPeriod * (fFlipReady ? fTickFrames : 1);
++	if (period == 0) {
++		nanoseconds_to_absolutetime((uint64_t)fTickUs * 1000, &period);
++	}
++	uint64_t values[6] = {
++		(uint32_t)count, (uint32_t)(count >> 32),
++		(uint32_t)now, (uint32_t)(now >> 32),
++		(uint32_t)period, (uint32_t)(period >> 32),
++	};
++	IOLockLock(fLock);
++	if (fQueueCount != 0) {
++		fPanelDrained += fQueueCount;
++		fQueueCount = 0;        /* SwapWait: retired; fPending (the latest) is drawn on wake */
++		fDirty = true;
++	}
++	fRetry = false;
++	for (unsigned int i = 0; i < fClients->getCount(); i++) {
++		IOMobileFramebufferUserClient *client = (IOMobileFramebufferUserClient *)fClients->getObject(i);
++		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
++	}
++	IOLockUnlock(fLock);
++	timer->setTimeoutMS(fOffTickMs);
++}
++
++extern "C" void sweet_fb_panel_off_for_halt(void);
++
++/*
++ * 0192: for a power-off / restart path, before the power goes: the panel to sleep (display off, sleep in), as the
++ * vendor's shutdown does through lcm_unprepare. Blocks ~150 ms; thread context only (not from a panic or an
++ * interrupt). Nothing with vivapaneloff=0.
++ */
++extern "C" void
++sweet_fb_panel_off_for_halt(void)
++{
++	AppleCLCD *fb = gSweetFB;
++	if (fb != NULL && fb->fPanelMode) {
++		fb->requestPower(true);
++	}
++}
++
+ /* 0191: selector 55, a color matrix of the given type (row-major, signed 32.32 fixed point; seen on the phone). */
+ void
+ AppleCLCD::setMatrix(uint32_t type, const uint64_t bits[9])
+@@ -2193,7 +2498,7 @@
+ 	IOLockUnlock(fScanLock);
+ }
+ 
+-/* USB link "disp [regs|scanout on|off|flip on|off]". */
++/* USB link "disp [regs|scanout on|off|flip on|off|...|panel off|on]". */
+ void
+ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
+ {
+@@ -2202,6 +2507,33 @@
+ 	while (*args == ' ') {
+ 		args++;
+ 	}
++	if (strncmp(args, "panel", 5) == 0) {
++		/* 0192: "disp panel [off|on|tick MS|vfp N]", outside the display locks (the sequences take them) */
++		const char *a = args + 5;
++		while (*a == ' ') {
++			a++;
++		}
++		uint32_t v = 0;
++		const char *n = strchr(a, ' ');
++		for (n = n != NULL ? n + 1 : a; *n >= '0' && *n <= '9'; n++) {
++			v = v * 10 + (uint32_t)(*n - '0');
++		}
++		if (strncmp(a, "off", 3) == 0 || strncmp(a, "on", 2) == 0) {
++			requestPower(a[1] == 'f', true);        /* forced: also with vivapaneloff=0 */
++		} else if (strncmp(a, "tick ", 5) == 0) {
++			fOffTickMs = MIN(MAX(v, 17u), 1000u);
++		} else if (strncmp(a, "vfp ", 4) == 0) {
++			fOffVfp = v != 0 ? MIN(MAX(v, 2452u), 32767u) : 0;
++		} else if (strncmp(a, "mode ", 5) == 0) {
++			fPanelMode = v != 0;
++		}
++		disp_say(&p, end, "panel %s (display %s), vivapaneloff %u, %llu off / %llu on, %llu failures%s%s; last off %llu us, "
++		    "on %llu us; asleep %llu ms in all; tick while asleep %u ms, VFP while asleep %u; %llu swaps retired unseen\n",
++		    fPanelOff ? "asleep" : "awake", fPowerOff ? "off" : "on", fPanelMode, fPanelOffs, fPanelOns, fPanelFails,
++		    fPanelWhy ? ", last: " : "", fPanelWhy ? fPanelWhy : "", fPanelOffUs, fPanelOnUs,
++		    absUsFB(fPanelOffTotal) / 1000, fOffTickMs, fOffVfp, fPanelDrained);
++		return;
++	}
+ 	IOLockLock(fScanLock);
+ 	if (strncmp(args, "regs", 4) == 0) {
+ 		if (!dispMap()) {
+@@ -2358,6 +2690,10 @@
+ 		disp_say(&p, end, "panel_hz=%u\nhz_mode=%u\nhz_switches=%llu\nhz_failures=%llu\n", fPanelHz, fHzMode,
+ 		    fHzSwitches, fHzFailures);
+ 		disp_say(&p, end, "brightness=%u\nbrightness_max=%u\nmatrix_calls=%llu\n", fBlLevel, PANEL_LEVEL_MAX, fMatrixCalls);
++		disp_say(&p, end, "panel_power=%d\ndisplay_power=%d\npanel_off_mode=%u\npanel_off_count=%llu\npanel_on_count=%llu\n"
++		    "panel_failures=%llu\npanel_off_us=%llu\npanel_on_us=%llu\npanel_asleep_ms=%llu\npanel_swaps_retired=%llu\n",
++		    fPanelOff ? 0 : 1, fPowerOff ? 0 : 1, fPanelMode, fPanelOffs, fPanelOns, fPanelFails, fPanelOffUs, fPanelOnUs,
++		    absUsFB(fPanelOffTotal) / 1000, fPanelDrained);
+ 		{
+ 			uint32_t pb = 0, pu = 0, pk = 0;
+ 			uint64_t fp = 0, fc = 0, sp = 0;
+@@ -2423,7 +2759,7 @@
+ 		    pollNs / 1000);
+ 		disp_say(&p, end, "panel refresh (0189): %u Hz, mode %s, %llu switches, %llu failures\n", fPanelHz,
+ 		    fHzMode == 1 ? "auto" : fHzMode == 120 ? "120" : "60", fHzSwitches, fHzFailures);
+-		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off|flip on|flip off|early on|early off|lat reset|hz 60|120|auto]\n");
++		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off|flip on|flip off|early on|early off|lat reset|hz 60|120|auto|bl N|kv|panel [off|on|tick MS|vfp N|mode 0|1]]\n");
+ 	}
+ 	IOLockUnlock(fScanLock);
+ }
+@@ -2602,14 +2938,8 @@
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
+-			IOLockLock(fFB->fLock);
+-			if (off != fFB->fPowerOff) {
+-				fFB->fPowerOff = off;
+-				fFB->fFadeStep = 0;
+-				fFB->fDirty = true;     /* on: redraw the latest frame */
+-			}
+-			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++			fFB->requestPower(off);         /* 0192: the panel sleeps / wakes (blocks ~150-300 ms) */
+ 		}
+ 		break;
+ 	case 55: {      /* 0191: IOMobileFramebufferSetMatrix(type, 3x3 signed 32.32) */
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -20,6 +20,7 @@
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
+ 	void getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs) APPLE_KEXT_OVERRIDE;
+ 	void setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs) APPLE_KEXT_OVERRIDE;
++	int haltRestart(unsigned int type) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ extern "C" int viva_rtc_read(uint64_t *secs);   /* VivaPwrap.cpp: the PMIC's RTC (viva only) */
+@@ -39,6 +40,37 @@
+ {
+ }
+ 
++extern "C" int viva_halt_restart(unsigned int type);  /* VivaPwrap.cpp: power off / TOPRGU reset (viva only) */
++extern "C" unsigned panic_active(void);                /* kern/debug.c */
++extern "C" void sweet_fb_panel_off_for_halt(void);     /* SweetFramebuffer.cpp: no-op with vivapaneloff=0 */
++
++/*
++ * Nothing sets PE_halt_restart here, so IOPlatformExpert::haltRestart returns -1 for a halt or restart:
++ * halt_all_cpus spins and PEHaltRestart's 30 s timer panics ("Halt/Restart Timed Out"). On viva, Shut Down
++ * (kPEHaltCPU, kPEUPSDelayHaltCPU) powers the PMIC off and a restart (kPERestartCPU) resets through the
++ * TOPRGU watchdog; viva_halt_restart() does not return there. Sweet, vivapoweroff=0 and every panic type
++ * keep the base behaviour. A panic ends in halt_all_cpus(TRUE) = kPERestartCPU as well (after
++ * kPEPanicRestartCPU): that one must keep spinning on the panic screen, hence `panicking`.
++ */
++int
++SweetPlatformExpert::haltRestart(unsigned int type)
++{
++	static bool panicking;
++
++	if (type != kPEHaltCPU && type != kPERestartCPU && type != kPEUPSDelayHaltCPU) {
++		panicking = panicking || type != kPEPagingOff;
++	} else if (!panicking && !panic_active()) {
++		/*
++		 * Panel to sleep (display off, sleep in) before the rails go: thread context, ~150 ms on the
++		 * framebuffer's work loop. The PM shutdown notifications (systemWillShutdown,
++		 * kIOMessageSystemWillPowerOff) already ran.
++		 */
++		sweet_fb_panel_off_for_halt();
++		viva_halt_restart(type);
++	}
++	return IODTPlatformExpert::haltRestart(type);
++}
++
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
+ bool
+diff --git a/iokit/Kernel/arm/VivaBattery.cpp b/iokit/Kernel/arm/VivaBattery.cpp
+--- a/iokit/Kernel/arm/VivaBattery.cpp
++++ b/iokit/Kernel/arm/VivaBattery.cpp
+@@ -182,6 +182,7 @@
+ extern "C" int viva_usb_host_configured(void);           /* bsd/dev/viva_usb.c */
+ extern "C" void viva_gpu_set_dvfs_cap(uint32_t mhz);      /* VivaGPU.cpp: 0 = no cap */
+ extern "C" void viva_cpufreq_set_lowpower(int on);        /* osfmk/arm64/viva_cpufreq.c: CPU ceilings */
++extern "C" void viva_cpufreq_set_skin(int deciC);         /* osfmk/arm64/viva_cpufreq.c: 0192 skin ceiling */
+ extern "C" void sweet_fb_set_duty_cap(uint32_t pct);      /* SweetFramebuffer.cpp: 0 = no cap */
+ 
+ static uint32_t
+@@ -604,6 +605,9 @@
+ 	VivaBatterySample s;
+ 	fPolls++;
+ 	readSample(&s);
++	if (s.fgOK) {
++		viva_cpufreq_set_skin(s.tempDeciC);     /* 0192: the battery is the closest thing to a skin sensor */
++	}
+ 	maintainCharger(&s);
+ 	publish(&s);
+ 	fLast = s;
+diff --git a/iokit/Kernel/arm/VivaPMIC.h b/iokit/Kernel/arm/VivaPMIC.h
+--- a/iokit/Kernel/arm/VivaPMIC.h
++++ b/iokit/Kernel/arm/VivaPMIC.h
+@@ -40,9 +40,22 @@
+ 	IOReturn writeRegulator(uint32_t addr, uint32_t mask, uint32_t value);
+ 	/* The started instance, waiting for it if needed (NULL after timeout). */
+ 	static VivaPwrap *wait(void);
++	/*
++	 * Shut Down / restart (SweetPlatformExpert::haltRestart via viva_halt_restart): RTC + PMIC power-off
++	 * sequence, then TOPRGU software reset as fallback. Never return. Holds the pwrap for good.
++	 */
++	void powerOff(void) __dead2;
++	void restart(void) __dead2;
++	bool haltRestartReady(void) const { return fRGU != 0; }
+ 
+ private:
+ 	bool waitFSM(uint32_t fsm);
++	/* Halt path: the caller owns the pwrap (holdForHalt). */
++	bool holdForHalt(void);
++	IOReturn readNoLock(uint32_t addr, uint32_t *value);
++	IOReturn writePowerOff(uint32_t addr, uint32_t mask, uint32_t value);
++	bool rtcWriteTrigger(void);
++	void toprguReset(void) __dead2;
+ 	inline uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(fRegs + off); }
+ 	inline void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(fRegs + off) = v; }
+ 
+@@ -50,6 +63,8 @@
+ 	vm_offset_t  fRegs;
+ 	IOLock      *fLock;
+ 	uint32_t     fTimeouts;
++	IOMemoryMap *fRGUMap;   /* TOPRGU, mapped at start: the halt path does not allocate */
++	vm_offset_t  fRGU;
+ };
+ 
+ /* PMIC interrupt groups (MT6358 "sp_top"), in TOP_INT_STATUS0 bit order. */
+diff --git a/iokit/Kernel/arm/VivaPwrap.cpp b/iokit/Kernel/arm/VivaPwrap.cpp
+--- a/iokit/Kernel/arm/VivaPwrap.cpp
++++ b/iokit/Kernel/arm/VivaPwrap.cpp
+@@ -12,8 +12,9 @@
+  * live in the same PMIC, so writePMIC() only accepts the interrupt enable
+  * SET/CLR and status registers of the PMIC interrupt groups (writeAllowed(),
+  * table in VivaPMIC.h), and writeRegulator() only the GPU rails' enable
+- * and VOSEL fields under a voltage ceiling (VivaGPU.cpp); everything else
+- * is refused and logged.
++ * and VOSEL fields under a voltage ceiling (VivaGPU.cpp); the power-off
++ * sequence (powerOff(), Shut Down) has its own six registers
++ * (gVivaPowerOffRegs, writePowerOff); everything else is refused and logged.
+  *
+  * The PMIC is a device-tree child (/arm-io/pwrap/pmic): published as a
+  * VivaDTNub, matched by VivaPMIC. C entry point viva_pwrap_read() for the
+@@ -27,6 +28,8 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IODeviceTreeSupport.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <machine/machine_routines.h>
+ 
+ #include "VivaPMIC.h"
+ 
+@@ -51,6 +54,37 @@
+ #define MT6358_PSC_TOP_INT_STATUS0 0x91c
+ #define MT6358_PSC_TOP_INT_RAW_STATUS0 0x91e
+ 
++/*
++ * Power off, as Xiaomi's kernel does it for this phone: mt_power_off() in drivers/mfd/mt6358-misc.c
++ * (viva-r-oss), the same sequence as TF-A's plat_mtk_system_off for the MT6358 (mt8183 rtc.c / pmic.c).
++ * RTC registers: base 0x580 (DT "base"), rtc-mt6358.c offsets; every RTC write is latched by WRTGR = 1,
++ * done when BBPU.CBUSY reads 0. BBPU writes carry the key 0x43 in [15:8].
++ */
++#define MT6358_RTC_BBPU         0x588
++#define RTC_BBPU_KEY            0x4300
++#define RTC_BBPU_PWREN          (1u << 0)       /* alarm power-on enable (kept, as the vendor does) */
++#define RTC_BBPU_CLR            (1u << 1)       /* clear alarm/spare state; reads 1 until the RTC is done */
++#define RTC_BBPU_RELOAD         (1u << 5)
++#define RTC_BBPU_CBUSY          (1u << 6)       /* write trigger in progress (read only) */
++#define MT6358_RTC_AL_MASK      0x590
++#define RTC_AL_MASK_DOW         (1u << 4)       /* power-on alarm ignores the day of week */
++#define MT6358_RTC_PROT         0x5bc           /* write interface lock, LK leaves it unlocked (read, logged) */
++#define MT6358_RTC_WRTGR        0x5c2
++#define MT6358_TOP_TMA_KEY      0x3a8           /* 0x9ca7 unlocks the PSEQ test registers, 0 locks */
++#define MT6358_PSEQ_ELR11       0xa62
++#define RG_SDN_DLY_ENB          (1u << 10)      /* 0 = shutdown delay on (wk_pmic_enable_sdn_delay) */
++#define MT6358_PPCCTL0          0xa08
++#define RG_PWRHOLD              (1u << 0)       /* the AP holds the PMIC on; 0 = power off (no charger) */
++
++/* TOPRGU watchdog (as bsd/dev/viva_usb.c "reboot"; mtk_wdt_v2.c wdt_arch_reset, viva-r-oss) */
++#define TOPRGU_PA               0x10007000u
++#define WDT_MODE                0x00
++#define WDT_MODE_IRQ            (1u << 3)       /* a timeout / SWRST only raises an interrupt */
++#define WDT_MODE_DUAL_MODE      (1u << 6)       /* first timeout = interrupt */
++#define WDT_MODE_KEY            0x22000000u
++#define WDT_SWRST               0x14
++#define WDT_SWRST_KEY           0x1209
++
+ OSDefineMetaClassAndStructors(VivaPwrap, IOService);
+ 
+ extern "C" void viva_wifi_reserve(void);
+@@ -99,6 +133,20 @@
+ 	    top, topint, con, mask, sta, raw, ret);
+ 
+ 	viva_wifi_reserve();
++	{
++		/* Shut Down / restart (powerOff, restart): vivapoweroff=0 keeps the old behaviour (no haltRestart:
++		 * CPU spins, "Halt/Restart Timed Out" panic after 30 s). TOPRGU mapped now, not on the halt path. */
++		uint32_t on = 1;
++		PE_parse_boot_argn("vivapoweroff", &on, sizeof(on));
++		if (on != 0) {
++			IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(TOPRGU_PA, 0x1000, kIODirectionInOut);
++			fRGUMap = md != NULL ? md->map(kIOMapInhibitCache) : NULL;
++			OSSafeReleaseNULL(md);
++			fRGU = fRGUMap != NULL ? (vm_offset_t)fRGUMap->getVirtualAddress() : 0;
++		}
++		IOLog("VIVA PWRAP: Shut Down = RTC/PMIC power off, restart = TOPRGU reset: %s\n",
++		    on == 0 ? "off (vivapoweroff=0)" : fRGU != 0 ? "on" : "off (cannot map TOPRGU)");
++	}
+ 	gVivaPwrap = this;
+ 	viva_cpufreq_start();
+ 	registerService();
+@@ -140,20 +188,28 @@
+ 	if (cmd & 0x80000000u) {
+ 		return kIOReturnNotPermitted;
+ 	}
+-	IOReturn ret = kIOReturnTimeout;
+ 	IOLockLock(fLock);
++	IOReturn ret = readNoLock(addr, value);
++	IOLockUnlock(fLock);
++	return ret;
++}
++
++/* fLock held (or the halt path owns the pwrap). */
++IOReturn
++VivaPwrap::readNoLock(uint32_t addr, uint32_t *value)
++{
++	IOReturn ret = kIOReturnTimeout;
+ 	if (WACS_FSM(rd32(PWRAP_WACS2_RDATA)) == WACS_FSM_WFVLDCLR) {
+ 		wr32(PWRAP_WACS2_VLDCLR, 1);    /* a previous read left it waiting */
+ 	}
+ 	if (waitFSM(WACS_FSM_IDLE)) {
+-		wr32(PWRAP_WACS2_CMD, cmd);
++		wr32(PWRAP_WACS2_CMD, (addr >> 1) << 16);
+ 		if (waitFSM(WACS_FSM_WFVLDCLR)) {
+ 			*value = rd32(PWRAP_WACS2_RDATA) & 0xffff;
+ 			wr32(PWRAP_WACS2_VLDCLR, 1);
+ 			ret = kIOReturnSuccess;
+ 		}
+ 	}
+-	IOLockUnlock(fLock);
+ 	return ret;
+ }
+ 
+@@ -372,4 +428,193 @@
+ 	*secs = days_from_civil(year, v[4], v[3]) * 86400 + v[2] * 3600 + v[1] * 60 + v[0];
+ 	return 0;
+ }
++
++/*
++ * Shut Down and restart (SweetPlatformExpert::haltRestart -> viva_halt_restart). Reached from reboot(2) ->
++ * host_reboot -> halt_all_cpus -> PEHaltRestart after the PM shutdown notifications: a thread, interrupts on,
++ * the other CPUs still running (CPU DVFS, the USB link may be mid-transaction on the pwrap). The halt path
++ * takes the pwrap lock and never gives it back: nobody else talks to the PMIC any more, and no WACS2
++ * transaction is in flight when the watchdog resets the SoC (Xiaomi's wdt_arch_reset disables the pwrap
++ * before its SWRST for the same reason).
++ *
++ * Writes of the power-off sequence only (writePowerOff): `whole` = the value is written as is (RTC
++ * registers latched by WRTGR, keys), else read-modify-write of the bits in the mask.
++ */
++static const struct {
++	uint16_t addr, mask;
++	bool     whole;
++} gVivaPowerOffRegs[] = {
++	{ MT6358_RTC_BBPU, 0x433f, true },              /* key 0x43, RELOAD, CLRPKY/AUTO/INIT, CLR, PWREN */
++	{ MT6358_RTC_AL_MASK, RTC_AL_MASK_DOW, true },  /* only "mask DOW" */
++	{ MT6358_RTC_WRTGR, 0x0001, true },             /* write trigger */
++	{ MT6358_TOP_TMA_KEY, 0xffff, true },           /* 0x9ca7 / 0 only (checked below) */
++	{ MT6358_PSEQ_ELR11, RG_SDN_DLY_ENB, false },
++	{ MT6358_PPCCTL0, RG_PWRHOLD, false },          /* not RG_CRST/RG_WRST next to it */
++};
++
++static bool gVivaHalting;
++
++bool
++VivaPwrap::holdForHalt(void)
++{
++	gVivaHalting = true;
++	if (ml_get_interrupts_enabled() && !ml_at_interrupt_context()) {
++		IOLockLock(fLock);              /* the normal case: CPU DVFS / the link let go within microseconds */
++		return true;
++	}
++	for (int i = 0; i < 20000; i++) {       /* not expected (interrupts off): poll ~20 ms, then go on anyway */
++		if (IOLockTryLock(fLock)) {
++			return true;
++		}
++		IODelay(1);
++	}
++	return false;
++}
++
++IOReturn
++VivaPwrap::writePowerOff(uint32_t addr, uint32_t mask, uint32_t value)
++{
++	unsigned int i;
++	for (i = 0; i < sizeof(gVivaPowerOffRegs) / sizeof(gVivaPowerOffRegs[0]); i++) {
++		if (gVivaPowerOffRegs[i].addr == addr) {
++			break;
++		}
++	}
++	if (!gVivaHalting || i == sizeof(gVivaPowerOffRegs) / sizeof(gVivaPowerOffRegs[0]) || mask == 0 ||
++	    (mask & ~gVivaPowerOffRegs[i].mask) || (value & ~mask) ||
++	    (addr == MT6358_TOP_TMA_KEY && value != 0 && value != 0x9ca7)) {
++		IOLog("VIVA PWRAP: refused power-off write 0x%04x mask 0x%x <- 0x%x\n", addr, mask, value);
++		return kIOReturnNotPermitted;
++	}
++	uint32_t v = value;
++	if (!gVivaPowerOffRegs[i].whole) {
++		uint32_t old = 0;
++		IOReturn ret = readNoLock(addr, &old);
++		if (ret != kIOReturnSuccess) {
++			return ret;
++		}
++		v = (old & ~mask) | value;
++	}
++	if (WACS_FSM(rd32(PWRAP_WACS2_RDATA)) == WACS_FSM_WFVLDCLR) {
++		wr32(PWRAP_WACS2_VLDCLR, 1);
++	}
++	if (!waitFSM(WACS_FSM_IDLE)) {
++		return kIOReturnTimeout;
++	}
++	wr32(PWRAP_WACS2_CMD, 0x80000000u | ((addr >> 1) << 16) | (v & 0xffff));
++	return waitFSM(WACS_FSM_IDLE) ? kIOReturnSuccess : kIOReturnTimeout;
++}
++
++/* rtc_write_trigger: WRTGR = 1, then BBPU.CBUSY until the RTC has taken the writes (vendor: 500 ms max). */
++bool
++VivaPwrap::rtcWriteTrigger(void)
++{
++	if (writePowerOff(MT6358_RTC_WRTGR, 1, 1) != kIOReturnSuccess) {
++		return false;
++	}
++	for (int i = 0; i < 50000; i++) {
++		uint32_t bbpu = 0;
++		if (readNoLock(MT6358_RTC_BBPU, &bbpu) == kIOReturnSuccess && !(bbpu & RTC_BBPU_CBUSY)) {
++			return true;
++		}
++		IODelay(10);
++	}
++	return false;
++}
++
++/*
++ * TOPRGU software reset, as the link's "reboot" (measured to come back through preloader/LK). WDT_MODE as
++ * wdt_arch_reset: never interrupt-only / dual mode, or SWRST would only raise an IRQ (logged, the link
++ * never saw it set). EXTEN (also reset the PMIC) is left as LK set it, like the link command.
++ */
++void
++VivaPwrap::toprguReset(void)
++{
++	uint32_t mode = *(volatile uint32_t *)(fRGU + WDT_MODE);
++	IOLog("VIVA PWRAP: TOPRGU software reset (WDT_MODE 0x%08x)\n", mode);
++	if (mode & (WDT_MODE_IRQ | WDT_MODE_DUAL_MODE)) {
++		*(volatile uint32_t *)(fRGU + WDT_MODE) = (mode & 0xffffff & ~(WDT_MODE_IRQ | WDT_MODE_DUAL_MODE)) |
++		    WDT_MODE_KEY;
++		IODelay(100);
++	}
++	for (;;) {
++		*(volatile uint32_t *)(fRGU + WDT_SWRST) = WDT_SWRST_KEY;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		IODelay(5000);
++	}
++}
++
++void
++VivaPwrap::restart(void)
++{
++	bool held = holdForHalt();
++	IOLog("VIVA PWRAP: restart (pwrap %s)\n", held ? "held" : "busy");
++	toprguReset();
++}
++
++/*
++ * mt_power_off (mt6358-misc.c, viva-r-oss): the RTC "lpsd" step (alarm/spare state cleared, power-on alarm
++ * kept, DOW masked), the shutdown delay workaround, then PWRHOLD = 0: the PMIC drops every rail. With a
++ * charger in, the PMIC powers straight back up (LK: charging screen); if this CPU still runs after 1 s
++ * (vendor: 10 x 100 ms, then arch_reset), the watchdog resets it. Not done (vendor extras): disabling the
++ * RTC 32 kHz export (RTC_CON.F32KOB) and the EOSC calibration of the shutdown callback.
++ */
++void
++VivaPwrap::powerOff(void)
++{
++	bool held = holdForHalt();
++	uint32_t bbpu = 0, prot = 0, almask = 0;
++	readNoLock(MT6358_RTC_BBPU, &bbpu);
++	readNoLock(MT6358_RTC_PROT, &prot);
++	readNoLock(MT6358_RTC_AL_MASK, &almask);
++	IOLog("VIVA PWRAP: power off (pwrap %s): RTC_BBPU 0x%04x PROT 0x%04x AL_MASK 0x%04x\n",
++	    held ? "held" : "busy", bbpu, prot, almask);
++
++	IOReturn r1 = writePowerOff(MT6358_RTC_BBPU, 0x433f, RTC_BBPU_KEY | RTC_BBPU_CLR | RTC_BBPU_PWREN);
++	IOReturn r2 = writePowerOff(MT6358_RTC_AL_MASK, RTC_AL_MASK_DOW, RTC_AL_MASK_DOW);
++	bool t1 = rtcWriteTrigger();
++	int clr;
++	for (clr = 0; clr < 50000; clr++) {             /* mtk_rtc_spar_alarm_clear_wait: CLR self-clears */
++		if (readNoLock(MT6358_RTC_BBPU, &bbpu) == kIOReturnSuccess && !(bbpu & RTC_BBPU_CLR)) {
++			break;
++		}
++		IODelay(10);
++	}
++	IOReturn r3 = writePowerOff(MT6358_RTC_BBPU, 0x433f, (bbpu & 0x3f) | RTC_BBPU_KEY | RTC_BBPU_RELOAD);
++	bool t2 = rtcWriteTrigger();
++
++	IOReturn r4 = writePowerOff(MT6358_TOP_TMA_KEY, 0xffff, 0x9ca7);
++	IOReturn r5 = writePowerOff(MT6358_PSEQ_ELR11, RG_SDN_DLY_ENB, 0);
++	writePowerOff(MT6358_TOP_TMA_KEY, 0xffff, 0);
++
++	readNoLock(MT6358_RTC_BBPU, &bbpu);
++	readNoLock(MT6358_RTC_AL_MASK, &almask);
++	IOLog("VIVA PWRAP: RTC lpsd %d/%d/%d trigger %d/%d clr %d us, BBPU 0x%04x AL_MASK 0x%04x, sdn delay %d/%d; "
++	    "PWRHOLD = 0\n", r1, r2, r3, t1, t2, clr * 10, bbpu, almask, r4, r5);
++	/* hook: panel/backlight off goes before this point (display driver, see SweetPlatformExpert::haltRestart) */
++	writePowerOff(MT6358_PPCCTL0, RG_PWRHOLD, 0);
++
++	for (int i = 0; i < 100; i++) {
++		IODelay(10000);
++	}
++	IOLog("VIVA PWRAP: still on 1 s after PWRHOLD = 0 (charger?), watchdog reset\n");
++	toprguReset();
++}
++
++/* SweetPlatformExpert::haltRestart: kPEHaltCPU / kPEUPSDelayHaltCPU / kPERestartCPU outside a panic. -1 = not
++ * viva (sweet), the pwrap never started, or vivapoweroff=0: the caller keeps IOPlatformExpert's behaviour. */
++extern "C" int
++viva_halt_restart(unsigned int type)
++{
++	if (gVivaPwrap == NULL || !gVivaPwrap->haltRestartReady()) {
++		return -1;
++	}
++	if (type == kPEHaltCPU || type == kPEUPSDelayHaltCPU) {
++		gVivaPwrap->powerOff();
++	}
++	if (type == kPERestartCPU) {
++		gVivaPwrap->restart();
++	}
++	return -1;
++}
+ #endif /* SWEET */
+diff --git a/iokit/Kernel/arm/VivaWiFi.cpp b/iokit/Kernel/arm/VivaWiFi.cpp
+--- a/iokit/Kernel/arm/VivaWiFi.cpp
++++ b/iokit/Kernel/arm/VivaWiFi.cpp
+@@ -14,6 +14,8 @@
+ #if defined(SWEET)
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <IOKit/IOPlatformExpert.h>
+ #include <pexpert/pexpert.h>
+ 
+ static IOBufferMemoryDescriptor *gVivaWiFiEMI;
+@@ -60,7 +62,7 @@
+ }
+ 
+ #define VIVA_WIFI_EMI_SIZE      0x500000        /* EMI_SIZE and DMA_SIZE in bsd/dev/viva_wifi.c */
+-#define VIVA_WIFI_DMA_SIZE      0x48000
++#define VIVA_WIFI_DMA_SIZE      0x148000        /* DMA_SIZE_BIG: RX ring 0 of up to 256 x 4 KiB (0192) */
+ 
+ extern "C" void
+ viva_wifi_reserve(void)
+@@ -106,4 +108,80 @@
+ 		gVivaWiFiEMI->performOperation(kIOMemoryIncoherentIOFlush, offset, len);
+ 	}
+ }
++
++/*
++ * The WFDMA interrupt (0192): GIC SPI 0x11d, level high (Linux DT wifi@18000000; gen4m axi.c glBusSetIrq). The ADT
++ * wlan node has no interrupts property, so its nub gets the IOKit pair here: IOInterruptControllers = the GIC's
++ * name (SweetGIC registered it from its nub's phandle), IOInterruptSpecifiers = <INTID flags> as SweetGIC reads them.
++ * The handler is viva_wifi_intr() (interrupt context): false = not ours, the line is disabled.
++ */
++extern "C" bool viva_wifi_intr(void);
++
++static IOService *gVivaWiFiIrqNub;
++
++static void
++vivaWiFiInterrupt(OSObject *target __unused, void *refCon __unused, IOService *nub, int source)
++{
++	if (!viva_wifi_intr()) {
++		nub->disableInterrupt(source);
++	}
++}
++
++extern "C" int
++viva_wifi_irq_attach(uint32_t intid)
++{
++	if (gVivaWiFiIrqNub != NULL) {
++		return 0;
++	}
++	IORegistryEntry *e = IORegistryEntry::fromPath("/arm-io/wlan", gIODTPlane);
++	IOService *nub = OSDynamicCast(IOService, e);
++	if (nub == NULL) {
++		OSSafeReleaseNULL(e);
++		return 2;               /* ENOENT */
++	}
++	OSDictionary *match = IOService::serviceMatching("SweetGIC");
++	IOService *gic = match != NULL ? IOService::copyMatchingService(match) : NULL;
++	OSSafeReleaseNULL(match);
++	const OSSymbol *name = (gic != NULL && gic->getProvider() != NULL) ? IODTInterruptControllerName(gic->getProvider()) : NULL;
++	OSSafeReleaseNULL(gic);
++	if (name == NULL) {
++		nub->release();
++		return 19;              /* ENODEV */
++	}
++	if (nub->getProperty(gIOInterruptControllersKey) == NULL) {
++		uint32_t cells[2] = { intid, 4 };       /* IRQ_TYPE_LEVEL_HIGH */
++		OSData *spec = OSData::withBytes(cells, sizeof(cells));
++		OSArray *ctls = OSArray::withObjects((const OSObject **)&name, 1);
++		OSArray *specs = spec != NULL ? OSArray::withObjects((const OSObject **)&spec, 1) : NULL;
++		if (ctls != NULL && specs != NULL) {
++			nub->setProperty(gIOInterruptControllersKey, ctls);
++			nub->setProperty(gIOInterruptSpecifiersKey, specs);
++		}
++		OSSafeReleaseNULL(spec);
++		OSSafeReleaseNULL(ctls);
++		OSSafeReleaseNULL(specs);
++	}
++	name->release();
++	IOReturn ret = nub->registerInterrupt(0, nub, vivaWiFiInterrupt, NULL);
++	if (ret != kIOReturnSuccess) {
++		IOLog("VIVA WIFI: interrupt INTID %u not registered (0x%x)\n", intid, (unsigned)ret);
++		nub->release();
++		return 5;               /* EIO */
++	}
++	IOLog("VIVA WIFI: WFDMA interrupt INTID %u on %s\n", intid, nub->getName());
++	gVivaWiFiIrqNub = nub;          /* the reference is kept */
++	return 0;
++}
++
++extern "C" void
++viva_wifi_irq_enable(bool on)
++{
++	if (gVivaWiFiIrqNub != NULL) {
++		if (on) {
++			gVivaWiFiIrqNub->enableInterrupt(0);
++		} else {
++			gVivaWiFiIrqNub->disableInterrupt(0);
++		}
++	}
++}
+ #endif /* SWEET */
+diff --git a/osfmk/arm64/viva_cpufreq.c b/osfmk/arm64/viva_cpufreq.c
+--- a/osfmk/arm64/viva_cpufreq.c
++++ b/osfmk/arm64/viva_cpufreq.c
+@@ -48,7 +48,37 @@
+  *   (LL 1618, big 1670). The controller's hardware reset protection (TOPRGU thermal mode) is NOT armed.
+  *   vivatherm=0 = no LVTS (cap at opp 6).
+  * USB link: cpu [status] | cpu gov on|off | cpu set ll|big|cci MHz (governor off first) | cpu max ll|big|cci MHz |
+- *   cpu fast on|off | cpu boost on|off | cpu reset (counters).
++ *   cpu fast on|off|boost | cpu boost on|off | cpu park on|off | cpu display on|off | cpu tune [key value] |
++ *   cpu reset (counters).
++ *
++ * 0192 (phone hot): idle / light-load power. Every knob is a boot-arg and a "cpu tune" key (shown by "cpu tune").
++ * - Floor: the slowest OPP of every domain is used (LL 500 MHz, big 774, CCI 500: Vproc12 600 mV instead of 675;
++ *   the vendor's own efuse table). vivacpufloor=14 = the 0145 floor.
++ * - Governor: outside a boost the slowest OPP <= vivacputarget (650 per mille, 500 in 0183) busy; the jump to the
++ *   ceiling needs vivacpuup (2) samples >= 80 % in a row (1 = 0145). Samples every vivacpupoll ms (16), at the floor
++ *   every vivacpuidlepoll ms (100, twice that with the display off), with timer leeway so the wakeups coalesce.
++ * - CCI: at most vivacpuccilag (2) OPPs below big (was: the faster cluster's OPP). Vproc12 is max(LL, CCI): a busy
++ *   A76 with CCI at 1400 MHz held the six A55s at 1031 mV.
++ * - UI boost by source. Touch (viva_cpufreq_ui_touch, VivaGT9896.cpp): vivacpuboost for vivacpuboostms, except a
++ *   contact that has been down longer than vivacpuboosthold (1000 ms) while nothing was drawn for 500 ms (a resting
++ *   finger, charger noise). Frames (viva_cpufreq_ui_activity, SwapEnd): a lighter level, vivacpuboostswap (1670:
++ *   LL 1666, big 1670) and only within vivacpuboostwin (1500 ms) of the last touch or of the first frame after
++ *   vivacpuboostgap (2000 ms) without frames: a steady animation (cursor blink, spinner, 120 Hz) no longer pins both
++ *   clusters at the fastest OPP. vivacpuboostwin=0 = every frame boosts (0183).
++ * - A76 preference (sched_viva_fast_cpus): vivacpufast=2 (default) only while boosted; 1 = always (0145); 0 = never.
++ *   Outside a boost the scheduler's lowest-idle-CPU choice keeps housekeeping (and kernel threads) on the A55s.
++ * - Display off (viva_cpufreq_display_power, to be called by SweetFramebuffer on backlight 0 / panel off): boost
++ *   signals are ignored and, with vivacpuoffcap=1 (default), the Low Power Mode ceilings apply.
++ * - Thermal: vivathermtrip default 75 C (was 85: a die at 85 C makes the back of the phone uncomfortable); skin proxy
++ *   = battery temperature from the fuel gauge (viva_cpufreq_set_skin, VivaBattery.cpp, every 15 s): >= vivaskintrip
++ *   (42 C; 0 = off) the LL/big ceiling goes to opp 3, one more OPP per update while hot, down to vivaskinmax (10:
++ *   LL 1175, big 1169); below trip - 2 C one OPP back per update.
++ * - vivacpupark=1 (default 0, experimental): with the big cluster idle for 1 s outside a boost, the A76s are taken out
++ *   of the scheduler's recommended cores (sched_perfcontrol_update_recommended_cores_reason, REASON_CLPC_SYSTEM) and
++ *   only wake for bound threads / their own timers; back on a boost or with 3+ A55s >= 80 % busy. They stay powered
++ *   (WFI): CPU_OFF / CPU_SUSPEND power-down needs a CPU offline/resume path this port does not have.
++ * - "cpu" prints time in each OPP (seconds + %), boost / display-off / parked time, per-CPU busy since the last
++ *   "cpu reset", signals per source.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <stdint.h>
+@@ -85,7 +115,7 @@
+ };
+ static const struct viva_opp kOppCCI[NOPP] = {
+ 	{ 1400, 85, 2 }, { 1330, 79, 2 }, { 1260, 72, 2 }, { 1190, 65, 2 }, { 1155, 62, 2 }, { 1120, 58, 2 },
+-	{ 1050, 55, 2 }, { 980, 51, 2 }, { 927, 48, 2 }, { 875, 45, 2 }, { 822, 43, 2 }, { 752, 39, 4 },
++	{ 1050, 55, 2 }, { 980, 51, 2 }, { 927, 48, 2 }, { 875, 45, 2 }, { 822, 43, 2 }, { 752, 39, 2 },
+ 	{ 682, 35, 4 }, { 612, 31, 4 }, { 560, 28, 4 }, { 500, 16, 4 },
+ };
+ 
+@@ -101,7 +131,6 @@
+ #define VPROC12_DBG0    0x141e
+ #define VSRAM11_TRACK0  0x1b64
+ #define VSRAM12_TRACK0  0x1b6c
+-#define FLOOR_IDX       14      /* LL 774, big 835, CCI 560: the lowest OPPs are not used */
+ #define LL_FIRST        0
+ #define LL_LAST         5
+ #define BIG_FIRST       6
+@@ -113,8 +142,16 @@
+ static int gMode = 1;           /* vivacpufreq */
+ static bool gReady;             /* init passed its checks */
+ static bool gGov;               /* governor running */
+-static bool gFast = true;       /* vivacpufast */
++static int gFastMode = 2;       /* vivacpufast: 0 never, 1 always, 2 only while boosted (0192) */
+ static bool gLowPower;
++/* 0192 policy knobs (boot-args and "cpu tune", see the top) */
++static int gFloor = NOPP - 1;   /* vivacpufloor: slowest OPP index used */
++static int gTarget = 650;       /* vivacputarget: per mille busy aimed at outside the ceiling jump */
++static int gUpSamples = 2;      /* vivacpuup: samples >= 80 % busy before the jump to the ceiling */
++static int gCciLag = 2;         /* vivacpuccilag: CCI at most this many OPPs below big */
++static int gPollMs = 16, gIdlePollMs = 100;
++static int gUp[NDOM];
++static unsigned gHot[NDOM];     /* CPUs >= 80 % busy in the last window */
+ static int gIdx[NDOM];          /* current OPP index */
+ static int gBootIdx[NDOM];
+ static int gMaxIdx[NDOM];       /* boot-arg / link ceiling (index: smaller = faster) */
+@@ -128,16 +165,44 @@
+ static uint64_t gLastAt;
+ static const char *gWhy = "not started";
+ static thread_call_t gCall;
+-/* 0183 UI boost */
++/* 0183 UI boost, 0192 per source */
+ static bool gBoost = true;              /* vivacpuboostms != 0, "cpu boost on|off" */
+-static int gBoostIdx[NDOM];             /* vivacpuboost: LL and big at least this fast while boosted */
+-static uint64_t gBoostAbs;              /* vivacpuboostms in mach time */
+-static volatile uint64_t gBoostUntil;   /* written without the lock by viva_cpufreq_ui_activity */
++static int gBoostMs = 250;              /* vivacpuboostms */
++static int gBoostMhz = 0;               /* vivacpuboost: touch level (0 = fastest OPP) */
++static int gBoostSwapMhz = 1670;        /* vivacpuboostswap: frame level (0 = as touch) */
++static int gBoostWinMs = 1500;          /* vivacpuboostwin: frames boost this long after a touch / burst start */
++static int gBoostGapMs = 2000;          /* vivacpuboostgap: quiet display before frames start a burst */
++static int gBoostHoldMs = 1000;         /* vivacpuboosthold: a still contact stops boosting after this */
++static int gBoostIdx[NDOM];             /* touch: LL and big at least this fast while boosted */
++static int gBoostSwapIdx[NDOM];         /* frames */
++static uint64_t gBoostAbs, gBoostWinAbs, gBoostGapAbs, gBoostHoldAbs;   /* the ms above in mach time */
++static volatile uint64_t gBoostUntil;   /* touch boost end; written without the lock by the signal hooks */
++static volatile uint64_t gSwapUntil;    /* frame boost end */
++static volatile uint64_t gTouchAt, gTouchDownAt, gLastSwapAt, gBurstAt;
+ static volatile bool gBoosting;         /* the last sample was boosted */
+-static volatile bool gSlowPoll;         /* the governor sleeps 100 ms */
+-static uint64_t gBoostSignals, gBoostStarts, gBoostTime, gBoostLastTick;
++static bool gBoostingFull;              /* ... at the touch level */
++static volatile bool gSlowPoll;         /* the governor sleeps vivacpuidlepoll */
++static uint64_t gBoostSignals, gBoostStarts, gBoostTime, gBoostFullTime, gLastTick;
++static uint64_t gTouchSignals, gTouchStill, gSwapSignals, gSwapBursts, gSwapPastWin, gOffIgnored;
+ static bool gFastSuspended;             /* A76 preference off: big cannot be fast enough (see the top) */
+ static uint64_t gFastSuspends;
++/* 0192 display state (viva_cpufreq_display_power or "cpu display") */
++static volatile bool gDispOff;
++static bool gDispHook;                  /* the display ever reported its state */
++static int gOffCap = 1;                 /* vivacpuoffcap: Low Power Mode ceilings while the display is off */
++static uint64_t gDispOffs, gDispOffTime;
++/* 0192 skin proxy: battery temperature (viva_cpufreq_set_skin) */
++static int gSkinTrip = 42;              /* vivaskintrip, C (0 = off) */
++static int gSkinMax = 10;               /* vivaskinmax: slowest skin ceiling (OPP index) */
++static volatile int gSkinIdx;           /* LL/big ceiling from the skin policy (0 = none) */
++static int gSkinDeci = -1000, gSkinPeak = -1000;
++static uint64_t gSkinStepsDown, gSkinStepsUp, gSkinUpdates;
++/* 0192 A76 parking (experimental) */
++static int gPark;                       /* vivacpupark */
++static bool gParked, gParkApplied;
++static uint64_t gParkSince, gParks, gParkTime;
++/* 0192 per-CPU busy since "cpu reset" */
++static uint64_t gIdle0[MAX_SCHED_CPUS], gWall0[MAX_SCHED_CPUS];
+ 
+ static inline uint32_t rd(uint64_t pa) { return ml_phys_read_word_64(pa); }
+ static void therm_tick(void);
+@@ -273,13 +338,16 @@
+ ceiling(int d)
+ {
+ 	int c = gMaxIdx[d];
+-	if (gLowPower && gLpmIdx[d] > c) {
++	if ((gLowPower || (gDispOff && gOffCap)) && gLpmIdx[d] > c) {
+ 		c = gLpmIdx[d];
+ 	}
+ 	if (d != DOM_CCI && gThermIdx > c) {
+ 		c = gThermIdx;
+ 	}
+-	return c > FLOOR_IDX ? FLOOR_IDX : c;
++	if (d != DOM_CCI && gSkinIdx > c) {
++		c = gSkinIdx;
++	}
++	return c > gFloor ? gFloor : c;
+ }
+ 
+ static int
+@@ -297,7 +365,8 @@
+ update_fast_map(void)
+ {
+ 	uint64_t m = 0;
+-	if (gFast && gGov && !gFastSuspended && kOppBig[ceiling(DOM_BIG)].mhz >= 1530) {
++	if (gFastMode != 0 && (gFastMode == 1 || gBoosting) && gGov && !gFastSuspended && !gParked &&
++	    kOppBig[ceiling(DOM_BIG)].mhz >= 1530) {
+ 		for (int c = BIG_FIRST; c <= BIG_LAST; c++) {
+ 			if (processor_array[c] != PROCESSOR_NULL) {
+ 				m |= 1ull << c;
+@@ -307,11 +376,11 @@
+ 	sched_viva_fast_cpus = m;
+ }
+ 
+-/* Busy per mille of the busiest CPU in [first, last] since the last sample. */
++/* Busy per mille of the busiest CPU in [first, last] since the last sample; *hot = CPUs >= 80 %. */
+ static unsigned
+-cluster_busy(int first, int last)
++cluster_busy(int first, int last, unsigned *hot)
+ {
+-	unsigned best = 0;
++	unsigned best = 0, n = 0;
+ 	uint64_t now = mach_absolute_time();
+ 	for (int c = first; c <= last; c++) {
+ 		processor_t p = processor_array[c];
+@@ -329,29 +398,113 @@
+ 		}
+ 		unsigned b = (unsigned)(1000 - di * 1000 / dw);
+ 		best = b > best ? b : best;
++		n += b >= 800;
+ 	}
++	if (hot != NULL) {
++		*hot = n;
++	}
+ 	return best;
+ }
+ 
++/* Idle and wall time of CPU c from recount (for the per-CPU busy since "cpu reset"). */
++static bool
++cpu_idle_now(int c, uint64_t *idle)
++{
++	processor_t p = processor_array[c];
++	if (p == PROCESSOR_NULL) {
++		return false;
++	}
++	struct recount_usage usage = { 0 };
++	*idle = 0;
++	recount_processor_usage(&p->pr_recount, &usage, idle);
++	return true;
++}
++
++static void
++busy_baseline(void)
++{
++	uint64_t now = mach_absolute_time();
++	for (int c = LL_FIRST; c <= BIG_LAST; c++) {
++		gWall0[c] = now;
++		if (!cpu_idle_now(c, &gIdle0[c])) {
++			gWall0[c] = 0;
++		}
++	}
++}
++
+ static int
+ gov_target(int d, unsigned busy)
+ {
+ 	int cap = ceiling(d);
+ 	if (busy >= 800) {
+-		return cap;
++		if (++gUp[d] >= gUpSamples) {
++			return cap;
++		}
++	} else {
++		gUp[d] = 0;
+ 	}
+-	unsigned need = kOpp[d][gIdx[d]].mhz * busy / 500;
++	unsigned need = kOpp[d][gIdx[d]].mhz * busy / (unsigned)gTarget;
+ 	int t = idx_for_mhz(d, need);
+ 	if (t < cap) {
+ 		t = cap;
+ 	}
+-	if (t > FLOOR_IDX) {
+-		t = FLOOR_IDX;
++	if (t > gFloor) {
++		t = gFloor;
+ 	}
+ 	return t;
+ }
+ 
++/* 0192: A76s out of / back into the scheduler's recommended cores. No lock held (the scheduler takes its own). */
+ static void
++park_apply(bool park)
++{
++	if (park == gParkApplied) {
++		return;
++	}
++	gParkApplied = park;
++	uint64_t mask = ALL_CORES_RECOMMENDED;
++	if (park) {
++		for (int c = BIG_FIRST; c <= BIG_LAST; c++) {
++			mask &= ~(1ull << c);
++		}
++	}
++	sched_perfcontrol_update_recommended_cores_reason(mask, REASON_CLPC_SYSTEM, 0);
++}
++
++/* 0192: whether the A76s should be parked now. Caller holds the lock. */
++static void
++park_decide(uint64_t now, bool boost)
++{
++	uint64_t sec = 0;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &sec);
++	if (gParked && gParkSince != 0) {
++		gParkTime += now - gParkSince;
++		gParkSince = now;
++	}
++	if (!gPark || !gGov || boost || (gParked && gHot[DOM_LL] >= 3)) {
++		if (gParked) {
++			gParked = false;
++			update_fast_map();
++		}
++		gParkSince = 0;
++		return;
++	}
++	if (gParked) {
++		return;
++	}
++	if (gBusy[DOM_BIG] >= 50 || gHot[DOM_LL] >= 2) {
++		gParkSince = 0;
++	} else if (gParkSince == 0) {
++		gParkSince = now;
++	} else if (now - gParkSince >= sec) {
++		gParked = true;
++		gParks++;
++		gParkSince = now;
++		update_fast_map();
++	}
++}
++
++static void
+ gov_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ {
+ 	bool slow = false;
+@@ -360,20 +513,27 @@
+ 		int want[NDOM];
+ 		gSamples++;
+ 		therm_tick();
+-		gBusy[DOM_LL] = cluster_busy(LL_FIRST, LL_LAST);
+-		gBusy[DOM_BIG] = cluster_busy(BIG_FIRST, BIG_LAST);
++		gBusy[DOM_LL] = cluster_busy(LL_FIRST, LL_LAST, &gHot[DOM_LL]);
++		gBusy[DOM_BIG] = cluster_busy(BIG_FIRST, BIG_LAST, &gHot[DOM_BIG]);
+ 		uint64_t now = mach_absolute_time();
+-		bool boost = gBoost && now < gBoostUntil;
+-		if (boost) {
+-			gBoostStarts += !gBoosting;
+-			gBoostTime += gBoosting && gBoostLastTick != 0 ? now - gBoostLastTick : 0;
++		bool on = gBoost && !gDispOff;
++		bool full = on && now < gBoostUntil;
++		bool boost = full || (on && now < gSwapUntil);
++		if (gLastTick != 0) {           /* the interval since the last sample, by the state it had */
++			gBoostTime += gBoosting ? now - gLastTick : 0;
++			gBoostFullTime += gBoostingFull ? now - gLastTick : 0;
++			gDispOffTime += gDispOff ? now - gLastTick : 0;
+ 		}
++		gBoostStarts += boost && !gBoosting;
++		bool boostChanged = boost != gBoosting;
+ 		gBoosting = boost;
+-		gBoostLastTick = now;
++		gBoostingFull = full;
++		gLastTick = now;
++		const int *bidx = full ? gBoostIdx : boost ? gBoostSwapIdx : NULL;
+ 		for (int d = DOM_LL; d <= DOM_BIG; d++) {
+ 			int t = gov_target(d, gBusy[d]);
+-			if (boost && t > gBoostIdx[d]) {
+-				t = gBoostIdx[d];       /* UI boost: at least this fast (the ceiling below still applies) */
++			if (bidx != NULL && t > bidx[d]) {
++				t = bidx[d];            /* UI boost: at least this fast (the ceiling below still applies) */
+ 			}
+ 			if (t > gIdx[d]) {              /* slower */
+ 				if (++gDown[d] < 3) {
+@@ -391,7 +551,7 @@
+ 		 * A76 preference: big at least 1.4 x LL's clock / 1.46, or the preference is suspended. Only while boosted
+ 		 * (0187): outside a boost it kept big at ~1920 MHz whenever LL ran fast, idle A76s included (84 C on the phone).
+ 		 */
+-		if (gFast && boost) {
++		if (gFastMode != 0 && boost) {
+ 			int need = idx_for_mhz(DOM_BIG, kOppLL[want[DOM_LL]].mhz * 140 / 146);
+ 			bool suspend = need < ceiling(DOM_BIG);
+ 			if (!suspend && want[DOM_BIG] > need) {
+@@ -400,26 +560,41 @@
+ 			if (suspend != gFastSuspended) {
+ 				gFastSuspended = suspend;
+ 				gFastSuspends += suspend;
+-				update_fast_map();
++				boostChanged = true;
+ 			}
+ 		}
+-		int fastest = want[DOM_LL] < want[DOM_BIG] ? want[DOM_LL] : want[DOM_BIG];
+-		want[DOM_CCI] = fastest < ceiling(DOM_CCI) ? ceiling(DOM_CCI) : fastest;
++		/* 0192: CCI follows LL, and big with a lag (Vproc12 = max(LL, CCI) feeds all six A55s) */
++		int cci = want[DOM_BIG] + gCciLag;
++		cci = want[DOM_LL] < cci ? want[DOM_LL] : cci;
++		cci = cci > gFloor ? gFloor : cci;
++		want[DOM_CCI] = cci < ceiling(DOM_CCI) ? ceiling(DOM_CCI) : cci;
+ 		gBusy[DOM_CCI] = gBusy[DOM_LL] > gBusy[DOM_BIG] ? gBusy[DOM_LL] : gBusy[DOM_BIG];
+ 		if (!apply(want)) {
+ 			gGov = false;
+-			update_fast_map();
+ 			printf("VIVA CPUFREQ: %s, governor stopped\n", gWhy);
++			boostChanged = true;
+ 		}
+-		slow = !boost && gIdx[DOM_LL] == FLOOR_IDX && gIdx[DOM_BIG] == FLOOR_IDX && gBusy[DOM_CCI] < 100;
++		park_decide(now, boost);
++		if (boostChanged) {
++			update_fast_map();
++		}
++		slow = !boost && gIdx[DOM_LL] == gFloor && gIdx[DOM_BIG] == gFloor && gBusy[DOM_CCI] < 100;
++	} else if (gParked) {
++		gParked = false;
+ 	}
+ 	gSlowPoll = slow;
+ 	bool again = gGov && gReady;
++	bool park = gParked;
++	uint64_t ms = (uint64_t)(slow ? (gDispOff ? 2 * gIdlePollMs : gIdlePollMs) : gPollMs);
+ 	lck_mtx_unlock(&viva_cpufreq_lock);
++	park_apply(park);
+ 	if (again) {
+-		uint64_t deadline;
+-		clock_interval_to_deadline(slow ? 100 : 16, NSEC_PER_MSEC, &deadline);
+-		thread_call_enter_delayed(gCall, deadline);
++		/* leeway: the wakeup may slide to coalesce with other timers (1/8 of the period, 1/2 when idle) */
++		uint64_t deadline, leeway;
++		clock_interval_to_deadline((uint32_t)ms, NSEC_PER_MSEC, &deadline);
++		nanoseconds_to_absolutetime(ms * NSEC_PER_MSEC / (slow ? 2 : 8), &leeway);
++		thread_call_enter_delayed_with_leeway(gCall, NULL, deadline, leeway,
++		    THREAD_CALL_DELAY_SYS_NORMAL | THREAD_CALL_DELAY_LEEWAY);
+ 	}
+ }
+ 
+@@ -431,7 +606,8 @@
+ 	}
+ 	gGov = true;
+ 	memset(gDown, 0, sizeof(gDown));
+-	(void)cluster_busy(LL_FIRST, BIG_LAST);  /* baseline */
++	memset(gUp, 0, sizeof(gUp));
++	(void)cluster_busy(LL_FIRST, BIG_LAST, NULL);  /* baseline */
+ 	update_fast_map();
+ 	uint64_t deadline;
+ 	clock_interval_to_deadline(16, NSEC_PER_MSEC, &deadline);
+@@ -442,6 +618,7 @@
+ gov_stop(void)
+ {
+ 	gGov = false;
++	gParked = false;                /* the caller unparks (park_apply) without the lock */
+ 	update_fast_map();
+ 	thread_call_cancel(gCall);
+ }
+@@ -516,7 +693,7 @@
+ static bool gTherm;             /* sensors initialised and valid */
+ static int gTempMC[NSENS];
+ static int gTempMax = -1000000, gTempPeak = -1000000;
+-static int gTrip = 85;
++static int gTrip = 75;          /* vivathermtrip (0192: 85 before) */
+ static unsigned gThermTicks;
+ static uint64_t gThermStepsDown, gThermStepsUp;
+ static const char *gThermWhy = "not started";
+@@ -624,12 +801,12 @@
+ 	}
+ 	int t = gTempMax / 1000;
+ 	if (t >= 105) {
+-		gThermIdx = FLOOR_IDX;
++		gThermIdx = gFloor;
+ 		gThermStepsDown++;
+ 	} else if (t >= gTrip) {
+-		if (gThermIdx < FLOOR_IDX) {
++		if (gThermIdx < gFloor) {
+ 			gThermIdx = gThermIdx == 0 ? (gIdx[DOM_BIG] < gIdx[DOM_LL] ? gIdx[DOM_BIG] : gIdx[DOM_LL]) + 1 : gThermIdx + 1;
+-			gThermIdx = gThermIdx > FLOOR_IDX ? FLOOR_IDX : gThermIdx;
++			gThermIdx = gThermIdx > gFloor ? gFloor : gThermIdx;
+ 			gThermStepsDown++;
+ 		}
+ 	} else if (t < gTrip - 5 && gThermIdx > 0 && gThermTicks % 64 == 0) {
+@@ -638,9 +815,85 @@
+ 	}
+ }
+ 
++/* ---- 0192 tunables: boot-arg = "viva" + name of the "cpu tune" key ---- */
++struct viva_tune {
++	const char *key;        /* "cpu tune" key; boot-arg "vivacpu<key>" unless arg is set */
++	const char *arg;
++	int *v;
++	int min, max;
++};
++
++static const struct viva_tune kTune[] = {
++	{ "floor", "vivacpufloor", &gFloor, 14, NOPP - 1 },
++	{ "target", "vivacputarget", &gTarget, 300, 950 },
++	{ "up", "vivacpuup", &gUpSamples, 1, 20 },
++	{ "ccilag", "vivacpuccilag", &gCciLag, 0, NOPP - 1 },
++	{ "poll", "vivacpupoll", &gPollMs, 4, 100 },
++	{ "idlepoll", "vivacpuidlepoll", &gIdlePollMs, 16, 1000 },
++	{ "fast", "vivacpufast", &gFastMode, 0, 2 },
++	{ "boostms", "vivacpuboostms", &gBoostMs, 0, 5000 },
++	{ "boost", "vivacpuboost", &gBoostMhz, 0, 3000 },
++	{ "boostswap", "vivacpuboostswap", &gBoostSwapMhz, 0, 3000 },
++	{ "boostwin", "vivacpuboostwin", &gBoostWinMs, 0, 60000 },
++	{ "boostgap", "vivacpuboostgap", &gBoostGapMs, 0, 60000 },
++	{ "boosthold", "vivacpuboosthold", &gBoostHoldMs, 0, 60000 },
++	{ "offcap", "vivacpuoffcap", &gOffCap, 0, 1 },
++	{ "trip", "vivathermtrip", &gTrip, 60, 100 },
++	{ "skintrip", "vivaskintrip", &gSkinTrip, 0, 60 },
++	{ "skinmax", "vivaskinmax", &gSkinMax, 1, NOPP - 1 },
++	{ "park", "vivacpupark", &gPark, 0, 1 },
++};
++#define NTUNE (sizeof(kTune) / sizeof(kTune[0]))
++
++/* The fastest OPP of d not above mhz (0 = the fastest OPP), never below the floor. */
++static int
++idx_at_most(int d, int mhz)
++{
++	int i = 0;
++	if (mhz > 0) {
++		i = idx_for_mhz(d, (unsigned)mhz);
++		while (i < gFloor && kOpp[d][i].mhz > (unsigned)mhz) {
++			i++;
++		}
++	}
++	return i > gFloor ? gFloor : i;
++}
++
++/* Values derived from the tunables (mach times, OPP indexes). */
++static void
++tune_derive(void)
++{
++	nanoseconds_to_absolutetime((uint64_t)gBoostMs * NSEC_PER_MSEC, &gBoostAbs);
++	nanoseconds_to_absolutetime((uint64_t)gBoostWinMs * NSEC_PER_MSEC, &gBoostWinAbs);
++	nanoseconds_to_absolutetime((uint64_t)gBoostGapMs * NSEC_PER_MSEC, &gBoostGapAbs);
++	nanoseconds_to_absolutetime((uint64_t)gBoostHoldMs * NSEC_PER_MSEC, &gBoostHoldAbs);
++	for (int d = DOM_LL; d <= DOM_BIG; d++) {
++		gBoostIdx[d] = idx_at_most(d, gBoostMhz);
++		gBoostSwapIdx[d] = gBoostSwapMhz == 0 ? gBoostIdx[d] : idx_at_most(d, gBoostSwapMhz);
++		if (gBoostSwapIdx[d] < gBoostIdx[d]) {
++			gBoostSwapIdx[d] = gBoostIdx[d];        /* frames never above the touch level */
++		}
++	}
++	if (gSkinTrip == 0) {
++		gSkinIdx = 0;
++	}
++	gSkinIdx = gSkinIdx > gSkinMax ? gSkinMax : gSkinIdx;
++}
++
++/* A signal while the governor polls slowly: sample now. */
++static inline void
++boost_kick(void)
++{
++	if (!gBoosting && gSlowPoll && gCall != NULL) {
++		gSlowPoll = false;
++		thread_call_enter(gCall);
++	}
++}
++
+ /*
+- * 0183: the display presented a frame or the touch screen reported a contact (any thread, never blocks; not from
+- * interrupt context). Boosts LL and big for vivacpuboostms from now (see the top).
++ * 0183 / 0192: the display presented a frame (SwapEnd, SweetFramebuffer.cpp; any thread, never blocks, not from
++ * interrupt context). Frame boost (vivacpuboostswap) for vivacpuboostms, only within vivacpuboostwin of the last
++ * touch or of the first frame after vivacpuboostgap without frames (see the top).
+  */
+ void
+ viva_cpufreq_ui_activity(void)
+@@ -648,14 +901,111 @@
+ 	if (!gBoost || !gGov) {
+ 		return;
+ 	}
+-	gBoostUntil = mach_absolute_time() + gBoostAbs;
++	uint64_t now = mach_absolute_time();
++	gSwapSignals++;
+ 	gBoostSignals++;
+-	if (!gBoosting && gSlowPoll && gCall != NULL) {
+-		gSlowPoll = false;
+-		thread_call_enter(gCall);       /* idle polling (100 ms): sample now */
++	if (gDispOff) {
++		gOffIgnored++;
++		return;
+ 	}
++	if (now - gLastSwapAt >= gBoostGapAbs && now - gTouchAt >= gBoostGapAbs) {
++		gBurstAt = now;                 /* the display was quiet: a new burst (app launch, banner, unlock) */
++		gSwapBursts++;
++	}
++	gLastSwapAt = now;
++	if (gBoostWinMs != 0 && now - gBurstAt >= gBoostWinAbs) {
++		gSwapPastWin++;                 /* a steady animation: the governor alone */
++		return;
++	}
++	gSwapUntil = now + gBoostAbs;
++	boost_kick();
+ }
+ 
++/*
++ * 0192: a touch report with `contacts` fingers (0 = the last finger lifted), VivaGT9896.cpp (not from interrupt
++ * context). Touch boost for vivacpuboostms; a contact down for more than vivacpuboosthold while nothing was drawn
++ * for 500 ms no longer boosts (resting finger, charger noise).
++ */
++void
++viva_cpufreq_ui_touch(int contacts)
++{
++	if (!gBoost || !gGov) {
++		return;
++	}
++	uint64_t now = mach_absolute_time(), gap = 0, still = 0;
++	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &gap);
++	nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &still);
++	gTouchSignals++;
++	gBoostSignals++;
++	if (gDispOff) {
++		gOffIgnored++;
++		return;
++	}
++	bool down = now - gTouchAt >= gap;     /* reports come every few ms while a finger is down */
++	if (down) {
++		gTouchDownAt = now;
++	}
++	gTouchAt = now;
++	if (contacts > 0 && !down && gBoostHoldMs != 0 && now - gTouchDownAt >= gBoostHoldAbs &&
++	    now - gLastSwapAt >= still) {
++		gTouchStill++;
++		return;
++	}
++	gBurstAt = now;
++	gBoostUntil = now + gBoostAbs;
++	boost_kick();
++}
++
++/*
++ * 0192: the panel is lit (on != 0) or dark (backlight 0 / panel off). For SweetFramebuffer; any context that may
++ * call thread_call_enter. Dark: boost signals are ignored and (vivacpuoffcap) the Low Power Mode ceilings apply.
++ */
++void
++viva_cpufreq_display_power(int on)
++{
++	bool off = on == 0;
++	gDispHook = true;
++	if (off == gDispOff) {
++		return;
++	}
++	gDispOff = off;
++	if (off) {
++		gDispOffs++;
++		gBoostUntil = gSwapUntil = 0;
++	}
++	if (gGov && gCall != NULL) {
++		thread_call_enter(gCall);       /* new ceilings / boost state at once */
++	}
++}
++
++/*
++ * 0192: battery temperature in 0.1 C (VivaBattery.cpp, every poll: 15 s), the closest thing to a skin sensor.
++ * >= vivaskintrip: LL/big ceiling to opp 3, then one OPP slower per update while hot (down to vivaskinmax);
++ * below trip - 2 C one OPP faster per update.
++ */
++void
++viva_cpufreq_set_skin(int deciC)
++{
++	gSkinDeci = deciC;
++	gSkinPeak = deciC > gSkinPeak ? deciC : gSkinPeak;
++	gSkinUpdates++;
++	if (gSkinTrip == 0) {
++		gSkinIdx = 0;
++		return;
++	}
++	int idx = gSkinIdx;
++	if (deciC >= gSkinTrip * 10) {
++		if (idx < gSkinMax) {
++			idx = idx < 3 ? 3 : idx + 1;
++			gSkinStepsDown++;
++		}
++	} else if (deciC < (gSkinTrip - 2) * 10 && idx > 0) {
++		idx = idx <= 3 ? 0 : idx - 1;
++		gSkinStepsUp++;
++	}
++	gSkinIdx = idx > gSkinMax ? gSkinMax : idx;
++}
++
+ /* 0183: Viva Manager / "gpu kv": boost on, rising edges, time boosted (ms), activity signals. */
+ void
+ viva_cpufreq_boost_stats(int *on, uint64_t *starts, uint64_t *ms, uint64_t *signals)
+@@ -676,8 +1026,11 @@
+ 	if (PE_parse_boot_argn("vivacpufreq", &v, sizeof(v))) {
+ 		gMode = (int)v;
+ 	}
+-	if (PE_parse_boot_argn("vivacpufast", &v, sizeof(v))) {
+-		gFast = v != 0;
++	for (unsigned i = 0; i < NTUNE; i++) {
++		int x = 0;
++		if (PE_parse_boot_argn(kTune[i].arg, &x, sizeof(x))) {
++			*kTune[i].v = x < kTune[i].min ? kTune[i].min : x > kTune[i].max ? kTune[i].max : x;
++		}
+ 	}
+ 	unsigned def[NDOM] = { 2000, 2050, 1400 }, lpm[NDOM] = { 1500, 1530, 1050 };
+ 	const char *const arg[NDOM] = { "vivacpull", "vivacpubig", "vivacpucci" };
+@@ -693,20 +1046,11 @@
+ 			gLpmIdx[d]++;
+ 		}
+ 	}
+-	unsigned boostMhz = 0, boostMs = 250;
+-	(void)PE_parse_boot_argn("vivacpuboost", &boostMhz, sizeof(boostMhz));
+-	(void)PE_parse_boot_argn("vivacpuboostms", &boostMs, sizeof(boostMs));
+-	gBoost = boostMs != 0;
+-	nanoseconds_to_absolutetime((uint64_t)(boostMs > 5000 ? 5000 : boostMs) * NSEC_PER_MSEC, &gBoostAbs);
+-	for (int d = DOM_LL; d <= DOM_BIG; d++) {
+-		gBoostIdx[d] = 0;
+-		if (boostMhz != 0) {            /* the fastest OPP not above boostMhz */
+-			gBoostIdx[d] = idx_for_mhz(d, boostMhz);
+-			while (gBoostIdx[d] < FLOOR_IDX && kOpp[d][gBoostIdx[d]].mhz > boostMhz) {
+-				gBoostIdx[d]++;
+-			}
+-		}
++	gBoost = gBoostMs != 0;
++	if (!gBoost) {
++		gBoostMs = 250;                 /* the length "cpu boost on" uses */
+ 	}
++	tune_derive();
+ 	if (PE_parse_boot_argn("vivalpmcpu", &v, sizeof(v))) {
+ 		gLpmIdx[DOM_BIG] = idx_for_mhz(DOM_BIG, v);
+ 		while (gLpmIdx[DOM_BIG] < NOPP - 1 && kOppBig[gLpmIdx[DOM_BIG]].mhz > v) {
+@@ -720,8 +1064,6 @@
+ 	}
+ 	unsigned th = 1;
+ 	(void)PE_parse_boot_argn("vivatherm", &th, sizeof(th));
+-	(void)PE_parse_boot_argn("vivathermtrip", &gTrip, sizeof(gTrip));
+-	gTrip = gTrip < 60 ? 60 : gTrip > 100 ? 100 : gTrip;
+ 	gTherm = th != 0 && lvts_init();
+ 	if (th == 0) {
+ 		gThermWhy = "off (vivatherm=0)";
+@@ -730,6 +1072,7 @@
+ 	gCall = thread_call_allocate_with_options(gov_tick, NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
+ 	lck_mtx_lock(&viva_cpufreq_lock);
+ 	gReady = init_checks();
++	busy_baseline();
+ 	if (gReady) {
+ 		gWhy = "ok";
+ 		account_time();
+@@ -738,9 +1081,10 @@
+ 		}
+ 	}
+ 	lck_mtx_unlock(&viva_cpufreq_lock);
+-	printf("VIVA THERMAL: LVTS %s\n", gThermWhy);
+-	printf("VIVA CPUFREQ: %s; boot ll %u MHz big %u MHz cci %u MHz; %s\n", gWhy, pll_mhz(DOM_LL), pll_mhz(DOM_BIG),
+-	    pll_mhz(DOM_CCI), !gReady ? "disabled" : gMode == 1 ? "governor on" : "manual (link)");
++	printf("VIVA THERMAL: LVTS %s, trip %d C, skin trip %d C\n", gThermWhy, gTrip, gSkinTrip);
++	printf("VIVA CPUFREQ: %s; boot ll %u MHz big %u MHz cci %u MHz; %s; floor opp %d, target %d, A76 pref %d, "
++	    "park %d\n", gWhy, pll_mhz(DOM_LL), pll_mhz(DOM_BIG), pll_mhz(DOM_CCI),
++	    !gReady ? "disabled" : gMode == 1 ? "governor on" : "manual (link)", gFloor, gTarget, gFastMode, gPark);
+ }
+ 
+ void
+@@ -756,7 +1100,7 @@
+ void
+ viva_cpufreq_set_thermal_cap(int idx)
+ {
+-	gThermIdx = idx < 0 ? 0 : idx > FLOOR_IDX ? FLOOR_IDX : idx;
++	gThermIdx = idx < 0 ? 0 : idx > gFloor ? gFloor : idx;
+ }
+ 
+ int
+@@ -796,6 +1140,21 @@
+ 	return s;
+ }
+ 
++static unsigned
++ms_of(uint64_t abs)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return (unsigned)(ns / NSEC_PER_MSEC);
++}
++
++static bool
++word_is(const char *s, const char *w)
++{
++	size_t n = strlen(w);
++	return strncmp(s, w, n) == 0 && (s[n] == 0 || s[n] == ' ');
++}
++
+ void
+ viva_cpufreq_link(const char *args, char *out, size_t len)
+ {
+@@ -813,29 +1172,85 @@
+ 		SAY("governor %s\n", gGov ? "on" : "off");
+ 	} else if (strncmp(a, "fast", 4) == 0) {
+ 		const char *b = skip(word_end(a));
+-		gFast = strncmp(b, "off", 3) != 0;
++		gFastMode = word_is(b, "off") ? 0 : word_is(b, "boost") ? 2 : 1;
+ 		update_fast_map();
+-		SAY("A76 preference %s (fast cpus 0x%llx)\n", gFast ? "on" : "off", sched_viva_fast_cpus);
++		SAY("A76 preference %s (fast cpus 0x%llx)\n", gFastMode == 0 ? "off" : gFastMode == 1 ? "always" :
++		    "while boosted", sched_viva_fast_cpus);
+ 	} else if (strncmp(a, "boost", 5) == 0) {
+ 		const char *b = skip(word_end(a));
+ 		if (strncmp(b, "on", 2) == 0) {
+ 			gBoost = true;
+-			if (gBoostAbs == 0) {
+-				nanoseconds_to_absolutetime(250 * NSEC_PER_MSEC, &gBoostAbs);
+-			}
+ 		} else if (strncmp(b, "off", 3) == 0) {
+ 			gBoost = false;
+ 		}
+-		uint64_t ns = 0;
+-		absolutetime_to_nanoseconds(gBoostAbs, &ns);
+-		SAY("UI boost %s (%llu ms, ll >= %u MHz, big >= %u MHz)\n", gBoost ? "on" : "off", ns / NSEC_PER_MSEC,
+-		    kOppLL[gBoostIdx[DOM_LL]].mhz, kOppBig[gBoostIdx[DOM_BIG]].mhz);
++		SAY("UI boost %s (%d ms; touch ll >= %u big >= %u MHz; frames ll >= %u big >= %u MHz, window %d ms, gap %d ms; "
++		    "hold %d ms)\n", gBoost ? "on" : "off", gBoostMs, kOppLL[gBoostIdx[DOM_LL]].mhz,
++		    kOppBig[gBoostIdx[DOM_BIG]].mhz, kOppLL[gBoostSwapIdx[DOM_LL]].mhz, kOppBig[gBoostSwapIdx[DOM_BIG]].mhz,
++		    gBoostWinMs, gBoostGapMs, gBoostHoldMs);
++	} else if (strncmp(a, "park", 4) == 0) {
++		const char *b = skip(word_end(a));
++		if (*b != 0) {
++			gPark = word_is(b, "on") ? 1 : 0;
++		}
++		SAY("A76 parking %s, parked %s\n", gPark ? "on" : "off", gParked ? "yes" : "no");
++	} else if (strncmp(a, "display", 7) == 0) {
++		const char *b = skip(word_end(a));
++		if (*b != 0) {
++			lck_mtx_unlock(&viva_cpufreq_lock);
++			viva_cpufreq_display_power(word_is(b, "on"));
++			lck_mtx_lock(&viva_cpufreq_lock);
++		}
++		SAY("display %s (from the display driver: %s)\n", gDispOff ? "off" : "on", gDispHook ? "yes" : "never");
++	} else if (strncmp(a, "tune", 4) == 0) {
++		const char *b = skip(word_end(a));
++		const char *c = skip(word_end(b));
++		bool found = *b == 0;
++		for (unsigned i = 0; i < NTUNE && *b != 0; i++) {
++			if (!word_is(b, kTune[i].key)) {
++				continue;
++			}
++			found = true;
++			if (*c >= '0' && *c <= '9') {
++				int x = 0;
++				while (*c >= '0' && *c <= '9' && x < 1000000) {
++					x = x * 10 + (*c++ - '0');
++				}
++				*kTune[i].v = x < kTune[i].min ? kTune[i].min : x > kTune[i].max ? kTune[i].max : x;
++				if (kTune[i].v == &gBoostMs) {
++					gBoost = gBoostMs != 0;
++					gBoostMs = gBoostMs == 0 ? 250 : gBoostMs;
++				}
++				tune_derive();
++				update_fast_map();
++			}
++			SAY("%s = %d\n", kTune[i].key, *kTune[i].v);
++		}
++		if (!found) {
++			SAY("unknown key\n");
++		}
++		if (*b == 0) {
++			for (unsigned i = 0; i < NTUNE; i++) {
++				SAY("%s%s %d (%d..%d, boot-arg %s)", i % 3 ? "; " : "  ", kTune[i].key, *kTune[i].v, kTune[i].min,
++				    kTune[i].max, kTune[i].arg);
++				if (i % 3 == 2 || i == NTUNE - 1) {
++					SAY("\n");
++				}
++			}
++			SAY("usage: cpu tune [key value]\n");
++		}
+ 	} else if (strncmp(a, "reset", 5) == 0) {
+-		gBoostSignals = gBoostStarts = gBoostTime = gFastSuspends = 0;
++		gBoostSignals = gBoostStarts = gBoostTime = gBoostFullTime = gFastSuspends = 0;
++		gTouchSignals = gTouchStill = gSwapSignals = gSwapBursts = gSwapPastWin = gOffIgnored = 0;
++		gDispOffs = gDispOffTime = gParks = gParkTime = 0;
++		gSkinStepsDown = gSkinStepsUp = gSkinUpdates = 0;
++		gThermStepsDown = gThermStepsUp = 0;
++		gTempPeak = gTempMax;
++		gSkinPeak = gSkinDeci;
+ 		gSteps = gVoltWrites = gErrors = gSamples = 0;
+ 		memset(gTimeAt, 0, sizeof(gTimeAt));
+ 		gLastAt = 0;
+ 		account_time();
++		busy_baseline();
+ 		SAY("counters reset\n");
+ 	} else if (strncmp(a, "set", 3) == 0 || strncmp(a, "max", 3) == 0) {
+ 		bool set = a[0] == 's';
+@@ -873,47 +1288,77 @@
+ 		(void)vproc_read(1, &v11);
+ 		(void)vproc_read(0, &v12);
+ 		account_time();
+-		SAY("cpufreq: %s, governor %s, mode %d, low power %s, thermal cap opp %d, A76 preference %s (0x%llx)\n",
+-		    gWhy, gGov ? "on" : "off", gMode, gLowPower ? "on" : "off", gThermIdx, gFast ? "on" : "off",
+-		    sched_viva_fast_cpus);
++		SAY("cpufreq: %s, governor %s, mode %d, low power %s, display %s%s, A76 preference %s (0x%llx), parked %s\n",
++		    gWhy, gGov ? "on" : "off", gMode, gLowPower ? "on" : "off", gDispOff ? "off" : "on",
++		    gDispHook ? "" : " (no hook)", gFastMode == 0 ? "off" : gFastMode == 1 ? "always" : "boost",
++		    sched_viva_fast_cpus, gParked ? "yes" : "no");
+ 		SAY("  thermal: %s, trip %d C, hottest %d.%d C (peak %d.%d C), cap opp %d, %llu steps down, %llu up\n  ",
+ 		    gThermWhy, gTrip, gTempMax / 1000, (gTempMax % 1000 + 1000) % 1000 / 100, gTempPeak / 1000,
+ 		    (gTempPeak % 1000 + 1000) % 1000 / 100, gThermIdx, gThermStepsDown, gThermStepsUp);
+ 		for (int i = 0; i < NSENS; i++) {
+ 			SAY(" %s %d.%d", kSensName[i], gTempMC[i] / 1000, (gTempMC[i] % 1000 + 1000) % 1000 / 100);
+ 		}
+-		SAY("\n");
++		SAY("\n  skin (battery): %d.%d C (peak %d.%d C), trip %d C, cap opp %d (max %d), %llu steps down, %llu up, "
++		    "%llu updates\n", gSkinDeci / 10, (gSkinDeci % 10 + 10) % 10, gSkinPeak / 10, (gSkinPeak % 10 + 10) % 10,
++		    gSkinTrip, gSkinIdx, gSkinMax, gSkinStepsDown, gSkinStepsUp, gSkinUpdates);
+ 		for (int d = 0; d < NDOM; d++) {
+-			SAY("  %-3s %4u MHz (opp %2d, table %4u, boot %4u), ceiling %4u, busy %3u.%u %%\n", kDomName[d],
+-			    pll_mhz(d), gIdx[d], kOpp[d][gIdx[d]].mhz, kOpp[d][gBootIdx[d]].mhz, kOpp[d][ceiling(d)].mhz,
+-			    gBusy[d] / 10, gBusy[d] % 10);
++			SAY("  %-3s %4u MHz (opp %2d, table %4u, boot %4u), ceiling %4u, floor %4u, busy %3u.%u %%\n",
++			    kDomName[d], pll_mhz(d), gIdx[d], kOpp[d][gIdx[d]].mhz, kOpp[d][gBootIdx[d]].mhz,
++			    kOpp[d][ceiling(d)].mhz, kOpp[d][gFloor].mhz, gBusy[d] / 10, gBusy[d] % 10);
+ 		}
+-		{
+-			uint64_t bns = 0, bms = 0;
+-			absolutetime_to_nanoseconds(gBoostTime, &bns);
+-			absolutetime_to_nanoseconds(gBoostAbs, &bms);
+-			SAY("  UI boost %s%s (%llu ms, ll >= %u big >= %u MHz): %llu boosts, %llu ms boosted, %llu signals; "
+-			    "A76 preference suspended %s (%llu times)\n", gBoost ? "on" : "off", gBoosting ? ", active" : "",
+-			    bms / NSEC_PER_MSEC, kOppLL[gBoostIdx[DOM_LL]].mhz, kOppBig[gBoostIdx[DOM_BIG]].mhz, gBoostStarts,
+-			    bns / NSEC_PER_MSEC, gBoostSignals, gFastSuspended ? "now" : "no", gFastSuspends);
++		uint64_t tot = 0;
++		for (int i = 0; i < NOPP; i++) {
++			tot += gTimeAt[DOM_LL][i];
+ 		}
+-		SAY("  Vproc11 (big) %u mV, Vproc12 (ll+cci) %u mV; %llu steps, %llu rail writes, %llu errors, %llu samples\n",
+-		    500 + v11 * 625 / 100, 500 + v12 * 625 / 100, gSteps, gVoltWrites, gErrors, gSamples);
++		unsigned totMs = ms_of(tot), pm = totMs ? totMs : 1;
++		SAY("  policy: target %d.%d %%, up after %d, cci lag %d, poll %d/%d ms (%llu samples = %llu/s)\n",
++		    gTarget / 10, gTarget % 10, gUpSamples, gCciLag, gPollMs, gIdlePollMs, gSamples,
++		    gSamples * 1000 / pm);
++		SAY("  UI boost %s%s: touch %d ms ll >= %u big >= %u; frames ll >= %u big >= %u, window %d gap %d hold %d ms\n"
++		    "    %llu boosts, %u ms boosted (%u touch level) = %u.%u %% of %u s; touch %llu (still %llu), frames %llu "
++		    "(bursts %llu, past window %llu), ignored display off %llu\n", gBoost ? "on" : "off",
++		    gBoosting ? (gBoostingFull ? ", active (touch)" : ", active (frames)") : "", gBoostMs,
++		    kOppLL[gBoostIdx[DOM_LL]].mhz, kOppBig[gBoostIdx[DOM_BIG]].mhz, kOppLL[gBoostSwapIdx[DOM_LL]].mhz,
++		    kOppBig[gBoostSwapIdx[DOM_BIG]].mhz, gBoostWinMs, gBoostGapMs, gBoostHoldMs, gBoostStarts,
++		    ms_of(gBoostTime), ms_of(gBoostFullTime), ms_of(gBoostTime) * 100 / pm, ms_of(gBoostTime) * 1000 / pm % 10,
++		    totMs / 1000, gTouchSignals, gTouchStill, gSwapSignals, gSwapBursts, gSwapPastWin, gOffIgnored);
++		SAY("  A76 preference suspended %s (%llu times); park %s: %llu parks, %u ms parked; display off %llu times, "
++		    "%u ms\n", gFastSuspended ? "now" : "no", gFastSuspends, gPark ? "on" : "off", gParks, ms_of(gParkTime),
++		    gDispOffs, ms_of(gDispOffTime));
++		SAY("  Vproc11 (big) %u mV, Vproc12 (ll+cci) %u mV; %llu steps, %llu rail writes, %llu errors\n",
++		    500 + v11 * 625 / 100, 500 + v12 * 625 / 100, gSteps, gVoltWrites, gErrors);
+ 		for (int d = 0; d < NDOM; d++) {
+-			uint64_t tot = 0;
++			tot = 0;
+ 			for (int i = 0; i < NOPP; i++) {
+ 				tot += gTimeAt[d][i];
+ 			}
+ 			SAY("  time %-3s:", kDomName[d]);
+ 			for (int i = 0; i < NOPP && tot; i++) {
+-				if (gTimeAt[d][i] * 100 / tot) {
+-					SAY(" %u:%llu%%", kOpp[d][i].mhz, gTimeAt[d][i] * 100 / tot);
++				uint64_t pmil = gTimeAt[d][i] * 1000 / tot;
++				if (pmil) {
++					SAY(" %u:%llu.%llu%%", kOpp[d][i].mhz, pmil / 10, pmil % 10);
+ 				}
+ 			}
+ 			SAY("\n");
+ 		}
+-		SAY("usage: cpu [status] | gov on|off | set ll|big|cci MHz | max ll|big|cci MHz | fast on|off | boost on|off | reset\n");
++		SAY("  cpu busy since reset:");
++		uint64_t now = mach_absolute_time();
++		for (int c = LL_FIRST; c <= BIG_LAST; c++) {
++			uint64_t idle = 0;
++			if (gWall0[c] == 0 || !cpu_idle_now(c, &idle) || now <= gWall0[c] || idle - gIdle0[c] > now - gWall0[c]) {
++				SAY(" %d -", c);
++				continue;
++			}
++			uint64_t pmil = 1000 - (idle - gIdle0[c]) * 1000 / (now - gWall0[c]);
++			SAY(" %d:%llu.%llu%%", c, pmil / 10, pmil % 10);
++		}
++		SAY("\nusage: cpu [status] | gov on|off | set|max ll|big|cci MHz | fast on|off|boost | boost on|off | "
++		    "park on|off | display on|off | tune [key value] | reset\n");
+ 	}
++	bool unpark = !gGov || !gPark;
+ 	lck_mtx_unlock(&viva_cpufreq_lock);
++	if (unpark) {
++		park_apply(false);
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

@@ -833,3 +833,36 @@ Update 2 (phone): brightness works through the nub (1476 levels sent) but the sl
 to a frame for its blanking inside the vsync tick, holding the frames; now non-blocking (checked at the next write).
 Night Shift arrives as selector 55 type 0 during the ramp, but the 72 bytes are 9 x int64 signed 32.32 (0xD5FE7E00 =
 0.836), not doubles; converted with >> 21. CCORR mapped through dispMap.
+
+### 0192: Shut Down / restart, panel sleep, CPU heat, WiFi RX block ack, force-restart sequence (NOT tested on the phone)
+User report 2026-11-13: VolUp, VolDown, Power shows no power-off slider; Settings > General > Shut Down panics; the
+phone runs hot (WiFi frame by frame, CPU clocks, panel never really off in standby).
+- **Shut Down / restart**: nothing set PE_halt_restart, so halt_all_cpus spun and PEHaltRestart's 30 s timer
+  panicked ("Halt/Restart Timed Out"). SweetPlatformExpert::haltRestart now (viva, not during a panic) puts the panel
+  to sleep (sweet_fb_panel_off_for_halt) and calls viva_halt_restart (VivaPwrap.cpp): restart = TOPRGU SWRST (as the
+  link's reboot, WDT_MODE IRQ/DUAL cleared); power off = vendor mt_power_off (viva-r-oss drivers/mfd/mt6358-misc.c):
+  RTC_BBPU 0x588 <- 0x4303, AL_MASK 0x590 <- 0x10, WRTGR 0x5c2, CBUSY/CLR polls, BBPU | RELOAD, TOP_TMA_KEY 0x3a8
+  0x9CA7, PSEQ_ELR11 0xa62 bit 10 = 0, PPCCTL0 0xa08 bit 0 (PWRHOLD) = 0; still alive after 1 s -> TOPRGU reset.
+  Separate whitelist (only while halting); the pwrap lock is taken and kept. `vivapoweroff=0` = old behaviour.
+- **Force-restart sequence** (VivaPMICKeys/VivaKeypad): SpringBoard maps keyboard event 0xFF01/0x40 (AppleVendorKeyboard
+  WillReset, sent by Apple's button firmware) to -[SBLockHardwareButton forceResetSequenceDidBegin] -> power-off slider
+  0.35 s later if the side button is still down. The kernel now recognizes VolUp click, VolDown click, side down (1 s
+  windows) and sends it; side still held `vivaforcerestart` ms (10000, 0 = off) later -> watchdog restart.
+  Side + volume held ("claw") goes to sosd (Emergency SOS remote alert) on D22, not to SpringBoard's own slider; if
+  sosd fails, com.apple.SOS SOSDeviceSupportedKey = false (mobile) re-enables SpringBoard's LockVolumeButtons-Shutdown.
+- **Panel sleep** (SweetFramebuffer.cpp): before, display off only faded to black with the panel awake at 60/120 Hz.
+  Now (vivapaneloff=1) 51 00 00, 28, 10 ms, 10, 120 ms (vendor lcm_unprepare, sent in video mode via VM_CMD), DSI VFP
+  -> vivapaneloffvfp (32767, ~8 fps), slow software vsync tick vivapaneltick (200 ms) that retires queued swaps;
+  wake = VFP back, 11, 120 ms, 51 level, 29, vblankCalibrate. Link `disp panel [off|on|tick MS|vfp N|mode 0|1]`,
+  `disp kv` panel_*. viva_cpufreq_display_power() is told about display on/off.
+- **CPU** (viva_cpufreq.c): boost split touch (full, 250 ms, ignores a still finger after 1 s) / frames (1670 MHz, only
+  near a touch or a first frame after 2 s); A76 preference only while boosted (was always on); CCI follows LL; floor =
+  lowest OPP (LL 500 / big 774); up-ramp needs 2 samples, target 65 %; timer leeway; display off = no boost + LPM caps;
+  battery "skin" ceiling (vivaskintrip 42 C); die trip 75 C (was 85); time-in-state + per-CPU busy in `cpu`; `cpu tune`.
+  Old 0183 behaviour: vivacpuboostwin=0 vivacpuboostswap=0 vivacpufast=1 vivacpufloor=14 vivacputarget=500 vivacpuup=1
+  vivacpuccilag=15 vivathermtrip=85 vivaskintrip=0.
+- **WiFi** (viva_wifi.c): STA record had ucRxAmpdu = 0 -> AP sent single MPDUs. Now rxba=1 with host reorder (gen4m
+  qmProcessPktWithReordering: per-TID 64-slot window, A-MSDU, 100 ms hole timeout, ADDBA/DELBA/bubble events), RX ring
+  0 = 128 entries (was 16; DMA area 0x148000), WFDMA interrupt SPI 0x11d (INTID 317) instead of 2 ms polling with
+  delay(50) looks (~1500 wakeups/s), one copy per frame, batch ifnet_input. Toggles `vivawifi<name>` / `wifi opt`:
+  rxba txba(0) reorder reorderms irq pollus idlems batch rxn. If trouble: vivawifiirq=0, vivawifirxn=16, vivawifirxba=0.
