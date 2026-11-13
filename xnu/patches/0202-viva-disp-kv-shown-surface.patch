@@ -1,0 +1,14 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index fb490cc..36d27ae 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2723,6 +2723,9 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
+ 		disp_say(&p, end, "panel_hz=%u\nhz_mode=%u\nhz_switches=%llu\nhz_failures=%llu\n", fPanelHz, fHzMode,
+ 		    fHzSwitches, fHzFailures);
+ 		disp_say(&p, end, "brightness=%u\nbrightness_max=%u\nmatrix_calls=%llu\n", fBlLevel, PANEL_LEVEL_MAX, fMatrixCalls);
++		/* 0202: which IOSurface the panel scans out and where the panel's window sits in it (viva-link.py shot) */
++		disp_say(&p, end, "shown_surface=%u\noffset_x=%d\noffset_y=%d\n", fShown.surface ? fShown.surface->id : 0,
++		    fOffX, fOffY);
+ 		disp_say(&p, end, "panel_power=%d\ndisplay_power=%d\npanel_off_mode=%u\npanel_off_count=%llu\npanel_on_count=%llu\n"
+ 		    "panel_failures=%llu\npanel_off_us=%llu\npanel_on_us=%llu\npanel_asleep_ms=%llu\npanel_swaps_retired=%llu\n",
+ 		    fPanelOff ? 0 : 1, fPowerOff ? 0 : 1, fPanelMode, fPanelOffs, fPanelOns, fPanelFails, fPanelOffUs, fPanelOnUs,

@@ -1,0 +1,111 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 36d27ae..8f0dcd7 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -130,6 +130,7 @@ extern "C" void viva_touch_display_power(int on);       /* 0195: hid/VivaGT9896.
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
++#include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+@@ -161,6 +162,7 @@ enum {
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
++#define SWEET_FB_DOT_PITCH_NATIVE       394     /* ppi of viva's panel (69.55 x 154.56 mm), sweetfb_native=1 */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+  * screens (UIKit: "No status bar visual provider for screen", the red
+@@ -207,6 +209,7 @@ public:
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
++	uint32_t      fDotPitch;                /* ppi reported to userland (0203) */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+@@ -438,6 +441,45 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * 0203: sweetfb_native=1 is the one switch for the native 360x800 pt display (gpu/docs/PIANO-DISPLAY-NATIVO.md
++ * section 8): the device tree that userland reads is made to agree with the size AppleCLCD reports, before anything
++ * in userland starts. IOMobileFramebuffer takes the canvas from /arm-io/disp0; MobileGestalt takes the artwork
++ * subtype (2556 = the Dynamic Island devices) and DeviceCornerRadius (u32 numerator, u32 denominator, points) from
++ * /product. Without the switch the ADT's iPhone X values stay. Boot-args sweetfb_corner=PX (110, measured on the
++ * phone 2026-11-13) and sweetfb_subtype=N (2556). MobileGestalt caches all this: its cache must be rebuilt.
++ */
++static void
++sweet_fb_dt_u32s(const char *path, const char *key, const uint32_t *v, unsigned n)
++{
++	IORegistryEntry *e = IORegistryEntry::fromPath(path, gIODTPlane);
++	if (e == NULL) {
++		IOLog("SWEET FB: native: no %s in the device tree\n", path);
++		return;
++	}
++	OSData *d = OSData::withBytes(v, n * (unsigned)sizeof(uint32_t));
++	if (d != NULL) {
++		e->setProperty(key, d);
++		d->release();
++	}
++	e->release();
++}
++
++static void
++sweet_fb_native_dt(uint32_t w, uint32_t h)
++{
++	uint32_t corner = 110, subtype = 2556;
++	PE_parse_boot_argn("sweetfb_corner", &corner, sizeof(corner));
++	PE_parse_boot_argn("sweetfb_subtype", &subtype, sizeof(subtype));
++	uint32_t radius[2] = { corner, 3 };     /* px / scale = points */
++	sweet_fb_dt_u32s("/arm-io/disp0", "canvas-width", &w, 1);
++	sweet_fb_dt_u32s("/arm-io/disp0", "canvas-height", &h, 1);
++	sweet_fb_dt_u32s("/product", "artwork-device-subtype", &subtype, 1);
++	sweet_fb_dt_u32s("/product", "display-corner-radius", radius, 2);
++	IOLog("SWEET FB: native %ux%u: disp0 canvas, /product artwork-device-subtype %u, display-corner-radius %u/3 pt\n",
++	    w, h, subtype, corner);
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -465,6 +507,11 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	fDotPitch = SWEET_FB_DOT_PITCH;
++	if (fLogicalW == fWidth && fLogicalH == fHeight && native) {
++		fDotPitch = SWEET_FB_DOT_PITCH_NATIVE;
++		sweet_fb_native_dt(fLogicalW, fLogicalH);
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -2955,7 +3002,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBGetDotPitch:
+-		out[0] = SWEET_FB_DOT_PITCH;
++		out[0] = fFB->fDotPitch;
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBNotifications:
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index a5bae06..8efa8c2 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -416,8 +416,9 @@ SweetHIDTouch::start(IOService *provider)
+ 	fOffY = (fLogicalH - 2400) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+-	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+-	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
++	/* mm, 16.16: viva's active area 69.55 x 154.56 mm (0203, was 68 x 151) */
++	setProperty("SurfaceWidth", (unsigned long long)(6955 * 65536 / 100), 32);
++	setProperty("SurfaceHeight", (unsigned long long)(15456 * 65536 / 100), 32);
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: touch registered\n");
