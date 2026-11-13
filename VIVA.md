@@ -866,3 +866,17 @@ phone runs hot (WiFi frame by frame, CPU clocks, panel never really off in stand
   0 = 128 entries (was 16; DMA area 0x148000), WFDMA interrupt SPI 0x11d (INTID 317) instead of 2 ms polling with
   delay(50) looks (~1500 wakeups/s), one copy per frame, batch ifnet_input. Toggles `vivawifi<name>` / `wifi opt`:
   rxba txba(0) reorder reorderms irq pollus idlems batch rxn. If trouble: vivawifiirq=0, vivawifirxn=16, vivawifirxba=0.
+
+### 0193: WiFi RX descriptors, panel brightness 10 bit, screen console on wake (NOT tested on the phone)
+Phone report on 0192 (2026-11-13): force-restart slider OK, panel really sleeps; but no WiFi network found, the
+brightness slider reached full at half way and went dark just after (two cycles), kernel lines on screen at wake.
+- **WiFi**: "wifi fw" failed at region 1 (`cmd 0x01 seq 4: no event in 500 ms (rx1 didx 2 ...)`, `radio FAILED to come
+  up`): the firmware had answered, the driver never saw it. 0192 dropped the clean + invalidate of the descriptor's
+  line of the cached mapping before reading it through the uncached one; with the two aliases the stale cached line
+  still answered. rx_peek / rx_pop / rx_resync flush the descriptor again (as up to 0191).
+- **Brightness**: PANEL_LEVEL_MAX 1023. Normal mode (53 20) takes 10 bits; 51 07 FF is HBM (vendor panel_hbm_set
+  sends 53 E8 first; lcm_aod_to_normal "normal mode backlight" 51 03 FF). With 2047 the level wrapped at 1024.
+- **Console at wake**: sweetfb_noconsole muted the screen console only on the first *copied* frame; with every frame
+  scanned out it never did, and kernel lines went into LK's buffer. Now muted on the first presented frame.
+Heat seen at the same time (not a kernel fix): `aggregated` (PowerlogCore, SQLite) thread at ~92 % of a core since
+boot, priority 4, so the governor held the LITTLE cluster at 2 GHz (cpu status: ll busy 93 %, peak 81 C).

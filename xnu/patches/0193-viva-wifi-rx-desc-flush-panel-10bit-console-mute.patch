@@ -1,0 +1,108 @@
+diff --git a/bsd/dev/viva_wifi.c b/bsd/dev/viva_wifi.c
+--- a/bsd/dev/viva_wifi.c
++++ b/bsd/dev/viva_wifi.c
+@@ -1084,12 +1084,16 @@
+ /*
+  * The entry the driver waits on in RX ring r, if the DMA is done with it: its buffer (cached view, the received
+  * bytes invalidated) and length; NULL if not done. rx_pop() gives it back. The descriptor is read through the
+- * uncached mapping: no flush of its line (0192: two IOKit cache operations per look less).
++ * uncached mapping, its line of the cached mapping cleaned + invalidated first: without that (0192 as built) the
++ * uncached read kept returning a stale copy (mismatched aliases: the cached line hits), the firmware's answers on RX
++ * ring 1 were never seen and "wifi fw" failed at region 1 (0193, phone: rx1 didx 2, driver waiting at 1).
+  */
+ static const uint8_t *
+ rx_peek(uint32_t r, uint32_t *len)
+ {
+-	uint32_t i = wd.rxIdx[r], d1 = desc(wd.rxDesc[r], i)[1];
++	uint32_t i = wd.rxIdx[r];
++	viva_wifi_dma_flush(wd.rxDesc[r] + 16 * i, 16);
++	uint32_t d1 = desc(wd.rxDesc[r], i)[1];
+ 	if (!(d1 & DESC_DMADONE)) {
+ 		return NULL;
+ 	}
+@@ -1108,6 +1112,7 @@
+ {
+ 	uint32_t i = wd.rxIdx[r];
+ 	desc(wd.rxDesc[r], i)[1] = (uint32_t)RX_BUF_LEN << 16;
++	viva_wifi_dma_flush(wd.rxDesc[r] + 16 * i, 16);        /* as before 0192: out before the CIDX write */
+ 	wr(WF_RX_RING(r) + 8, i);                      /* give the entry back */
+ 	wd.rxIdx[r] = (i + 1) % wd.rxN[r];
+ 	wd.rxGot[r]++;
+@@ -1123,6 +1128,8 @@
+ {
+ 	uint32_t i = wd.rxIdx[r], *d = desc(wd.rxDesc[r], i);
+ 	uint32_t didx = rd(WF_RX_RING(r) + 12) & 0xfff;
++	viva_wifi_dma_flush(wd.rxDesc[r] + 16 * i, 16);        /* this entry and the next (0193) */
++	viva_wifi_dma_flush(wd.rxDesc[r] + 16 * ((i + 1) % wd.rxN[r]), 16);
+ 	if (didx == i || (d[1] & DESC_DMADONE) || !(desc(wd.rxDesc[r], (i + 1) % wd.rxN[r])[1] & DESC_DMADONE)) {
+ 		wd.rxStuck[r] = 0;
+ 		return;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -88,9 +88,9 @@
+  * IOMFBDisplayRefresh (min refresh interval 8.333 ms), which QuartzCore reads when backboardd starts.
+  *
+  * Brightness and Night Shift (0191). CoreBrightness sets IOMFBBrightnessLevel on this service (CFNumber, nits in 16.16
+- * fixed point; SetIOMFBBrightness in CoreBrightness, iOS 16.7): the panel takes DCS 51 HH LL, 0..2047 for its
++ * fixed point; SetIOMFBBrightness in CoreBrightness, iOS 16.7): the panel takes DCS 51 HH LL, 0..1023 (0193) for its
+  * normal range (Xiaomi lcm_setbacklight_cmdq), sent through VM_CMD at the next vsync tick (fades coalesce);
+- * vivapanelnits (500) = the nits of level 2047; link "disp bl N". QuartzCore's color matrices arrive through
++ * vivapanelnits (500) = the nits of level 1023; link "disp bl N". QuartzCore's color matrices arrive through
+  * selector 55 (IOMobileFramebufferSetMatrix: scalar = which matrix, 9 x int64 signed 32.32, row-major); their product goes to the
+  * display pipe's CCORR (0x1400b000, Xiaomi mtk_disp_ccorr.c: 3x3, 1.0 = 0x800 on MT6781, 13-bit signed, two per
+  * register; CFG bit 0 relay / bit 1 engine). Identity = relay (bypass).
+@@ -289,7 +289,7 @@
+ 	/* 0191 brightness and color matrix (see the top) */
+ 	IOMemoryMap  *fCcorrMap;
+ 	vm_offset_t   fCcorr;
+-	uint32_t      fMaxNits;       /* vivapanelnits: nits at level 2047 */
++	uint32_t      fMaxNits;       /* vivapanelnits: nits at PANEL_LEVEL_MAX */
+ 	volatile uint32_t fBlWant;    /* panel level to send at the next tick, 0xffffffff = none */
+ 	uint32_t      fBlLevel;       /* last level sent */
+ 	uint64_t      fBlSent, fMatrixCalls, fMatrixApplied;
+@@ -1020,12 +1020,11 @@
+ 	 * Scanout costs no copy, so a scanned-out frame skips the CPU duty limit; a frame that falls back to the copy
+ 	 * does not (with scanout "on" but every frame copied, copies used to run at every vsync and early present).
+ 	 */
+-	fScanLive = fScanOn && scanout(rec);
+-	if (fScanLive) {
+-		IOLockUnlock(fScanLock);
+-		fGpuTicks = 0;
+-		return true;
+-	}
++	/*
++	 * The GUI presents: the screen console goes quiet (sweetfb_noconsole). 0193: before the scanout return; it used
++	 * to be after it, so with every frame scanned out the console kept drawing kernel lines into LK's buffer, seen
++	 * whenever that buffer was on screen (panel wake, phone 0192).
++	 */
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+ 		fConsolePaused = true;
+@@ -1034,6 +1033,12 @@
+ 			 * writes the read-only-late cons_ops_index and panics. */
+ 			sweet_console_muted = 1;
+ 		}
++	}
++	fScanLive = fScanOn && scanout(rec);
++	if (fScanLive) {
++		IOLockUnlock(fScanLock);
++		fGpuTicks = 0;
++		return true;
+ 	}
+ 	uint64_t t0 = mach_absolute_time();
+ 
+@@ -1224,7 +1229,12 @@
+ #define DISP_CCORR0_PA          0x1400b000ull
+ #define CCORR_CFG               0x020   /* bit 0 relay (bypass), bit 1 engine */
+ #define CCORR_COEF(n)           (0x080 + 4 * (n))
+-#define PANEL_LEVEL_MAX         2047
++/*
++ * 0193: 1023, not 2047. The panel's normal mode (DCS 53 20) takes 10 bits; 51 07 FF is the HBM level (vendor
++ * panel_hbm_set: 53 E8 first; lcm_aod_to_normal: "normal mode backlight" 51 03 FF). With 2047 the slider wrapped:
++ * full at half way, dark just after (phone, 0192).
++ */
++#define PANEL_LEVEL_MAX         1023
+ #define PANEL_VFP_60            2452
+ #define PANEL_VFP_120           20
+ 
