@@ -955,3 +955,20 @@ state W/R/U/S/T hint H event E upc ulr kbt ...`: block hint (kern/block_hint.h),
 blocked thread, the kernel frame-pointer backtrace from the context saved at the switch (kernel collection addresses
 unslid, heap addresses raw; symbolicate against the kernelcache). `kill PID [SIG]` (default 9, not pid 0/1): psignal
 from the kernel, for a stuck vivad (launchd starts it again). Build tree for 0200+: `research/bt0200` (own git).
+
+### 0202 / 0203: screenshot surface, native display switch (F1 of gpu/docs/PIANO-DISPLAY-NATIVO.md, NOT tested yet)
+- 0202: `disp kv` gains `shown_surface` (IOSurface id the panel scans out), `offset_x`, `offset_y`; `viva-link.py shot`
+  uses them.
+- 0203: with `sweetfb_native=1` AppleCLCD::start also writes, before userland starts, `/arm-io/disp0` canvas-width/height
+  (1080x2400), `/product artwork-device-subtype` (2556, `sweetfb_subtype`) and `display-corner-radius` <110 3>
+  (`sweetfb_corner`, px; measured from photos 2026-11-13) and reports dot pitch 394; the touch surface is 69.55 x
+  154.56 mm. The ADT stays the iPhone X one, so the same boot.img without the boot-arg is the old presentation.
+- SpringBoard side: `gpu/app/tweak/VivaDisplay.m` inside VivaIsland.dylib (Viva Manager CI build), active only when
+  disp0 canvas-width is 1080: island 100 x 29.33 pt at 2 pt, exclusion rect (390, 6, 300, 88) px, safe area top 53.67
+  / bottom 34, storyboard apps native (classic mode 0). Preferences `it.viva.display` (DisplayHooks, IslandWidth, ...).
+- Images (CI xnu 43524004489, app 43523979522): `out/xnu-ufs-rw-0203-native.img` (with sweetfb_native=1) and
+  `out/xnu-ufs-rw-0203.img` (without). MobileGestalt cache backed up to `~/Developer/ios-viva/backup/` (not in git) and
+  deleted right before the first native boot so that it is rebuilt.
+- Back: flash `out/xnu-ufs-rw-0203.img` (or 0201), push the backed-up plist back to
+  /private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist
+  (the island on the iPhone X canvas needs its hand-edited 2556), or turn the hooks off with DisplayHooks = NO.
