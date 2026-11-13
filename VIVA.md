@@ -972,3 +972,15 @@ from the kernel, for a stuck vivad (launchd starts it again). Build tree for 020
 - Back: flash `out/xnu-ufs-rw-0203.img` (or 0201), push the backed-up plist back to
   /private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist
   (the island on the iPhone X canvas needs its hand-edited 2556), or turn the hooks off with DisplayHooks = NO.
+
+### Native display on the phone (2026-11-14, images `out/xnu-ufs-rw-0203-native.img`, then `-0204-native.img`)
+- 0203 + VivaDisplay: lock screen, home, Settings, Sileo (storyboard app: native) at 360x800 pt; island on the camera
+  hole; status bar right once the exclusion rect went in points (px read as points put the time under the island).
+- Flicker during animations (user): CoreAnimation used AppleCLCD's default surface (LK's buffer, surface 1, now the
+  display's size) as a page and drew into it while the panel showed it ("copies" of 2 us, swaps of surface 1).
+  **0204**: in native mode the default surface is a contiguous surface of its own (`SWEET FB: default surface 3 (own,
+  contiguous)`); then 567 frames scanned out, 0 copied, a 12-frame burst of an app opening clean. Image with
+  `vivafbpool=6` (the default surface takes a pool buffer).
+- Status bar avoidance 150 pt (`it.viva.display` StatusBarAvoidWidth): time centred at ~58 pt (was 70).
+- Open: expanded island title clipped at the top (Apple's content insets assume 11.33 pt), Control Center laid out for
+  375 pt (modules left, ~56 pt free on the right), home screen grid of SBH type 4.
