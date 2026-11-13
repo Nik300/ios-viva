@@ -1,0 +1,18 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -459,8 +459,13 @@
+ 	 * allocation grown to the rounded rows (CA's 1125x2436 snapshot and 787x1705 switcher surfaces declare exactly
+ 	 * pitch x height and stayed unaligned: correct only if their writers read the pitch back).
+ 	 */
++	/*
++	 * 0200: off by default. Not every writer reads the pitch back: Sileo's package icons (246x246 BGRA, 992 -> 1024)
++	 * and LA08 glyph atlases (480 -> 512) were drawn with the client's pitch and shown with ours, as diagonal
++	 * stripes (phone, 2026-11-13; vivasurfpitch=0 fixed them). vivasurfpitch=1 / 2 keep the 0184 / 0187 behaviour.
++	 */
+ 	if (sweet_surface_pitch64 < 0) {
+-		int on = 1;
++		int on = 0;
+ 		PE_parse_boot_argn("vivasurfpitch", &on, sizeof(on));
+ 		sweet_surface_pitch64 = on;
+ 	}
