@@ -912,3 +912,9 @@ the display off, IC sleep sent), but kernel lines still showed at wake although 
 (`console` -> off). They were the boot's lines left in LK's buffer 0, shown whenever the OVL went back to it before
 CoreAnimation's next frame. When sweetfb_noconsole mutes the console (first presented frame), buffers 0 and 1 are now
 filled with black (64-bit stores: bzero's DC ZVA faults on the non-cacheable mapping). A panic still draws.
+
+### 0197: CCORR coefficient B<-R 13 bits (Night Shift purple) (NOT tested on the phone)
+Phone on 0195: brightness slider OK; Night Shift turned the screen purple. Its type-9 matrices have small negative
+off-diagonal terms (e.g. 1973 80 15 / -4 1914 2 / -12 -44 1806, 1.0 = 2048). CCORR_COEF(3) masked c[6] (B from R)
+to 12 bits as mtk_disp_ccorr.c's CPU path does; the vendor's CMDQ path (the one it runs) uses 13 bits for all nine.
+-12 & 0xfff = 4084 = about +2.0 in 13-bit signed: blue gained twice the red. Now 0x1fff.

@@ -1,0 +1,17 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1890,7 +1890,12 @@
+ 			disp_wr(fCcorr, CCORR_COEF(0), ((uint32_t)(c[0] & 0x1fff) << 16) | (uint32_t)(c[1] & 0x1fff));
+ 			disp_wr(fCcorr, CCORR_COEF(1), ((uint32_t)(c[2] & 0x1fff) << 16) | (uint32_t)(c[3] & 0x1fff));
+ 			disp_wr(fCcorr, CCORR_COEF(2), ((uint32_t)(c[4] & 0x1fff) << 16) | (uint32_t)(c[5] & 0x1fff));
+-			disp_wr(fCcorr, CCORR_COEF(3), ((uint32_t)(c[6] & 0x0fff) << 16) | (uint32_t)(c[7] & 0x1fff));
++			/*
++			 * 0197: c[6] (B from R) 13 bits like the rest. 0191 took the 12-bit mask of mtk_disp_ccorr.c's CPU path;
++			 * its CMDQ path (the one the vendor kernel runs) uses 13 bits. With 12, Night Shift's small negative B<-R
++			 * (-12) became +4084 (~ +2.0): blue got twice the red, the screen went purple (phone, 0195).
++			 */
++			disp_wr(fCcorr, CCORR_COEF(3), ((uint32_t)(c[6] & 0x1fff) << 16) | (uint32_t)(c[7] & 0x1fff));
+ 			disp_wr(fCcorr, CCORR_COEF(4), (uint32_t)(c[8] & 0x1fff) << 16);
+ 			uint32_t cfg = disp_rd(fCcorr, CCORR_CFG);
+ 			disp_wr(fCcorr, CCORR_CFG, identity ? ((cfg | 1u) & ~2u) : ((cfg & ~1u) | 2u));
