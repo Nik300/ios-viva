@@ -1,0 +1,208 @@
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index b40eccd..69216c1 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -86,3 +86,103 @@ sweet_sample_start(void)
+ 		thread_deallocate(thread);
+ 	}
+ }
++
++/*
++ * 0201: link commands `ps [NAME|PID]` and `kill PID [SIG]` (bsd/dev/viva_usb.c), for processes stuck where nothing
++ * else on the phone can look (vivad blocked in posix_spawn, 2026-11-13). `ps` alone: one line per process in the log;
++ * with a name or pid: every thread (osfmk/kern/exception.c sweet_ps_task). Output in the log ("PS ..." lines), the
++ * reply only counts. `kill` refuses pid 0 and 1.
++ */
++#include <sys/signalvar.h>
++
++extern void sweet_ps_task(const char *name, int pid, task_t task);   /* osfmk/kern/exception.c */
++
++struct sweet_ps_arg {
++	const char *name;
++	int pid, found;
++};
++
++static int
++sweet_ps_proc(proc_t p, void *varg)
++{
++	struct sweet_ps_arg *a = varg;
++	char name[32];
++	task_t task = proc_task(p);
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (a->name == NULL && a->pid < 0) {
++		printf("PS %5d %-24s threads %d\n", proc_pid(p), name, task != TASK_NULL ? get_task_numacts(task) : 0);
++		a->found++;
++	} else if ((a->pid >= 0 && proc_pid(p) == a->pid) || (a->name != NULL && strcmp(name, a->name) == 0)) {
++		if (task != TASK_NULL) {
++			sweet_ps_task(name, proc_pid(p), task);
++			a->found++;
++		}
++	}
++	return PROC_RETURNED;
++}
++
++void sweet_ps(const char *arg, char *out, size_t len);
++void sweet_kill(const char *arg, char *out, size_t len);
++
++/* decimal number at *s (spaces skipped); -1 if none */
++static int
++sweet_num(const char **s)
++{
++	int v = -1;
++	while (**s == ' ') {
++		(*s)++;
++	}
++	while (**s >= '0' && **s <= '9' && v < 100000000) {
++		v = (v < 0 ? 0 : v * 10) + (*(*s)++ - '0');
++	}
++	return v;
++}
++
++void
++sweet_ps(const char *arg, char *out, size_t len)
++{
++	struct sweet_ps_arg a = { .name = NULL, .pid = -1, .found = 0 };
++	char name[32];
++	while (*arg == ' ') {
++		arg++;
++	}
++	if (*arg >= '0' && *arg <= '9') {
++		const char *q = arg;
++		a.pid = sweet_num(&q);
++	} else if (*arg) {
++		size_t n = 0;
++		while (arg[n] && arg[n] != ' ' && n < sizeof(name) - 1) {
++			name[n] = arg[n];
++			n++;
++		}
++		name[n] = 0;
++		a.name = name;
++	}
++	printf("PS --- %s\n", *arg ? arg : "all");
++	proc_iterate(PROC_ALLPROCLIST, sweet_ps_proc, &a, NULL, NULL);
++	snprintf(out, len, "ps: %d process%s, \"PS\" lines in the log\n", a.found, a.found == 1 ? "" : "es");
++}
++
++void
++sweet_kill(const char *arg, char *out, size_t len)
++{
++	int pid = sweet_num(&arg), sig = sweet_num(&arg);
++	if (sig < 0) {
++		sig = SIGKILL;
++	}
++	if (pid <= 1 || sig <= 0 || sig >= NSIG) {
++		snprintf(out, len, "kill PID [SIG]: pid > 1, signal 1..%d (default 9)\n", NSIG - 1);
++		return;
++	}
++	proc_t p = proc_find(pid);
++	if (p == PROC_NULL) {
++		snprintf(out, len, "kill: no process %d\n", pid);
++		return;
++	}
++	char name[32];
++	proc_name(pid, name, sizeof(name));
++	psignal(p, sig);
++	proc_rele(p);
++	printf("VIVA LINK: kill %d (%s) signal %d\n", pid, name, sig);
++	snprintf(out, len, "kill: signal %d sent to %d (%s)\n", sig, pid, name);
++}
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index 0f0981a..30ed2e4 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -258,6 +258,8 @@ extern void viva_gpu_link(const char *args, char *out, size_t outLen);       /*
+ extern void viva_cpufreq_link(const char *args, char *out, size_t outLen);   /* osfmk/arm64/viva_cpufreq.c */
+ extern void viva_disp_link(const char *args, char *out, size_t outLen);      /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+ extern int sweet_console_muted;                                             /* osfmk/console/serial_console.c */
++extern void sweet_ps(const char *arg, char *out, size_t len);                /* bsd/dev/sweet_sample.c (0201) */
++extern void sweet_kill(const char *arg, char *out, size_t len);
+ 
+ extern void viva_battery_usb_changed(void);                                  /* VivaBattery.cpp: poll now */
+ 
+@@ -1752,6 +1754,10 @@ vl_command(void)
+ 			vl_reply("vivad: not running (no reader on /dev/vivalink%s) or nothing to send\n",
+ 			    vd_node ? "" : ", not created yet");
+ 		}
++	} else if (IS("ps") || IS("kill")) {
++		char out[160];
++		(IS("ps") ? sweet_ps : sweet_kill)(rest, out, sizeof(out));
++		vl_reply("%s", out);
+ 	} else if (IS("rewind")) {
+ 		uint64_t total = sweet_log_position(), back = UINT64_MAX;
+ 		(void)vl_arg(&rest, &back);
+@@ -1779,7 +1785,7 @@ vl_command(void)
+ 			delay(5000);
+ 		}
+ 	} else if (IS("help")) {
+-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+ 	} else {
+ 		vl_reply("unknown command: %s (try help)\n", c);
+ 	}
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..fa4ea47 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1040,6 +1040,62 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 	task_unlock(task);
+ }
+ 
++/*
++ * 0201: link command `ps NAME|PID` (bsd/dev/viva_usb.c). Where is a process stuck *in the kernel*? Per thread:
++ * state, block hint, wait event, the user pc/lr and, for a blocked thread, a frame-pointer backtrace of its kernel
++ * stack from the context saved at the switch. Kernel collection addresses are unslid (symbolicate against the
++ * kernelcache's own addresses), heap addresses (wait events on objects) printed as they are. Racy by design (no
++ * thread locks): only frames inside the thread's own kernel stack are followed.
++ */
++void sweet_ps_task(const char *name, int pid, task_t task);
++
++/* text and data of the kernel collection unslid (symbolicate), anything else (heap) as it is */
++#define SPS_ADDR(v) ((unsigned long)(VM_KERNEL_IS_SLID(v) ? __DO_UNSLIDE(v) : (vm_offset_t)VM_KERNEL_STRIP_PTR(v)))
++
++void
++sweet_ps_task(const char *name, int pid, task_t task)
++{
++	int tn = 0;
++	thread_t thread;
++
++	printf("PS %s[%d] threads %d\n", name, pid, task->thread_count);
++	task_lock(task);
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		char line[480];
++		int n;
++		int state = thread->state;
++		arm_saved_state_t *ss = find_user_regs(thread);
++
++		n = snprintf(line, sizeof(line), "PS %s t%d tid %llu state %s%s%s%s%s hint %d event 0x%lx", name, tn++,
++		    thread_tid(thread), (state & TH_WAIT) ? "W" : "", (state & TH_RUN) ? "R" : "", (state & TH_UNINT) ? "U" : "",
++		    (state & TH_SUSP) ? "S" : "", (state & TH_TERMINATE) ? "T" : "", (int)thread->block_hint,
++		    SPS_ADDR(thread->wait_event));
++		if (ss != NULL && is_saved_state64(ss)) {
++			n += snprintf(line + n, sizeof(line) - n, " upc 0x%llx ulr 0x%llx", get_saved_state_pc(ss),
++			    get_saved_state_lr(ss));
++		}
++		vm_offset_t stack = thread->kernel_stack;
++		if ((state & TH_WAIT) && !(state & TH_RUN) && stack != 0 && thread != current_thread()) {
++			struct arm_kernel_saved_state *ks = &((thread_kernel_state_t)thread->machine.kstackptr)->machine.ss;
++			uint64_t fp = ks->fp, top = stack + kernel_stack_size;
++			n += snprintf(line + n, sizeof(line) - n, " kbt 0x%lx", SPS_ADDR(ks->lr));
++			for (int i = 0; i < 24 && fp >= stack && fp + 16 <= top && (fp & 7) == 0 && n < (int)sizeof(line) - 24; i++) {
++				uint64_t *frame = (uint64_t *)fp;
++				n += snprintf(line + n, sizeof(line) - n, " 0x%lx", SPS_ADDR(frame[1]));
++				if (frame[0] <= fp) {
++					break;
++				}
++				fp = frame[0];
++			}
++		} else if ((state & TH_WAIT) && stack == 0) {
++			n += snprintf(line + n, sizeof(line) - n, " (continuation 0x%lx)",
++			    SPS_ADDR(thread->continuation));
++		}
++		printf("%s\n", line);
++	}
++	task_unlock(task);
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ kern_return_t
