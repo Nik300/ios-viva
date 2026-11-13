@@ -1,0 +1,210 @@
+diff --git a/iokit/Kernel/arm/hid/VivaGT9896.cpp b/iokit/Kernel/arm/hid/VivaGT9896.cpp
+--- a/iokit/Kernel/arm/hid/VivaGT9896.cpp
++++ b/iokit/Kernel/arm/hid/VivaGT9896.cpp
+@@ -21,13 +21,26 @@
+  * Reads go in 8-byte pieces (VivaI2C FIFO transfers).
+  *
+  * ADT: i2c-address, avdd-gpio, dvdd-gpio, reset-gpio, max-x, max-y,
+- * reg-coor, reg-pid, reg-fw-request; the interrupt is
++ * reg-coor, reg-pid, reg-fw-request, reg-command; the interrupt is
+  * interrupts/interrupt-parent (VivaEINT).
++ *
++ * 0195, sleep with the display: the IC kept scanning with the screen off and,
++ * on the charger, reported a phantom resting contact ~230 times a second for
++ * hours (1.16 M reports with the display off on the phone: an interrupt, an
++ * I2C read and a HID event each, the CPU never idle, the phone warm). As the
++ * vendor's suspend/resume (goodix_ts_i2c.c goodix_hw_suspend: COMMAND_SLEEP
++ * 0x05 to the command register, Yellowstone 5-byte form {cmd, data BE16,
++ * checksum BE16}; goodix_hw_resume = hardware reset): on display off
++ * (SweetFramebuffer requestPower -> viva_touch_display_power) the interrupt
++ * is disabled, held contacts are lifted and the IC sleeps; on display on it
++ * is reset and the interrupt enabled. Runs from a thread call on the touch
++ * work loop (the display path never waits for I2C). vivatouchsleep=0 = off.
+  */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOInterruptEventSource.h>
++#include <kern/thread_call.h>
+ 
+ #include "SweetHIDTouch.h"
+ #include "../VivaIO.h"
+@@ -44,6 +57,7 @@
+ #define GT_POINT_STYLUS_HOVER   0x03
+ #define GT_REQUEST_CONFIG       0x01
+ #define GT_REQUEST_RESET        0x03
++#define GT_COMMAND_SLEEP        0x05    /* goodix_ts_i2c.c COMMAND_SLEEP */
+ #define PANEL_W                 1080
+ #define PANEL_H                 2400
+ 
+@@ -67,7 +81,15 @@
+ 	bool powerOn(void);
+ 	void handleEvent(void);
+ 	void handleRequest(void);
++	static void sleepCall(thread_call_param_t p0, thread_call_param_t p1);
++	static IOReturn sleepAction(OSObject *owner, void *a0, void *a1, void *a2, void *a3);
++	void setAsleep(bool asleep);
+ 
++public:
++	void displayPower(bool on);
++
++private:
++
+ 	VivaI2C                *fBus;
+ 	VivaGPIO               *fGPIO;
+ 	IOWorkLoop             *fWorkLoop;
+@@ -78,8 +100,16 @@
+ 	uint32_t                fHeadErrors;
+ 	uint32_t                fPrevMap;
+ 	uint32_t                fEvents, fBadSums;
++	uint16_t                fRegCommand;
++	thread_call_t           fSleepCall;
++	volatile bool           fWantAsleep;    /* display off */
++	bool                    fAsleep;
++	uint32_t                fSleeps, fWakes, fSleepFails;
+ };
+ 
++static VivaGT9896 *gVivaTouch;          /* for viva_touch_display_power */
++static int gVivaTouchSleep = 1;         /* vivatouchsleep */
++
+ OSDefineMetaClassAndStructors(VivaGT9896, SweetHIDTouch);
+ 
+ static uint32_t
+@@ -161,6 +191,8 @@
+ 	fRegCoor = (uint16_t)dtU32(provider, "reg-coor", 0x4180);
+ 	fRegPid = (uint16_t)dtU32(provider, "reg-pid", 0x4022);
+ 	fRegRequest = (uint16_t)dtU32(provider, "reg-fw-request", 0x4180);
++	fRegCommand = (uint16_t)dtU32(provider, "reg-command", 0x4160);        /* VIVA.md: Yellowstone command 0x4160 */
++	PE_parse_boot_argn("vivatouchsleep", &gVivaTouchSleep, sizeof(gVivaTouchSleep));
+ 	if (fBus == NULL || fGPIO == NULL || fWorkLoop == NULL) {
+ 		IOLog("VIVA TOUCH: missing I2C bus, GPIO or work loop\n");
+ 		return false;
+@@ -188,11 +220,94 @@
+ 		return false;
+ 	}
+ 	fInterrupt->enable();
+-	IOLog("VIVA TOUCH: GT9896 at 0x%02x on, %ux%u\n", fAddr, fMaxX, fMaxY);
++	fSleepCall = thread_call_allocate_with_options(&VivaGT9896::sleepCall, this, THREAD_CALL_PRIORITY_KERNEL, 0);
++	if (fSleepCall != NULL) {
++		gVivaTouch = this;
++	}
++	IOLog("VIVA TOUCH: GT9896 at 0x%02x on, %ux%u, sleeps with the display %s\n", fAddr, fMaxX, fMaxY,
++	    gVivaTouchSleep ? "on" : "off (vivatouchsleep=0)");
+ 	return true;
++}
++
++/* 0195: from the display's power path (any context that may block briefly; never waits for the IC). */
++void
++VivaGT9896::displayPower(bool on)
++{
++	fWantAsleep = !on;
++	thread_call_enter(fSleepCall);
++}
++
++void
++VivaGT9896::sleepCall(thread_call_param_t p0, thread_call_param_t p1 __unused)
++{
++	VivaGT9896 *self = (VivaGT9896 *)p0;
++	self->fWorkLoop->runAction(&VivaGT9896::sleepAction, self);
++}
++
++IOReturn
++VivaGT9896::sleepAction(OSObject *owner, void *a0 __unused, void *a1 __unused, void *a2 __unused, void *a3 __unused)
++{
++	VivaGT9896 *self = OSDynamicCast(VivaGT9896, owner);
++	if (self != NULL) {
++		self->setAsleep(self->fWantAsleep);     /* the latest request: a quick off/on pair settles on "on" */
++	}
++	return kIOReturnSuccess;
+ }
+ 
++/* On the work loop (gate held: no interrupt handler runs meanwhile). */
+ void
++VivaGT9896::setAsleep(bool asleep)
++{
++	if (asleep == fAsleep) {
++		return;
++	}
++	if (asleep) {
++		fInterrupt->disable();
++		for (uint32_t id = 0; id < SWEET_TOUCH_FINGERS; id++) {
++			if (fPrevMap & (1u << id)) {
++				touch((int)id, false, 0, 0);    /* nothing stays down while the screen is off */
++			}
++		}
++		fPrevMap = 0;
++		uint8_t zero = 0;
++		writeReg(fRegCoor, &zero, 1);
++		uint8_t cmd[5] = { GT_COMMAND_SLEEP, 0, 0, 0, GT_COMMAND_SLEEP };      /* goodix_cmd_init, Yellowstone */
++		IOReturn r = writeReg(fRegCommand, cmd, sizeof(cmd));
++		fAsleep = true;
++		fSleeps++;
++		if (r != kIOReturnSuccess) {
++			fSleepFails++;
++		}
++		if (fSleeps <= 4 || r != kIOReturnSuccess) {
++			IOLog("VIVA TOUCH: display off: interrupt off, IC sleep %s (%u events so far)\n",
++			    r == kIOReturnSuccess ? "sent" : "NOT sent", fEvents);
++		}
++		return;
++	}
++	/* goodix_hw_resume = goodix_hw_reset: reset low, high, then the IC's own start-up time */
++	fGPIO->setOutput(fReset, false);
++	IODelay(2000);
++	fGPIO->setOutput(fReset, true);
++	IOSleep(110);
++	uint8_t zero = 0;
++	writeReg(fRegCoor, &zero, 1);
++	fAsleep = false;
++	fWakes++;
++	fInterrupt->enable();
++	if (fWakes <= 4) {
++		IOLog("VIVA TOUCH: display on: IC reset, interrupt on\n");
++	}
++}
++
++extern "C" void
++viva_touch_display_power(int on)
++{
++	if (gVivaTouch != NULL && gVivaTouchSleep) {
++		gVivaTouch->displayPower(on != 0);
++	}
++}
++
++void
+ VivaGT9896::free(void)
+ {
+ 	if (fInterrupt != NULL) {
+@@ -202,6 +317,13 @@
+ 		}
+ 	}
+ 	OSSafeReleaseNULL(fInterrupt);
++	if (fSleepCall != NULL) {
++		if (gVivaTouch == this) {
++			gVivaTouch = NULL;
++		}
++		thread_call_cancel_wait(fSleepCall);
++		thread_call_free(fSleepCall);
++	}
+ 	SweetHIDTouch::free();
+ 	OSSafeReleaseNULL(fWorkLoop);
+ }
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -124,6 +124,7 @@
+ extern "C" void (*sweet_fb_panic_hook)(void);   /* pexpert/arm/pe_serial.c */
+ extern "C" void viva_cpufreq_ui_activity(void);        /* osfmk/arm64/viva_cpufreq.c: 0183 UI boost */
+ extern "C" void viva_cpufreq_display_power(int on);    /* 0192: display off = no boost, Low Power Mode ceilings */
++extern "C" void viva_touch_display_power(int on);       /* 0195: hid/VivaGT9896.cpp, the touch IC sleeps */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -1892,6 +1893,7 @@
+ AppleCLCD::requestPower(bool off, bool force)
+ {
+ 	viva_cpufreq_display_power(!off);       /* never blocks */
++	viva_touch_display_power(!off);         /* 0195: a thread call, never waits for I2C */
+ 	if ((!fPanelMode && !force && !fPanelOff) || fWorkLoop == NULL) {
+ 		IOLockLock(fLock);
+ 		if (off != fPowerOff) {

@@ -896,3 +896,12 @@ bootstrapped again).
   `vivacpubg` MHz (1075; 0 = off, 0192 behaviour). A boost, foreground threads and promoted threads get the full
   clock. Tune keys `bg`, `bgpri`; `cpu status` shows busy with/without low priority, low % per CPU since reset and
   the samples the cap held lower.
+
+### 0195: the touch IC sleeps with the display (NOT tested on the phone)
+Phone on 0194, display off on the Mac's charger for ~1.5 h, warm again: CPU at the floor (LL 500 MHz, 9 % busy, low
+priority ~1 %), GPU idle, but `cpu status` counted 1,163,233 touch reports ignored with the display off (~230/s for
+5077 s; "still" contact = the charger's noise read as a resting finger). Each one: EINT, an I2C read, a HID event to
+backboardd. VivaGT9896 now does the vendor's suspend/resume (goodix_ts_i2c.c): display off -> interrupt disabled,
+contacts lifted, COMMAND_SLEEP {05 00 00 00 05} to the command register 0x4160 (ADT reg-command); display on ->
+hardware reset (2 ms low, 110 ms) and interrupt enabled. Called from AppleCLCD::requestPower through a thread call on
+the touch work loop. `vivatouchsleep=0` = off. Tap-to-wake is not possible while it sleeps.
