@@ -905,3 +905,10 @@ backboardd. VivaGT9896 now does the vendor's suspend/resume (goodix_ts_i2c.c): d
 contacts lifted, COMMAND_SLEEP {05 00 00 00 05} to the command register 0x4160 (ADT reg-command); display on ->
 hardware reset (2 ms low, 110 ms) and interrupt enabled. Called from AppleCLCD::requestPower through a thread call on
 the touch work loop. `vivatouchsleep=0` = off. Tap-to-wake is not possible while it sleeps.
+
+### 0196: LK's buffers cleared when the screen console goes quiet (NOT tested on the phone)
+Phone on 0195: WiFi works again, Shut Down from the slider powers off, touch sleeps with the display (0 reports with
+the display off, IC sleep sent), but kernel lines still showed at wake although the screen console was muted
+(`console` -> off). They were the boot's lines left in LK's buffer 0, shown whenever the OVL went back to it before
+CoreAnimation's next frame. When sweetfb_noconsole mutes the console (first presented frame), buffers 0 and 1 are now
+filled with black (64-bit stores: bzero's DC ZVA faults on the non-cacheable mapping). A panic still draws.
