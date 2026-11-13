@@ -17,6 +17,9 @@
                                        key, lock, display, screenshot, crash), S (link state), K (kernel lines
                                        matching -k, default panics/faults). --until waits for a matching line
                                        (exit 0; 2 on --timeout): a test waits for the user instead of a "done"
+  viva-link.py shot [FILE] [--full] [--width N]
+                                       screenshot: the framebuffer on screen, cropped to what the panel shows,
+                                       as a PNG on the Mac (default ~/.viva-link/shots/shot-DATE.png)
   viva-link.py serve                   the link server (started by itself when needed, see below)
   viva-link.py stop                    stop the link server
   viva-link.py journal                 print the journal directory (everything, with times, one file per day)
@@ -530,6 +533,45 @@ def dump(link, pa, size):
     return bytes(out[pa - start:pa - start + size])
 
 
+SHOTS = os.path.expanduser('~/.viva-link/shots')
+
+
+def shot(link, a):
+    """What the panel shows, as a PNG on the Mac: the render server's framebuffer that is on screen (disp kv
+    shown_surface, kernel 0202), cropped to the panel's window (offset_x/y); --full keeps the whole surface. Without
+    0202 every screen-sized framebuffer is saved (FILE-N.png) and the newest guess is FILE."""
+    import subprocess
+    kv = dict(l.split('=', 1) for l in link.command('disp kv').split() if '=' in l)
+    out, st = run_capture(link, ['vctl', 'shot', '/private/var/tmp/vlshot'])
+    found = [(m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+             for m in re.finditer(r'(\S+\.png): surface (\d+) (\d+)x(\d+)', out)]
+    found = [f for f in found if (f[2], f[3]) != (int(kv.get('width', 0)), int(kv.get('height', 0)))]  # stale console
+    if st or not found:
+        sys.exit('vctl shot: %s' % (out.strip() or 'exit %d' % st))
+    dest = a.command[0] if a.command else os.path.join(SHOTS, time.strftime('shot-%Y%m%d-%H%M%S.png'))
+    os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+    shown = int(kv.get('shown_surface', 0))
+    pick = [f for f in found if f[1] == shown]
+    if not pick:
+        if shown == 0:
+            link.note('kernel without shown_surface (0202): saving every framebuffer, %s = the last one' % dest)
+        pick = found[-1:]
+        for i, f in enumerate(found):
+            pull(link, f[0], '%s-%d.png' % (dest[:-4] if dest.endswith('.png') else dest, i))
+    pull(link, pick[0][0], dest)
+    w, h = int(kv.get('width', 0)), int(kv.get('height', 0))
+    ox, oy = int(kv.get('offset_x', -1)), int(kv.get('offset_y', -1))
+    if ox < 0:          # before 0202: centred window
+        ox, oy = max(0, (pick[0][2] - w) // 2), max(0, (pick[0][3] - h) // 2)
+    sips = lambda *args: subprocess.run(['sips'] + list(args), capture_output=True)
+    if not a.full and w and h and (pick[0][2], pick[0][3]) != (w, h):
+        sips('-c', str(h), str(w), '--cropOffset', str(oy), str(ox), dest, '--out', dest)
+    if a.width:
+        sips('--resampleWidth', str(a.width), dest, '--out', dest)
+    print('%s (surface %d, %s)' % (dest, pick[0][1], 'whole %dx%d' % pick[0][2:4] if a.full or not w else
+                                   'panel %dx%d at %d,%d' % (w, h, ox, oy)))
+
+
 WATCH_KERNEL = r'panic|Panic|fault|Fault|crash|jetsam|watchdog'   # kernel lines `watch` shows by default
 
 
@@ -596,7 +638,7 @@ def main():
     ap.add_argument('-o', '--output', help='append the console log to this file')
     ap.add_argument('mode', nargs='?', default='interactive',
                     choices=('interactive', 'log', 'cmd', 'dump', 'dumpdtb', 'push', 'pull', 'run', 'bootrec',
-                             'watch', 'serve', 'stop', 'journal'))
+                             'watch', 'serve', 'stop', 'journal', 'shot'))
     ap.add_argument('command', nargs='*')
     w = ap.add_argument_group('watch')
     w.add_argument('-k', '--kernel', action='append', metavar='REGEX',
@@ -607,6 +649,9 @@ def main():
     w.add_argument('--count', type=int, default=1, help='with --until: matches needed (default 1)')
     w.add_argument('--timeout', type=float, default=0, help='with --until: give up after SECONDS (exit 2)')
     w.add_argument('--bare', action='store_true', help='no time stamps')
+    sh = ap.add_argument_group('shot')
+    sh.add_argument('--full', action='store_true', help='the whole framebuffer, not only the panel window')
+    sh.add_argument('--width', type=int, help='scale the PNG to this width')
     a = ap.parse_intermixed_args()
 
     oneshot = a.mode not in ('interactive', 'log', 'watch')
@@ -668,6 +713,9 @@ def main():
         return
     if a.mode == 'bootrec':
         bootrec(link, a.command)
+        return
+    if a.mode == 'shot':
+        shot(link, a)
         return
     if a.mode == 'run':
         if not a.command:
