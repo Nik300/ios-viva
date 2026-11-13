@@ -918,3 +918,40 @@ Phone on 0195: brightness slider OK; Night Shift turned the screen purple. Its t
 off-diagonal terms (e.g. 1973 80 15 / -4 1914 2 / -12 -44 1806, 1.0 = 2048). CCORR_COEF(3) masked c[6] (B from R)
 to 12 bits as mtk_disp_ccorr.c's CPU path does; the vendor's CMDQ path (the one it runs) uses 13 bits for all nine.
 -12 & 0xfff = 4084 = about +2.0 in 13-bit signed: blue gained twice the red. Now 0x1fff.
+
+### Viva Link server, journal and `watch` (2026-11-13, tools only)
+Only one process can claim the link interface, so a long `log`, the interactive interface or two agents kept each
+other out. `tools/viva-link.py` now always goes through a local server (`viva-link.py serve`, started in the
+background by the first command, replaced when the tool's code is newer; `tools/viva_link_server.py`) that owns the
+USB link and listens on `~/.viva-link/link.sock`. Every mode works as before; `VIVA_LINK_DIRECT=1` = old direct
+access. The server journals everything with times to `~/.viva-link/journal/YYYY-MM-DD.log` (`L` kernel line, `O`
+vivad output, `E` phone event, `C` command + reply, `S` link state), and beats only while a client is connected.
+- Phone events: `tools/vivad/vevents.c` (built by tools/vivad/build.sh, ad-hoc signed with vevents.entitlements,
+  copy to /private/var/root/viva-tests/vevents). The server starts it through vivad when a client attaches; it prints
+  `EV app BUNDLE PID` (frontmost app from the Darwin role UI_FOCAL: SpringBoard's SBSCopyFrontmostApplication...
+  answers only platform binaries), `EV touch down|up N X Y [MS DIST]` (HID monitor client), `EV key down|up NAME`,
+  `EV lock 0|1`, `EV display 0|1`, `EV screenshot PATH` (DCIM), `EV crash PATH` (CrashReporter); it replaces an
+  older instance and leaves 30 s after the link stops being active.
+- `viva-link.py watch [-k REGEX] [--until REGEX [--count N] [--timeout S]]`: events as they happen; with `--until`
+  a test waits for the user's action (e.g. `--until 'E app com.apple.mobilesafari'`), exit 0 / 2 on timeout.
+- Tested with the simulator (`tools/tests/test_viva_link_server.py`, `test_viva_link_tui.py`) and on the phone
+  (server, journal, one-shot commands and a watch at the same time; vevents saw touches, home, lock/display).
+- Open: on 2026-11-13 vivad hung in posix_spawn twice when starting the latest vevents build (`vivad: not reading`,
+  no "started" line), while the earlier builds ran; during the same boot wired memory was ~225k pages (3.4 GiB, the
+  2026-11-07 hang). 0201 `ps vivad` should say where it waits.
+
+### 0200: IOSurface pitch rounding off by default (Sileo icons, NOT tested as a kernel)
+Phone 2026-11-13: Sileo's package icons were diagonal stripes, web pages in Safari had no text. Kernel log: 0184 P6
+rounded client pitches to 64 (`SWEET SURF: 246x246 fmt 0x42475241 pitch 992 -> 1024`, LA08 glyph atlases 480 ->
+512, 11 surfaces), but some writers keep their own pitch. With boot-arg `vivasurfpitch=0` (VIVABOOT record, same
+kernel) the icons are right. 0200 makes 0 the default (1 / 2 = 0184 / 0187 behaviour). **Safari is a separate
+problem**: still no text and black triangles with vivasurfpitch=0 (example.com, no WebContent crash, no GPU fault in
+the log); WebKit's GPU process is the only user of IOSurface selector 44 (IOSurfaceClientSetOwnershipIdentity,
+harmless). Next: Safari's feature flag "GPU Process: DOM Rendering", vmg errors with VMG_STDERR=auto.
+
+### 0201: link `ps [NAME|PID]` and `kill PID [SIG]` (NOT tested on the phone)
+`ps` alone: one line per process (`PS pid name threads N`) in the log. `ps NAME|PID`: per thread `PS name tN tid T
+state W/R/U/S/T hint H event E upc ulr kbt ...`: block hint (kern/block_hint.h), wait event, user pc/lr and, for a
+blocked thread, the kernel frame-pointer backtrace from the context saved at the switch (kernel collection addresses
+unslid, heap addresses raw; symbolicate against the kernelcache). `kill PID [SIG]` (default 9, not pid 0/1): psignal
+from the kernel, for a stuck vivad (launchd starts it again). Build tree for 0200+: `research/bt0200` (own git).
