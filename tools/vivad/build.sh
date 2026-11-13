@@ -51,3 +51,6 @@ build "$DIR/vbootrec" "$HERE/vbootrec.c"
 # vivausbd (PTP + usbmux of the std USB persona, docs/VIVA-USB-PERSONA.md), next to vivad
 build "$DIR/vivausbd" "$HERE/vivausbd.c"
 file "$DIR/vivausbd"
+# vevents (user events on the phone for `viva-link.py watch`), next to vivad; HID monitor + SpringBoard entitlements
+build "$DIR/vevents" "$HERE/vevents.c"
+codesign -s - -f --entitlements "$HERE/vevents.entitlements" "$DIR/vevents"

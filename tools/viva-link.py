@@ -12,6 +12,14 @@
   viva-link.py pull PATH [LOCAL]       copy a file from the phone
   viva-link.py run PROGRAM [ARGS..]    run it through vivad, print its output, exit with its status
                                        (PROGRAM without '/' is in /private/var/root/viva-tests)
+  viva-link.py watch [-k RE] [--until RE [--count N] [--timeout S]] [--all] [--bare]
+                                       what happens on the phone, one line per event: E (vevents: app, touch,
+                                       key, lock, display, screenshot, crash), S (link state), K (kernel lines
+                                       matching -k, default panics/faults). --until waits for a matching line
+                                       (exit 0; 2 on --timeout): a test waits for the user instead of a "done"
+  viva-link.py serve                   the link server (started by itself when needed, see below)
+  viva-link.py stop                    stop the link server
+  viva-link.py journal                 print the journal directory (everything, with times, one file per day)
   viva-link.py bootrec [hex|show]      edit the VIVABOOT block (next boot's boot-args in userdata, patch 0180)
                                        in $EDITOR (default vim; EDITOR=nano ...): fields and command line, or
                                        with `hex` the raw 4096 bytes; written when saved changed. Needs
@@ -32,6 +40,12 @@ Phone commands: see PHONE_COMMANDS (`help` on the phone has the arguments).
 Interactive keys: Enter sends, Up/Down history (~/.viva-link-history), Tab completes, PgUp/PgDn scroll the
 selected pane (Shift-Tab switches it), End resumes following, Ctrl-F filters the log, F2 layout, F3 maximise,
 Ctrl-C/Ctrl-D quit. Local commands start with ':' (or '/'): :help lists them.
+
+Link server (tools/viva_link_server.py): only one process can claim the USB interface, so every mode talks to
+`viva-link.py serve` over ~/.viva-link/link.sock and starts it in the background when there is none; a server
+older than this code is replaced. Any number of tools (the interface, a watch, one-shot commands, other agents)
+then share the phone, and the server journals everything to ~/.viva-link/journal/YYYY-MM-DD.log. It sends the
+heartbeat only while a client is connected. VIVA_LINK_DIRECT=1: the old direct USB access (no server).
 
 VIVA_LINK_FAKE=1 replaces the phone with a simulator (tools/viva_link_fake.py) for testing without USB.
 
@@ -110,7 +124,9 @@ class Link:
         self.last_beat = 0.0
         self.closing = False
         self.attaches = 0
+        self.connected_at = 0.0
         self.log_bytes = 0
+        self.want_beat = lambda: True       # the link server beats only while it has clients
         self.on_log = self.on_output = None # set by the interface: called by the pump thread with the bytes
         self.log = open(logfile, 'ab') if logfile else None
         self.logfile = logfile
@@ -154,9 +170,11 @@ class Link:
             except (USBError, ValueError):
                 pass
         self.info = '%s, %s speed' % (product, {3: 'high', 2: 'full', 4: 'super'}.get(dev.speed, 'unknown'))
-        self.hello(port)                    # active right away, not at the next beat
+        if self.want_beat():
+            self.hello(port)                # active right away, not at the next beat
         self.port = port
         self.state = 'connected'
+        self.connected_at = time.time()
         self.attaches += 1
         self.note('connected: %s (persona %s, interface %d)' % (self.info, port.persona, port.ifn))
 
@@ -186,7 +204,8 @@ class Link:
     def beat(self):
         """'Viva Link active' heartbeat, every second while attached."""
         while True:
-            self.hello(self.port)
+            if self.want_beat():
+                self.hello(self.port)
             time.sleep(1)
 
     def hello(self, port):
@@ -300,6 +319,8 @@ def fnv1a(data):
 
 
 def push(link, local, path, mode):
+    if getattr(link, 'remote', False):      # the server reads the file and does the transfer
+        return link.file_op('push', local=os.path.abspath(local), path=path, mode=mode)
     data = open(local, 'rb').read()
     h = fnv1a(data)
     reply = link.command('push %d %d %d %s' % (len(data), mode, h, path))
@@ -323,6 +344,8 @@ def push(link, local, path, mode):
 
 
 def pull(link, path, local):
+    if getattr(link, 'remote', False):
+        return link.file_op('pull', path=path, local=os.path.abspath(local))
     with link.lock:
         link.file = bytearray()
     reply = link.command('pull %s' % path, timeout=600)
@@ -336,22 +359,43 @@ def pull(link, path, local):
 
 
 def run(link, args):
+    """Print the program's own "[ID] ..." lines as they come (other jobs, e.g. vevents, are not shown)."""
     with link.lock:
         link.output = bytearray()
+    echo, link.echo_output = link.echo_output, False
+    try:
+        run_lines(link, args)
+    finally:
+        link.echo_output = echo
+
+
+def run_lines(link, args):
     reply = link.command('run ' + ' '.join('"%s"' % a if ' ' in a else a for a in args))
     m = re.search(r'vivad: (\d+) queued', reply)
     if not m:
         sys.exit(reply.strip())
+    tag = b'[%s] ' % m.group(1).encode()
     end = re.compile(rb'\[%s\] (exit|signal) (-?\d+)' % m.group(1).encode())
+    done = 0                                # bytes of link.output already looked at
     while True:
-        link.output_event.wait()
+        link.output_event.wait(1)
         link.output_event.clear()
+        with link.lock:
+            out = bytes(link.output)
+        cut = out.rfind(b'\n') + 1
+        for line in out[done:cut].split(b'\n')[:-1]:
+            if line.startswith(tag):
+                if link.on_output:          # the interface's output pane
+                    link.on_output(line + b'\n')
+                else:
+                    sys.stdout.buffer.write(line + b'\n')
+                    sys.stdout.flush()
+                e = end.match(line)
+                if e:
+                    sys.exit(int(e.group(2)) if e.group(1) == b'exit' else 128 + int(e.group(2)))
+        done = max(done, cut)
         if link.port is None:
             sys.exit('link lost')
-        with link.lock:
-            e = end.search(link.output)
-        if e:
-            sys.exit(int(e.group(2)) if e.group(1) == b'exit' else 128 + int(e.group(2)))
 
 
 def run_capture(link, args):
@@ -486,21 +530,121 @@ def dump(link, pa, size):
     return bytes(out[pa - start:pa - start + size])
 
 
+WATCH_KERNEL = r'panic|Panic|fault|Fault|crash|jetsam|watchdog'   # kernel lines `watch` shows by default
+
+
+def watch(link, a):
+    """Phone events (E), link state (S) and kernel lines (K, filtered) as they happen; --until waits for one."""
+    kernel = re.compile('|'.join(a.kernel) if a.kernel else WATCH_KERNEL)
+    until = re.compile(a.until) if a.until else None
+    lines = threading.local()
+    done = threading.Event()
+    hits = [0]
+    out_lock = threading.Lock()
+
+    def emit(kind, text, t=None, show=True):
+        line = '%s %s' % (kind, text)
+        hit = until is not None and until.search(line)
+        if show or hit:
+            with out_lock:
+                sys.stdout.write('%s %s\n' % (time.strftime('%H:%M:%S', time.localtime(t or time.time())), line)
+                                 if not a.bare else line + '\n')
+                sys.stdout.flush()
+        if hit:
+            hits[0] += 1
+            if hits[0] >= a.count:
+                done.set()
+
+    log_carry = [b'']
+
+    def on_log(data):
+        parts = (log_carry[0] + data).split(b'\n')
+        log_carry[0] = parts.pop()
+        for p in parts:
+            text = p.decode('utf-8', 'replace')
+            emit('K', text, show=a.all or bool(kernel.search(text)))
+
+    out_carry = [b'']
+
+    def on_output(data):
+        parts = (out_carry[0] + data).split(b'\n')
+        out_carry[0] = parts.pop()
+        for p in parts:
+            text = p.decode('utf-8', 'replace')
+            if not re.match(r'^\[\w+\] EV ', text):
+                emit('O', text, show=a.all)
+
+    link.on_log, link.on_output = on_log, on_output
+    link.on_event = lambda m: emit('E', m['d'], m.get('ts'))
+    seen = [None]
+
+    def states():
+        while True:
+            now = (link.state, link.attaches)
+            if now != seen[0]:
+                seen[0] = now
+                emit('S', 'link %s%s' % (link.state, (' persona %s' % link.port.persona) if link.port else ''))
+            time.sleep(0.25)
+    threading.Thread(target=states, daemon=True).start()
+    if not done.wait(a.timeout or None):
+        print('watch: timeout after %d s' % a.timeout, file=sys.stderr)
+        sys.exit(2)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('-o', '--output', help='append the console log to this file')
     ap.add_argument('mode', nargs='?', default='interactive',
-                    choices=('interactive', 'log', 'cmd', 'dump', 'dumpdtb', 'push', 'pull', 'run', 'bootrec'))
+                    choices=('interactive', 'log', 'cmd', 'dump', 'dumpdtb', 'push', 'pull', 'run', 'bootrec',
+                             'watch', 'serve', 'stop', 'journal'))
     ap.add_argument('command', nargs='*')
-    a = ap.parse_args()
+    w = ap.add_argument_group('watch')
+    w.add_argument('-k', '--kernel', action='append', metavar='REGEX',
+                   help='kernel lines to show (repeatable; default: %s)' % WATCH_KERNEL)
+    w.add_argument('--all', action='store_true', help='every kernel line and vivad output line too')
+    w.add_argument('--until', metavar='REGEX', help='exit 0 once a line matches ("E app ...", "K ...", also kernel '
+                   'lines not shown); the matching line is printed')
+    w.add_argument('--count', type=int, default=1, help='with --until: matches needed (default 1)')
+    w.add_argument('--timeout', type=float, default=0, help='with --until: give up after SECONDS (exit 2)')
+    w.add_argument('--bare', action='store_true', help='no time stamps')
+    a = ap.parse_intermixed_args()
 
-    oneshot = a.mode not in ('interactive', 'log')
+    oneshot = a.mode not in ('interactive', 'log', 'watch')
     # A bye after every one-shot command flips the phone's link state (island, charger input limit) at each command
     # of a script; that churn hung SpringBoard (2026-11-07). Without it the kernel drops "active" 4 s after the last
     # heartbeat, so a run of commands is one link session.
     global BYE
-    BYE = not oneshot
-    link = Link(a.output, show_log=not oneshot, reconnect=not oneshot)
+    BYE = a.mode in ('interactive', 'log')
+    import viva_link_server as srv
+    if a.mode == 'serve':
+        BYE = False
+        srv.Server(sys.modules[__name__]).run()
+        return
+    if a.mode == 'stop':
+        BYE = False
+        if not srv.alive():
+            print('no link server running')
+            return
+        link = srv.RemoteLink(os.path.abspath(__file__), 'stop')
+        os.environ['VIVA_LINK_ANY_SERVER'] = '1'
+        link.open()
+        link.request_raw({'op': 'shutdown'})
+        print('link server stopped')
+        return
+    if a.mode == 'journal':
+        print(srv.JOURNAL)
+        return
+    if os.environ.get('VIVA_LINK_DIRECT'):
+        link = Link(a.output, show_log=not oneshot, reconnect=not oneshot)
+    else:
+        link = srv.RemoteLink(os.path.abspath(__file__), '%s %s' % (a.mode, ' '.join(a.command)[:60]),
+                              show_log=not oneshot and a.mode != 'watch', reconnect=not oneshot)
+        if a.output:
+            link.log = open(a.output, 'ab')
+    if a.mode == 'watch':
+        link.connect()
+        watch(link, a)
+        return
     if a.mode == 'interactive':
         try:
             import viva_link_tui
@@ -510,7 +654,8 @@ def main():
             viva_link_tui.run(link, sys.modules[__name__])     # attaches by itself, shows the wait
             return
     link.connect()
-    threading.Thread(target=link.pump, daemon=True).start()
+    if not getattr(link, 'remote', False):
+        threading.Thread(target=link.pump, daemon=True).start()
     if a.mode == 'push':
         if len(a.command) < 2:
             sys.exit('push LOCAL PATH [MODE]')
