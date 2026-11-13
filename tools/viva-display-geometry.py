@@ -7,7 +7,7 @@ From the panel (1080x2400, 69.55 x 154.56 mm) and the camera hole, computes in p
 the island (collapsed pill, SpringBoard's exclusion rect, inter-sensor region, edge insets), the status bar,
 safe areas, home indicator, corner radius, the compatibility (letterbox) windows of third-party apps and the
 kernel/ADT values. --json writes the values the SpringBoard tweak reads (preferences it.viva.display).
-Defaults are estimates (hole from the Redmi Note 10 Pro's cutout): measure and run again.
+Defaults: measured on the phone 2026-11-13 (two photos against a link screenshot, gpu/docs/PIANO-DISPLAY-NATIVO.md 8.3).
 """
 import argparse, json
 
@@ -118,11 +118,11 @@ def report(g):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('--hole-x', type=float, default=540, help='camera hole centre, panel px (default 540, estimate)')
-    ap.add_argument('--hole-y', type=float, default=52, help='camera hole centre, panel px (default 52, estimate)')
-    ap.add_argument('--hole-r', type=float, default=24.5, help='camera hole radius, px (default 24.5, estimate)')
-    ap.add_argument('--corner', type=float, default=90, help='display corner radius, px (default 90, estimate)')
-    ap.add_argument('--measured', action='store_true', help='the hole/corner values were measured on the phone')
+    ap.add_argument('--hole-x', type=float, default=543, help='camera hole centre, panel px (measured 2026-11-13 from photos)')
+    ap.add_argument('--hole-y', type=float, default=50, help='camera hole centre, panel px (measured)')
+    ap.add_argument('--hole-r', type=float, default=20, help='camera hole radius, px (measured 18 visible + 2 margin)')
+    ap.add_argument('--corner', type=float, default=110, help='display corner radius, px (measured 110 +-10)')
+    ap.add_argument('--estimate', dest='measured', action='store_false', help='the hole/corner values are guesses')
     ap.add_argument('--island-top', type=float, default=2.0, help='gap above the island, pt (default 2)')
     ap.add_argument('--island-h', type=float, default=0, help='island height, pt (default: centred on the hole)')
     ap.add_argument('--island-w', type=float, default=0, help='island width, pt (default: Apple proportions)')
