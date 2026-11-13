@@ -572,7 +572,7 @@ def shot(link, a):
                                    'panel %dx%d at %d,%d' % (w, h, ox, oy)))
 
 
-WATCH_KERNEL = r'panic|Panic|fault|Fault|crash|jetsam|watchdog'   # kernel lines `watch` shows by default
+WATCH_KERNEL = r'^(?!PS |SMP ).*(\b[Pp]anic|\b[Ff]ault\b|\b[Cc]rash|\bjetsam|\bwatchdog)'   # kernel lines `watch` shows by default
 
 
 def watch(link, a):
