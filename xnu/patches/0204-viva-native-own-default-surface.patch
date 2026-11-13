@@ -1,0 +1,138 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8f0dcd7..0938e69 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -210,6 +210,7 @@ public:
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	uint32_t      fDotPitch;                /* ppi reported to userland (0203) */
++	SweetSurface *fDefault;                 /* 0204: the default surface handed to userland (fLock) */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+@@ -383,6 +384,7 @@ public:
+ 	void rearm(IOTimerEventSource *timer);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	SweetSurface *defaultSurface(void);
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -441,6 +443,35 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * 0204: in native mode the boot framebuffer has the display's size, and CoreAnimation used the default surface as one
++ * of its pages: it drew into LK's buffer while the panel showed it, so animations flickered with half-drawn frames
++ * (phone, 2026-11-14: swaps of surface 1, "copies" of 2 us). It now gets a contiguous surface of its own, scanned
++ * out like the others once the GPU is done. The iPhone X presentation keeps the boot framebuffer (never a page:
++ * different size). Boot-arg sweetfb_ownsurface=0: old behaviour.
++ */
++SweetSurface *
++AppleCLCD::defaultSurface(void)
++{
++	IOLockLock(fLock);
++	if (fDefault == NULL) {
++		uint32_t own = 1;
++		PE_parse_boot_argn("sweetfb_ownsurface", &own, sizeof(own));
++		if (own && fLogicalW == fWidth && fLogicalH == fHeight) {
++			fDefault = sweet_surface_create_display(fLogicalW, fLogicalH, SWEET_FB_FORMAT_BGRA);
++			IOLog("SWEET FB: default surface %u (own, %s)\n", fDefault ? fDefault->id : 0,
++			    fDefault ? "contiguous" : "no memory: boot framebuffer");
++		}
++		if (fDefault == NULL) {
++			fDefault = fSurface;
++			fDefault->retain();
++		}
++	}
++	SweetSurface *s = fDefault;
++	IOLockUnlock(fLock);
++	return s;
++}
++
+ /*
+  * 0203: sweetfb_native=1 is the one switch for the native 360x800 pt display (gpu/docs/PIANO-DISPLAY-NATIVO.md
+  * section 8): the device tree that userland reads is made to agree with the size AppleCLCD reports, before anything
+@@ -2968,7 +2999,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 
+ 	switch (selector) {
+ 	case kSweetFBGetLayerDefaultSurface:
+-		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
++		out[0] = sweet_surface_port_in_task(fFB->defaultSurface(), fTask);
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBSwapBegin:
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 69d280d..d283ec2 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -336,6 +336,55 @@ sweet_surface_publish(SweetSurface *s)
+ 	return ok;
+ }
+ 
++static IOBufferMemoryDescriptor *sweet_surface_pool_take(uint32_t size, int8_t *slot);
++
++/*
++ * 0204: a display-sized BGRA surface the kernel hands out as AppleCLCD's default surface in native mode: physically
++ * contiguous (pool first, then a fresh range below 4 GiB) so the panel can scan it out, cacheable like any client
++ * surface. NULL when no contiguous memory is left (the caller keeps the boot framebuffer).
++ */
++SweetSurface *
++sweet_surface_create_display(uint32_t width, uint32_t height, uint32_t pixelFormat)
++{
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		return NULL;
++	}
++	s->width = width;
++	s->height = height;
++	s->bytesPerElement = 4;
++	s->elementWidth = s->elementHeight = 1;
++	s->bytesPerRow = (uint32_t)(((uint64_t)width * 4 + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
++	s->pixelFormat = pixelFormat;
++	s->allocSize = (uint32_t)round_page((uint64_t)s->bytesPerRow * height);
++	IOBufferMemoryDescriptor *mem = sweet_surface_pool_take(s->allocSize, &s->poolSlot);
++	if (mem != NULL) {
++		sweet_surface_from_pool++;
++	} else if (sweet_surface_contig + s->allocSize <= SWEET_SURFACE_CONTIG_MAX) {
++		mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut |
++		    kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, s->allocSize, 0x00000000ffffc000ull);
++		if (mem != NULL) {
++			OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_contig);
++			sweet_surface_from_contig++;
++		}
++	}
++	if (mem == NULL) {
++		s->release();
++		return NULL;
++	}
++	OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++	bzero(mem->getBytesNoCopy(), s->allocSize);
++	s->memory = mem;
++	s->contig = true;
++	s->cpuDirty = 1;
++	s->mapCache = kIOMapDefaultCache;
++	if (!sweet_surface_publish(s)) {
++		s->release();
++		return NULL;
++	}
++	return s;
++}
++
+ SweetSurface *
+ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+     uint32_t bytesPerRow, uint32_t pixelFormat)
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 91eb886..0ab9a44 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -82,6 +82,8 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+  */
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
++/* 0204: contiguous display-sized surface (AppleCLCD's default surface in native mode); NULL if no memory. */
++SweetSurface *sweet_surface_create_display(uint32_t width, uint32_t height, uint32_t pixelFormat);
+ 
+ /*
+  * Cache maintenance around device access (see cpuDirty/gpuDirty). Each returns the bytes cleaned (0: nothing
