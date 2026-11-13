@@ -1,0 +1,279 @@
+diff --git a/osfmk/kern/processor.c b/osfmk/kern/processor.c
+--- a/osfmk/kern/processor.c
++++ b/osfmk/kern/processor.c
+@@ -420,10 +420,56 @@
+ }
+ 
+ #endif /* CONFIG_SCHED_EDGE */
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * viva 0194: time each CPU spends running low-priority threads (sched_pri <= viva_lowpri_max: background and
++ * maintenance QoS, MAXPRI_THROTTLE), for the CPU governor (osfmk/arm64/viva_cpufreq.c): work nobody waits for no
++ * longer drives a cluster to its fastest clock (PowerLog's SQLite thread at priority 4 held the A55s at 2 GHz).
++ * Updated on the CPU itself at every processor state change (context switch, idle); read racily by the governor.
++ */
++int viva_lowpri_max = MAXPRI_THROTTLE;
++uint64_t viva_lowpri_time[MAX_SCHED_CPUS];      /* accumulated mach time on low-priority threads */
++uint64_t viva_lowpri_since[MAX_SCHED_CPUS];     /* != 0: running one since then */
++
++static inline void
++viva_lowpri_switch(processor_t processor, bool low)
++{
++	int c = processor->cpu_id;
++	if (c < 0 || c >= MAX_SCHED_CPUS) {
++		return;
++	}
++	uint64_t since = viva_lowpri_since[c];
++	if ((since != 0) == low) {
++		return;
++	}
++	uint64_t now = mach_absolute_time();
++	if (since != 0) {
++		os_atomic_add(&viva_lowpri_time[c], now - since, relaxed);
++	}
++	os_atomic_store(&viva_lowpri_since[c], low ? now : 0, relaxed);
++}
+ 
++/* Low-priority time of CPU c up to now (the running stretch included). */
++uint64_t
++viva_lowpri_time_now(int c)
++{
++	if (c < 0 || c >= MAX_SCHED_CPUS) {
++		return 0;
++	}
++	uint64_t t = os_atomic_load(&viva_lowpri_time[c], relaxed);
++	uint64_t since = os_atomic_load(&viva_lowpri_since[c], relaxed);
++	uint64_t now = mach_absolute_time();
++	return t + (since != 0 && now > since ? now - since : 0);
++}
++#endif
++
+ void
+ processor_state_update_idle(processor_t processor)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	viva_lowpri_switch(processor, false);
++#endif
+ 	processor->current_pri = IDLEPRI;
+ 	processor->current_sfi_class = SFI_CLASS_KERNEL;
+ 	processor->current_recommended_pset_type = PSET_SMP;
+@@ -446,6 +492,9 @@
+ void
+ processor_state_update_from_thread(processor_t processor, thread_t thread, boolean_t pset_lock_held)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	viva_lowpri_switch(processor, !(thread->state & TH_IDLE) && thread->sched_pri <= viva_lowpri_max);
++#endif
+ 	processor->current_pri = thread->sched_pri;
+ 	processor->current_sfi_class = thread->sfi_class;
+ 	processor->current_recommended_pset_type = recommended_pset_type(thread);
+@@ -475,6 +524,9 @@
+ processor_state_update_explicit(processor_t processor, int pri, sfi_class_id_t sfi_class,
+     pset_cluster_type_t pset_type, perfcontrol_class_t perfctl_class, thread_urgency_t urgency, __unused sched_bucket_t bucket)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	viva_lowpri_switch(processor, pri > IDLEPRI && pri <= viva_lowpri_max);
++#endif
+ 	processor->current_pri = pri;
+ 	processor->current_sfi_class = sfi_class;
+ 	processor->current_recommended_pset_type = pset_type;
+diff --git a/osfmk/arm64/viva_cpufreq.c b/osfmk/arm64/viva_cpufreq.c
+--- a/osfmk/arm64/viva_cpufreq.c
++++ b/osfmk/arm64/viva_cpufreq.c
+@@ -79,6 +79,15 @@
+  *   (WFI): CPU_OFF / CPU_SUSPEND power-down needs a CPU offline/resume path this port does not have.
+  * - "cpu" prints time in each OPP (seconds + %), boost / display-off / parked time, per-CPU busy since the last
+  *   "cpu reset", signals per source.
++ *
++ * 0194 low-priority load manager. The scheduler counts per CPU the time on threads at sched_pri <= vivacpubgpri (4 =
++ * MAXPRI_THROTTLE: background and maintenance QoS; osfmk/kern/processor.c viva_lowpri_time_now). The governor's busy
++ * (ceiling jump, target, hot CPUs, parking) is the foreground busy: total minus that time. Low-priority work alone may
++ * still raise a cluster, by the same target rule on the total busy, but never above vivacpubg MHz (1075: LL 1075,
++ * big 1085, Vproc ~750 mV) -- what CLPC does with background work on an iPhone. A boost, a foreground thread or a
++ * priority promotion (a background thread holding a lock a foreground one waits for runs at the waiter's priority)
++ * still gets the full clock. Seen on the phone: PowerLog's archive thread (priority 4) at 92 % of a core held the
++ * A55s at 2 GHz / 1031 mV for hours. vivacpubg=0 = off (total busy, as 0192).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <stdint.h>
+@@ -95,6 +104,8 @@
+ extern int viva_pwrap_read(uint32_t addr, uint32_t *value);                          /* VivaPwrap.cpp */
+ extern int viva_pwrap_write_regulator(uint32_t addr, uint32_t mask, uint32_t value);
+ extern uint64_t sched_viva_fast_cpus;                                                /* kern/sched_prim.c */
++extern int viva_lowpri_max;                                                          /* kern/processor.c (0194) */
++extern uint64_t viva_lowpri_time_now(int c);
+ 
+ #define NOPP 16
+ struct viva_opp {
+@@ -158,7 +169,11 @@
+ static int gLpmIdx[NDOM];       /* Low Power Mode ceiling */
+ static int gThermIdx = 0;       /* thermal ceiling for big and LL (0 = none) */
+ static int gDown[NDOM];
+-static unsigned gBusy[NDOM];    /* last window, per mille, busiest CPU */
++static unsigned gBusy[NDOM];    /* last window, per mille, busiest CPU (0194: foreground only) */
++static unsigned gBusyAll[NDOM]; /* 0194: the same with low-priority threads counted */
++static uint64_t gLow[MAX_SCHED_CPUS];   /* 0194: viva_lowpri_time_now at the last sample */
++static int gBgMhz = 1075;       /* vivacpubg: clock low-priority work alone may ask for (0 = manager off) */
++static uint64_t gBgCapped, gLow0[MAX_SCHED_CPUS];       /* samples where the cap held a cluster lower; "cpu reset" */
+ static uint64_t gIdle[MAX_SCHED_CPUS], gWall[MAX_SCHED_CPUS];
+ static uint64_t gSteps, gVoltWrites, gErrors, gSamples;
+ static uint64_t gTimeAt[NDOM][NOPP];   /* mach ticks spent at each OPP */
+@@ -206,6 +221,7 @@
+ 
+ static inline uint32_t rd(uint64_t pa) { return ml_phys_read_word_64(pa); }
+ static void therm_tick(void);
++static int idx_at_most(int d, int mhz);
+ static inline void wr(uint64_t pa, uint32_t v) { ml_phys_write_word_64(pa, v); }
+ 
+ static unsigned
+@@ -376,11 +392,14 @@
+ 	sched_viva_fast_cpus = m;
+ }
+ 
+-/* Busy per mille of the busiest CPU in [first, last] since the last sample; *hot = CPUs >= 80 %. */
+-static unsigned
+-cluster_busy(int first, int last, unsigned *hot)
++/*
++ * Busy per mille of the busiest CPU in [first, last] since the last sample, without the time on low-priority threads
++ * (0194, unless vivacpubg=0); *all = the same with it; *hot = CPUs >= 80 % (foreground).
++ */
++static unsigned
++cluster_busy(int first, int last, unsigned *hot, unsigned *all)
+ {
+-	unsigned best = 0, n = 0;
++	unsigned best = 0, bestAll = 0, n = 0;
+ 	uint64_t now = mach_absolute_time();
+ 	for (int c = first; c <= last; c++) {
+ 		processor_t p = processor_array[c];
+@@ -390,18 +409,29 @@
+ 		struct recount_usage usage = { 0 };
+ 		uint64_t idle = 0;
+ 		recount_processor_usage(&p->pr_recount, &usage, &idle);
+-		uint64_t dw = now - gWall[c], di = idle - gIdle[c];
++		uint64_t low = viva_lowpri_time_now(c);
++		uint64_t dw = now - gWall[c], di = idle - gIdle[c], dl = low - gLow[c];
+ 		gWall[c] = now;
+ 		gIdle[c] = idle;
++		gLow[c] = low;
+ 		if (dw == 0 || di > dw) {
+ 			continue;
+ 		}
+-		unsigned b = (unsigned)(1000 - di * 1000 / dw);
++		unsigned ba = (unsigned)(1000 - di * 1000 / dw);
++		unsigned b = ba;
++		if (gBgMhz != 0) {
++			uint64_t lp = dl * 1000 / dw;
++			b = lp >= ba ? 0 : ba - (unsigned)lp;
++		}
+ 		best = b > best ? b : best;
++		bestAll = ba > bestAll ? ba : bestAll;
+ 		n += b >= 800;
+ 	}
+ 	if (hot != NULL) {
+ 		*hot = n;
++	}
++	if (all != NULL) {
++		*all = bestAll;
+ 	}
+ 	return best;
+ }
+@@ -426,10 +456,12 @@
+ 	uint64_t now = mach_absolute_time();
+ 	for (int c = LL_FIRST; c <= BIG_LAST; c++) {
+ 		gWall0[c] = now;
++		gLow0[c] = viva_lowpri_time_now(c);
+ 		if (!cpu_idle_now(c, &gIdle0[c])) {
+ 			gWall0[c] = 0;
+ 		}
+ 	}
++	gBgCapped = 0;
+ }
+ 
+ static int
+@@ -513,8 +545,8 @@
+ 		int want[NDOM];
+ 		gSamples++;
+ 		therm_tick();
+-		gBusy[DOM_LL] = cluster_busy(LL_FIRST, LL_LAST, &gHot[DOM_LL]);
+-		gBusy[DOM_BIG] = cluster_busy(BIG_FIRST, BIG_LAST, &gHot[DOM_BIG]);
++		gBusy[DOM_LL] = cluster_busy(LL_FIRST, LL_LAST, &gHot[DOM_LL], &gBusyAll[DOM_LL]);
++		gBusy[DOM_BIG] = cluster_busy(BIG_FIRST, BIG_LAST, &gHot[DOM_BIG], &gBusyAll[DOM_BIG]);
+ 		uint64_t now = mach_absolute_time();
+ 		bool on = gBoost && !gDispOff;
+ 		bool full = on && now < gBoostUntil;
+@@ -532,6 +564,21 @@
+ 		const int *bidx = full ? gBoostIdx : boost ? gBoostSwapIdx : NULL;
+ 		for (int d = DOM_LL; d <= DOM_BIG; d++) {
+ 			int t = gov_target(d, gBusy[d]);
++			if (gBgMhz != 0 && gBusyAll[d] > gBusy[d]) {
++				/* 0194: low-priority work: the target rule on the total, not above vivacpubg */
++				int tb = idx_for_mhz(d, kOpp[d][gIdx[d]].mhz * gBusyAll[d] / (unsigned)gTarget);
++				int cap = idx_at_most(d, gBgMhz);
++				if (tb < cap) {
++					tb = cap;
++					gBgCapped++;
++				}
++				if (tb > gFloor) {
++					tb = gFloor;
++				}
++				if (tb < t) {
++					t = tb;
++				}
++			}
+ 			if (bidx != NULL && t > bidx[d]) {
+ 				t = bidx[d];            /* UI boost: at least this fast (the ceiling below still applies) */
+ 			}
+@@ -569,6 +616,7 @@
+ 		cci = cci > gFloor ? gFloor : cci;
+ 		want[DOM_CCI] = cci < ceiling(DOM_CCI) ? ceiling(DOM_CCI) : cci;
+ 		gBusy[DOM_CCI] = gBusy[DOM_LL] > gBusy[DOM_BIG] ? gBusy[DOM_LL] : gBusy[DOM_BIG];
++		gBusyAll[DOM_CCI] = gBusyAll[DOM_LL] > gBusyAll[DOM_BIG] ? gBusyAll[DOM_LL] : gBusyAll[DOM_BIG];
+ 		if (!apply(want)) {
+ 			gGov = false;
+ 			printf("VIVA CPUFREQ: %s, governor stopped\n", gWhy);
+@@ -607,7 +655,7 @@
+ 	gGov = true;
+ 	memset(gDown, 0, sizeof(gDown));
+ 	memset(gUp, 0, sizeof(gUp));
+-	(void)cluster_busy(LL_FIRST, BIG_LAST, NULL);  /* baseline */
++	(void)cluster_busy(LL_FIRST, BIG_LAST, NULL, NULL);    /* baseline */
+ 	update_fast_map();
+ 	uint64_t deadline;
+ 	clock_interval_to_deadline(16, NSEC_PER_MSEC, &deadline);
+@@ -842,6 +890,8 @@
+ 	{ "skintrip", "vivaskintrip", &gSkinTrip, 0, 60 },
+ 	{ "skinmax", "vivaskinmax", &gSkinMax, 1, NOPP - 1 },
+ 	{ "park", "vivacpupark", &gPark, 0, 1 },
++	{ "bg", "vivacpubg", &gBgMhz, 0, 3000 },               /* 0194 */
++	{ "bgpri", "vivacpubgpri", &viva_lowpri_max, 0, 31 },  /* 0194: up to and including this sched_pri */
+ };
+ #define NTUNE (sizeof(kTune) / sizeof(kTune[0]))
+ 
+@@ -1302,9 +1352,10 @@
+ 		    "%llu updates\n", gSkinDeci / 10, (gSkinDeci % 10 + 10) % 10, gSkinPeak / 10, (gSkinPeak % 10 + 10) % 10,
+ 		    gSkinTrip, gSkinIdx, gSkinMax, gSkinStepsDown, gSkinStepsUp, gSkinUpdates);
+ 		for (int d = 0; d < NDOM; d++) {
+-			SAY("  %-3s %4u MHz (opp %2d, table %4u, boot %4u), ceiling %4u, floor %4u, busy %3u.%u %%\n",
+-			    kDomName[d], pll_mhz(d), gIdx[d], kOpp[d][gIdx[d]].mhz, kOpp[d][gBootIdx[d]].mhz,
+-			    kOpp[d][ceiling(d)].mhz, kOpp[d][gFloor].mhz, gBusy[d] / 10, gBusy[d] % 10);
++			SAY("  %-3s %4u MHz (opp %2d, table %4u, boot %4u), ceiling %4u, floor %4u, busy %3u.%u %% (with low "
++			    "priority %3u.%u %%)\n", kDomName[d], pll_mhz(d), gIdx[d], kOpp[d][gIdx[d]].mhz,
++			    kOpp[d][gBootIdx[d]].mhz, kOpp[d][ceiling(d)].mhz, kOpp[d][gFloor].mhz, gBusy[d] / 10, gBusy[d] % 10,
++			    gBusyAll[d] / 10, gBusyAll[d] % 10);
+ 		}
+ 		uint64_t tot = 0;
+ 		for (int i = 0; i < NOPP; i++) {
+@@ -1350,8 +1401,11 @@
+ 				continue;
+ 			}
+ 			uint64_t pmil = 1000 - (idle - gIdle0[c]) * 1000 / (now - gWall0[c]);
+-			SAY(" %d:%llu.%llu%%", c, pmil / 10, pmil % 10);
++			uint64_t lmil = (viva_lowpri_time_now(c) - gLow0[c]) * 1000 / (now - gWall0[c]);
++			SAY(" %d:%llu.%llu%% (low %llu.%llu%%)", c, pmil / 10, pmil % 10, lmil / 10, lmil % 10);
+ 		}
++		SAY("\n  low priority (0194): sched_pri <= %d, alone up to %d MHz%s; %llu samples held lower by it",
++		    viva_lowpri_max, gBgMhz, gBgMhz ? "" : " (manager off)", gBgCapped);
+ 		SAY("\nusage: cpu [status] | gov on|off | set|max ll|big|cci MHz | fast on|off|boost | boost on|off | "
+ 		    "park on|off | display on|off | tune [key value] | reset\n");
+ 	}

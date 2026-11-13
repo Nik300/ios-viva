@@ -880,3 +880,19 @@ brightness slider reached full at half way and went dark just after (two cycles)
   scanned out it never did, and kernel lines went into LK's buffer. Now muted on the first presented frame.
 Heat seen at the same time (not a kernel fix): `aggregated` (PowerlogCore, SQLite) thread at ~92 % of a core since
 boot, priority 4, so the governor held the LITTLE cluster at 2 GHz (cpu status: ll busy 93 %, peak 81 C).
+
+### 0194: low-priority load manager in the CPU governor (NOT tested on the phone)
+Heat on 0192/0193: PowerLog (`aggregated`) ran one SQLite thread at priority 4 at ~92 % of a core for hours; the
+governor saw a busy A55 and held LL at 2 GHz / CCI at 1.4 GHz (93 % busy, SoC peak 81 C). Root cause of that load:
+on 2026-11-07 PowerLog queued 14414 daily archive jobs (PLStorageOperator_EventPoint_Archive, Stage -1) from 1987 to
+2026, because boots before 0151 (no RTC, calendar at 1970) left rows at 1970-01-01; each job copies and gzips the
+16 MB database (~1.1 s). Not a missing service (the RTC is set before launchd since 0151, no newer 1970 rows); the
+database was reset on the phone (aggregated booted out, BatteryLife/CurrentPowerlog.PLSQL* and Archives deleted,
+bootstrapped again).
+- **Scheduler** (osfmk/kern/processor.c): per CPU, time on threads with sched_pri <= viva_lowpri_max (4,
+  MAXPRI_THROTTLE: background / maintenance QoS), accumulated at every processor state change (context switch, idle).
+- **Governor** (viva_cpufreq.c): busy = foreground busy (total minus that time) for the target, the ceiling jump, hot
+  CPUs and parking. Low-priority work alone still raises a cluster by the same rule on the total busy, at most to
+  `vivacpubg` MHz (1075; 0 = off, 0192 behaviour). A boost, foreground threads and promoted threads get the full
+  clock. Tune keys `bg`, `bgpri`; `cpu status` shows busy with/without low priority, low % per CPU since reset and
+  the samples the cap held lower.
