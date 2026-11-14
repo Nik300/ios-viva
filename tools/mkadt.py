@@ -48,6 +48,51 @@ CANVAS = [1125, 2436]
 # last 32MB boundary below dramc-rk1. Addresses from the viva DTB and the
 # on-device probe (README of ios-viva).
 VIVA_PHYS_BASE, VIVA_MEM_SIZE = 0xc0000000, 0x1be000000 - 0xc0000000
+# xnu 0209: the low bank 0x40000000-0xc0000000 between LK's fixed reservations (dtb/viva-live.dts /reserved-memory
+# mblock-*: TEE, ATF, GenieZone, modem, SCP/SSPM/ADSP, pstore, framebuffer, logs; no-map or not, all kept). The
+# kernel maps and frees only the pieces in /chosen "viva-lowmem"; the dynamic Linux pools (CMA, *-share) are not
+# used under iOS. Pieces shrink inward to VIVA_LOWMEM_ALIGN and smaller ones are dropped.
+VIVA_LOW_BANK = (0x40000000, 0xc0000000)
+VIVA_RESERVED = [
+    (0x4ce00000, 0x200000),     # atf-reserved
+    (0x4d000000, 0x10000),      # aee_debug_kinfo
+    (0x4d010000, 0xe0000),      # pstore
+    (0x4d0f0000, 0x10000),      # minirdump
+    (0x56000000, 0x720000),     # adsp
+    (0x5ff00000, 0x80000),      # PICACHU
+    (0x6e000000, 0x16a0000),    # ap_md_c_smem
+    (0x70000000, 0x6800000),    # tee-reserved
+    (0x77ff0000, 0x10000),      # SPM-reserved
+    (0x78000000, 0x700000),     # ap_md_nc_smem
+    (0x7bc10000, 0x1df0000),    # framebuffer (LK's, scanned out)
+    (0x7da00000, 0xc00000),     # tee_ree_reserved
+    (0x7e600000, 0x400000),     # tee-secmem
+    (0x7ea00000, 0x41000),      # gz-log
+    (0x7eac0000, 0x100000),     # SSPM-reserved
+    (0x7ebc0000, 0x40000),      # log_store
+    (0x7ec00000, 0x1400000),    # gz
+    (0x9fc00000, 0x300000),     # SCP-reserved
+    (0xae000000, 0x10000000),   # md_mem_usage (modem)
+    (0xbfc00000, 0x20000),      # tee-log-reserved
+    (0xbfe00000, 0x40000),      # atf-log-reserved
+    (0xbff60000, 0x10000),      # ccci_tag_mem
+    (0xbff70000, 0x80000),      # atf-ramdump-reserved
+    (0xbffff000, 0x1000),       # dramc-rk0
+]
+VIVA_LOWMEM_ALIGN = 0x100000    # 1 MiB clear of every reservation (16 KiB pages would do)
+VIVA_LOWMEM_MIN = 0x800000      # pieces under 8 MiB are not worth a physmap entry
+
+
+def viva_lowmem():
+    """Free <base, size> pieces of the viva low bank, sorted, for /chosen viva-lowmem."""
+    pieces, cur = [], VIVA_LOW_BANK[0]
+    for base, size in sorted(VIVA_RESERVED) + [(VIVA_LOW_BANK[1], 0)]:
+        lo = (cur + VIVA_LOWMEM_ALIGN - 1) & ~(VIVA_LOWMEM_ALIGN - 1)
+        hi = base & ~(VIVA_LOWMEM_ALIGN - 1)
+        if hi - lo >= VIVA_LOWMEM_MIN:
+            pieces.append((lo, hi - lo))
+        cur = max(cur, base + size)
+    return pieces
 VIVA_GICD, VIVA_GICD_SIZE = 0x0c000000, 0x40000
 VIVA_GICR, VIVA_GICR_SIZE = 0x0c040000, 0x200000
 VIVA_FB, VIVA_FB_STRIDE = 0x7bc10000, 1088 * 4
@@ -275,6 +320,7 @@ def build(seed=None, qemu=False, highmem=False, viva=False, viva_ufs=False):
         ph(),
         ('dram-base', u64(phys_base)),
         ('dram-size', u64(mem_size)),
+    ] + ([('viva-lowmem', b''.join(u64(b, s) for b, s in viva_lowmem()))] if viva else []) + [
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
         ('embedded-panic-log-size', u32(PANIC_LOG_SIZE)),
