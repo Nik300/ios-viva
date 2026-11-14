@@ -1,0 +1,70 @@
+diff --git a/iokit/Kernel/IOBufferMemoryDescriptor.cpp b/iokit/Kernel/IOBufferMemoryDescriptor.cpp
+index fd09db9..2456769 100644
+--- a/iokit/Kernel/IOBufferMemoryDescriptor.cpp
++++ b/iokit/Kernel/IOBufferMemoryDescriptor.cpp
+@@ -33,6 +33,7 @@
+ #include <IOKit/system.h>
+ 
+ #include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
+ #include <IOKit/IOMapper.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <libkern/OSDebug.h>
+@@ -172,6 +173,46 @@ IOBufferMemoryDescriptor::withCopy(
+ }
+ 
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0207: who allocates the wired IOBufferMemoryDescriptors that pile up on viva (2026-11-14: ~368 buffers of ~420 KiB
++ * each time an app comes to the front, tag "iokit", IOMemoryMap count in step). Boot-arg viviobmdtrace=KIB: every
++ * buffer of at least KIB KiB prints its size, task, process and a frame-pointer backtrace (unslid, symbolicate with
++ * the kernel); the first 600. 0 (default): off.
++ */
++extern "C" void proc_selfname(char *buf, int size);
++
++static void
++viva_iobmd_trace(task_t inTask, IOOptionBits options, mach_vm_size_t capacity)
++{
++	static int32_t kib = -1;
++	static volatile SInt32 printed;
++	if (kib < 0) {
++		uint32_t v = 0;
++		PE_parse_boot_argn("viviobmdtrace", &v, sizeof(v));
++		kib = (int32_t)v;
++	}
++	if (kib == 0 || capacity < ((mach_vm_size_t)kib << 10) || OSIncrementAtomic(&printed) >= 600) {
++		return;
++	}
++	char name[20];
++	proc_selfname(name, sizeof(name));
++	char line[256];
++	int n = snprintf(line, sizeof(line), "IOBMD %llu KiB %s task %s opts 0x%x bt", capacity >> 10, name,
++	    inTask == kernel_task ? "kernel" : "user", options);
++	uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
++	for (int f = 0; f < 8 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; f++) {
++		uintptr_t *frame = (uintptr_t *)fp;
++		n += snprintf(line + n, sizeof(line) - n, " 0x%lx", (unsigned long)VM_KERNEL_UNSLIDE(frame[1]));
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++	printf("%s\n", line);
++}
++#endif
++
+ bool
+ IOBufferMemoryDescriptor::initWithPhysicalMask(
+ 	task_t            inTask,
+@@ -193,6 +234,10 @@ IOBufferMemoryDescriptor::initWithPhysicalMask(
+ 		return false;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	viva_iobmd_trace(inTask, options, capacity);
++#endif
++
+ 	/*
+ 	 * The IOKit constructor requests the allocator for zeroed memory
+ 	 * so the members of the class do not need to be explicitly zeroed.

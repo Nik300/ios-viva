@@ -56,3 +56,7 @@ build "$DIR/vevents" "$HERE/vevents.c"
 codesign -s - -f --entitlements "$HERE/vevents.entitlements" "$DIR/vevents"
 # vnotify (post Darwin notifications: notifyutil is missing), next to vivad
 build "$DIR/vnotify" "$HERE/vnotify.c"
+# vmem (wired memory by VM tag / allocation site, mach_memory_info), next to vivad
+build "$DIR/vmem" "$HERE/vmem.c"
+# vclass (IOKit live object counts per class, IOKitDiagnostics), next to vivad
+build "$DIR/vclass" "$HERE/vclass.c"
