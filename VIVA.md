@@ -998,3 +998,8 @@ from the kernel, for a stuck vivad (launchd starts it again). Build tree for 020
   /var/jb/usr/lib/VivaUIKit.off or delete the dylib.
 - Phone: boot without the dylib fine (apps start, insert failure ignored); with it Safari's keyboard is 360 pt wide at
   x 0, all ten keys and return visible.
+- VivaDisplay (same day): home screen / dock / folders / App Library laid out for SBH screen type 3 (iPhone X) through
+  +[SBHDefaultIconListLayoutProvider currentDeviceScreenType] (was 4, "X zoomed": small icons, rows far apart;
+  preference HomeScreenType); the keyboard fix also inside SpringBoard (App Library search: SpringBoard is not
+  injected). Phone: 60 pt icons, X spacing; App Library keyboard 360 pt at x 0. Spotlight and Sileo keyboards fine
+  through VivaUIKit.dylib (user).
