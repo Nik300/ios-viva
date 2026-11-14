@@ -1,0 +1,207 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index 30ed2e4..f6ff29e 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -260,6 +260,7 @@ extern void viva_disp_link(const char *args, char *out, size_t outLen);      /*
+ extern int sweet_console_muted;                                             /* osfmk/console/serial_console.c */
+ extern void sweet_ps(const char *arg, char *out, size_t len);                /* bsd/dev/sweet_sample.c (0201) */
+ extern void sweet_kill(const char *arg, char *out, size_t len);
++extern void sweet_surface_report(const char *arg, char *out, size_t len);     /* iokit/Kernel/arm/SweetSurface.cpp (0206) */
+ 
+ extern void viva_battery_usb_changed(void);                                  /* VivaBattery.cpp: poll now */
+ 
+@@ -1754,6 +1755,13 @@ vl_command(void)
+ 			vl_reply("vivad: not running (no reader on /dev/vivalink%s) or nothing to send\n",
+ 			    vd_node ? "" : ", not created yet");
+ 		}
++	} else if (IS("surf")) {
++		char out[200];
++		while (*rest == ' ') {
++			rest++;
++		}
++		sweet_surface_report(rest, out, sizeof(out));
++		vl_reply("%s", out);
+ 	} else if (IS("ps") || IS("kill")) {
+ 		char out[160];
+ 		(IS("ps") ? sweet_ps : sweet_kill)(rest, out, sizeof(out));
+@@ -1785,7 +1793,7 @@ vl_command(void)
+ 			delay(5000);
+ 		}
+ 	} else if (IS("help")) {
+-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | surf [all] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+ 	} else {
+ 		vl_reply("unknown command: %s (try help)\n", c);
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index d283ec2..845a017 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -66,6 +66,7 @@ enum {
+ 	kSweetSurfaceSetBulk            = 27,
+ 	kSweetSurfaceLookupFromPort     = 34,
+ 	kSweetSurfaceCreatePort         = 35,
++	kSweetSurfaceSetPurgeable       = 20,   /* 0206: [id, state] -> [old state] (IOSurfaceClientSetPurgeable) */
+ };
+ 
+ enum {
+@@ -101,6 +102,7 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
++static volatile SInt32 sweet_surface_live;       /* 0206: SweetSurface objects alive (in the table or not) */
+ uint32_t             sweet_surface_scanout_w, sweet_surface_scanout_h;
+ static uint64_t      sweet_surface_contig;      /* bytes of contiguous (scanout) surfaces */
+ #define SWEET_SURFACE_CONTIG_MAX        (96ull << 20)
+@@ -126,6 +128,7 @@ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ void
+ SweetSurface::free()
+ {
++	OSDecrementAtomic(&sweet_surface_live);
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+@@ -315,6 +318,7 @@ sweet_surface_alloc(void)
+ 		OSSafeReleaseNULL(s);
+ 		return NULL;
+ 	}
++	OSIncrementAtomic(&sweet_surface_live);
+ 	s->poolSlot = -1;
+ 	s->state = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
+@@ -1024,6 +1028,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			}
+ 		}
+ 	}
++	proc_selfname(s->creator, sizeof(s->creator));
++	s->created = mach_absolute_time();
+ 	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+@@ -1256,6 +1262,25 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	}
+ 	case kSweetSurfaceCreate:
+ 		return create(args);
++	case kSweetSurfaceSetPurgeable: {
++		/* 0206: remember the state; contents are never discarded (all surface memory is wired), so the old state is
++		 * never "empty" (2). kIOSurfacePurgeableKeepCurrent (3) only reads it. */
++		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
++		uint64_t state = args->scalarInputCount > 1 ? args->scalarInput[1] : 3;
++		if (s == NULL) {
++			return kIOReturnNotFound;
++		}
++		uint8_t old = s->purgeable;
++		if (state <= 1) {
++			s->purgeable = (uint8_t)state;
++		}
++		s->release();
++		if (args->scalarOutputCount > 0) {
++			args->scalarOutput[0] = old;
++			args->scalarOutputCount = 1;
++		}
++		return kIOReturnSuccess;
++	}
+ 	case kSweetSurfaceSetValue:
+ 	case kSweetSurfaceCopyValues:
+ 	case kSweetSurfaceRemoveValue:
+@@ -1437,4 +1462,74 @@ IOSurfaceRootUserClient::getTargetAndTrapForIndex(IOService **targetP, UInt32 in
+ 	*targetP = this;
+ 	return &sweet_surface_traps[index];
+ }
++
++/*
++ * 0206: where does the wired memory go (phone freezes at ~200k wired pages, 2026-11-07/13/14)? Every live surface,
++ * grouped by the process that created it: count, bytes, bytes marked volatile (purgeable, never discarded here),
++ * bytes with no user client holding them (only kernel references: GPU fences, the display, leaks). `surf all` also
++ * lists each surface of 1 MiB or more. Lines "SURF ..." go to the log; the reply has the totals.
++ */
++extern "C" void
++sweet_surface_report(const char *arg, char *out, size_t len)
++{
++	struct agg {
++		char     name[20];
++		uint32_t count, orphans;
++		uint64_t bytes, volatileBytes, orphanBytes;
++	};
++	const uint32_t maxAgg = 48;
++	struct agg *a = (struct agg *)IOMallocZeroData(sizeof(struct agg) * maxAgg);
++	if (a == NULL) {
++		snprintf(out, len, "surf: no memory\n");
++		return;
++	}
++	bool all = arg != NULL && strncmp(arg, "all", 3) == 0;
++	uint32_t naggs = 0, total = 0;
++	uint64_t bytes = 0, vol = 0, orphan = 0, now = mach_absolute_time(), ns;
++	sweet_surface_init_lock();
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID; id++) {
++		SweetSurface *s = sweet_surface_table[id];
++		if (s == NULL) {
++			continue;
++		}
++		const char *name = s->creator[0] ? s->creator : "(kernel)";
++		uint32_t i;
++		for (i = 0; i < naggs && strncmp(a[i].name, name, sizeof(a[i].name)) != 0; i++) {
++		}
++		if (i == naggs && naggs < maxAgg) {
++			strlcpy(a[naggs++].name, name, sizeof(a[0].name));
++		}
++		bool noUsers = sweet_surface_users[id] == 0;
++		if (i < naggs) {
++			a[i].count++;
++			a[i].bytes += s->allocSize;
++			a[i].volatileBytes += s->purgeable == 1 ? s->allocSize : 0;
++			a[i].orphans += noUsers;
++			a[i].orphanBytes += noUsers ? s->allocSize : 0;
++		}
++		total++;
++		bytes += s->allocSize;
++		vol += s->purgeable == 1 ? s->allocSize : 0;
++		orphan += noUsers ? s->allocSize : 0;
++		if (all && s->allocSize >= (1u << 20)) {
++			absolutetime_to_nanoseconds(now - s->created, &ns);
++			printf("SURF %u %ux%u fmt 0x%x %u KiB users %u retain %d purg %u age %llu s %s%s\n", id, s->width,
++			    s->height, s->pixelFormat, s->allocSize >> 10, sweet_surface_users[id], s->getRetainCount(),
++			    s->purgeable, ns / 1000000000ull, name, s->contig ? " contig" : "");
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	for (uint32_t i = 0; i < naggs; i++) {
++		printf("SURF by %-20s %4u surfaces %7llu KiB, volatile %7llu KiB\n", a[i].name, a[i].count,
++		    a[i].bytes >> 10, a[i].volatileBytes >> 10);
++	}
++	/* surfaces left the table when their last client let go; a kernel reference (display, GPU fence, mapping)
++	 * keeps one alive: live - in table objects, wired counter - table bytes */
++	snprintf(out, len, "surf: %u in table, %llu MiB, volatile %llu MiB; %d objects alive; buffer memory %llu MiB "
++	    "(%lld MiB outside the table); \"SURF\" lines in the log\n", total, bytes >> 20, vol >> 20,
++	    (int)sweet_surface_live, sweet_surface_wired >> 20, ((long long)sweet_surface_wired - (long long)bytes) >> 20);
++	(void)orphan;
++	IOFreeData(a, sizeof(struct agg) * maxAgg);
++}
+ #endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 0ab9a44..53b2524 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -65,6 +65,11 @@ public:
+ 	 */
+ 	OSObject                 *gpuPrev;
+ 
++	/* 0206: who made it, when, and the client's purgeable state (IOSurfaceSetPurgeable, kept but never acted on) */
++	char                      creator[20];
++	uint64_t                  created;
++	uint8_t                   purgeable;
++
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+@@ -85,6 +90,9 @@ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+ /* 0204: contiguous display-sized surface (AppleCLCD's default surface in native mode); NULL if no memory. */
+ SweetSurface *sweet_surface_create_display(uint32_t width, uint32_t height, uint32_t pixelFormat);
+ 
++/* 0206: link command `surf [all]`: live surfaces by creating process (log lines "SURF ..."), summary in out. */
++extern "C" void sweet_surface_report(const char *arg, char *out, size_t len);
++
+ /*
+  * Cache maintenance around device access (see cpuDirty/gpuDirty). Each returns the bytes cleaned (0: nothing
+  * to do or not a cacheable surface).
