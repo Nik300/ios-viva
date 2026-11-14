@@ -1003,3 +1003,10 @@ from the kernel, for a stuck vivad (launchd starts it again). Build tree for 020
   preference HomeScreenType); the keyboard fix also inside SpringBoard (App Library search: SpringBoard is not
   injected). Phone: 60 pt icons, X spacing; App Library keyboard 360 pt at x 0. Spotlight and Sileo keyboards fine
   through VivaUIKit.dylib (user).
+- Home grid nearer the island (VivaDisplay HomeTopShift 16 pt: the root lists' portrait top inset; first row at ~73 pt,
+  was 90). The clipped "Viva Link · USB" title was VivaIsland's own overlay notice: its 72 pt pill centred the text
+  across the system island (drawn above the overlay); the content now goes below the island and the pill grows to
+  island height + 52 pt. VivaDisplay's ExpandedTopExtra (system expanded insets) stays 0 (untested).
+- Freeze 01:48 (user forced a restart): again the wired-memory exhaustion (wired ~197k pages, 112 failed 10 MB
+  vm_page_find_contiguous) after ~15 min with many SpringBoard restarts, screenshots and an app reinstall (uicache).
+  Open: find what keeps that memory wired (IOSurfaces of killed SpringBoards? display pages?).
