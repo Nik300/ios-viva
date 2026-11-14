@@ -984,3 +984,17 @@ from the kernel, for a stuck vivad (launchd starts it again). Build tree for 020
 - Status bar avoidance 150 pt (`it.viva.display` StatusBarAvoidWidth): time centred at ~58 pt (was 70).
 - Open: expanded island title clipped at the top (Apple's content insets assume 11.33 pt), Control Center laid out for
   375 pt (modules left, ~56 pt free on the right), home screen grid of SBH type 4.
+
+### 0205: dyld policy + VivaUIKit injection; keyboard fixed (2026-11-14, `out/xnu-ufs-rw-0205-native.img`)
+- The keyboard on the 360 pt screen was 20 pt to the right (keys of the 320 layout stretched to 360 inside a 320 pt view
+  centred by UIInputSetHostView): UIKit derives the keyboard view's width only for six exact reference sizes
+  (_UIKeyboardGetDerivedKeyboardForSpecificOrientation: 320x693, 360x780, 390x844, 393x852, 428x926, 430x932). Analysis:
+  gpu/docs/PIANO-DISPLAY-NATIVO.md section 9. Needs code in every app.
+- 0205: MAC policy "AMFI" answers dyld (op 90, flags 0x6b: path variables, missing inserted library not fatal,
+  interposing; `vivadyldpolicy`); exec_extract_strings adds DYLD_INSERT_LIBRARIES=/var/jb/usr/lib/VivaUIKit.dylib to
+  executables inside an .app (not SpringBoard; `VIVA INJECT:` lines, the first 32). `vivainject=0`: neither.
+- `gpu/app/tweak/VivaUIKit.m` (Viva Manager CI, installed by app/install.sh): Foundation + IOKit only; in native mode
+  hooks -[UIKBScreenTraits keyboardScreenReferenceSize] 360x800 -> 360x780 once UIKitCore is loaded. Off:
+  /var/jb/usr/lib/VivaUIKit.off or delete the dylib.
+- Phone: boot without the dylib fine (apps start, insert failure ignored); with it Safari's keyboard is 360 pt wide at
+  x 0, all ten keys and return visible.
