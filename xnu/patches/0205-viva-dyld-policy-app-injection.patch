@@ -1,0 +1,180 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..dfbb18b 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5541,6 +5541,46 @@ bad:
+ }
+ 
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0205: global injection for viva's display fixes inside apps (gpu/docs/PIANO-DISPLAY-NATIVO.md section 9; the first
++ * one is the keyboard, laid out 20 pt off on the 360 pt screen). Executables inside an .app bundle (apps, their
++ * extensions, CoreServices apps such as Spotlight; not SpringBoard, which loads VivaIsland.dylib, nor daemons) get
++ * DYLD_INSERT_LIBRARIES=VivaUIKit.dylib unless they already have one; dyld honours it through the "AMFI" policy
++ * (bsd/kern/sweet_amfi.c), and a missing dylib is not fatal: deleting the file turns it off. Boot-arg vivainject=0: off.
++ */
++static const char viva_inject_env[] = "DYLD_INSERT_LIBRARIES=/var/jb/usr/lib/VivaUIKit.dylib";
++
++static bool
++viva_inject_wanted(struct image_params *imgp)
++{
++	static int inject = -1;
++	static uint32_t logged;
++	if (inject < 0) {
++		uint32_t v = 1;
++		PE_parse_boot_argn("vivainject", &v, sizeof(v));
++		inject = v != 0;
++	}
++	if (!inject || imgp->ip_vp == NULLVP) {
++		return false;
++	}
++	char *path = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	int len = MAXPATHLEN;
++	bool want = false;
++	if (path != NULL && vn_getpath(imgp->ip_vp, path, &len) == 0) {
++		want = strnstr(path, ".app/", MAXPATHLEN) != NULL && strnstr(path, "/SpringBoard.app/", MAXPATHLEN) == NULL;
++		if (want && logged < 32) {
++			logged++;
++			printf("VIVA INJECT: %s\n", path);
++		}
++	}
++	if (path != NULL) {
++		kfree_data(path, MAXPATHLEN);
++	}
++	return want;
++}
++#endif
++
+ /*
+  * exec_extract_strings
+  *
+@@ -5714,6 +5754,9 @@ exec_extract_strings(struct image_params *imgp)
+ 	imgp->ip_envc = 0;
+ 
+ 	/* Now, get the environment */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	bool viva_has_insert = false;
++#endif
+ 	while (envv != 0LL) {
+ 		user_addr_t     env;
+ 
+@@ -5729,10 +5772,18 @@ exec_extract_strings(struct image_params *imgp)
+ 		/*
+ 		 * av[n...] = env[n]
+ 		 */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		char *viva_start = imgp->ip_strendp;
++#endif
+ 		error = exec_add_user_string(imgp, env, imgp->ip_seg, TRUE);
+ 		if (error) {
+ 			goto bad;
+ 		}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (strncmp(viva_start, "DYLD_INSERT_LIBRARIES=", 22) == 0) {
++			viva_has_insert = true;
++		}
++#endif
+ 		if (imgp->ip_argspace < new_ptr_size) {
+ 			error = E2BIG;
+ 			goto bad;
+@@ -5741,6 +5792,22 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* 0205: VivaUIKit.dylib into every app (see viva_inject_wanted) */
++	if (!viva_has_insert && viva_inject_wanted(imgp)) {
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(viva_inject_env), UIO_SYSSPACE, TRUE);
++		if (error) {
++			goto bad;
++		}
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4d..4179129 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -32,6 +32,7 @@
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+ #include <sys/systm.h>
++#include <pexpert/pexpert.h>
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
+@@ -367,6 +368,50 @@ static struct mac_policy_conf sweet_amfi_mac_conf = {
+ 
+ static mac_policy_handle_t sweet_amfi_mac_handle;
+ 
++/*
++ * 0205: policy "AMFI" for dyld (gpu/docs/PIANO-DISPLAY-NATIVO.md section 9). dyld asks
++ * __mac_syscall("AMFI", 90, {u64 input flags, u64 *output flags}) (amfi_check_dyld_policy_self) which DYLD_* variables
++ * it may honour; without the policy every process was restricted, so no library could be inserted. Answer: @path
++ * loads, path variables (DYLD_INSERT_LIBRARIES), fallback paths, a missing inserted library is not fatal, interposing
++ * (boot-arg vivadyldpolicy=FLAGS overrides 0x6b). Every other AMFI operation keeps failing as without the policy
++ * (ENOPOLICY). Boot-arg vivainject=0: no "AMFI" policy and no injection (bsd/kern/kern_exec.c), as before 0205.
++ */
++#define SWEET_AMFI_DYLD_POLICY_SELF     90
++static uint64_t sweet_amfi_dyld_flags = 0x6b;
++static uint32_t sweet_amfi_dyld_calls;
++
++static int
++sweet_amfi_dyld_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	if (call != SWEET_AMFI_DYLD_POLICY_SELF) {
++		return ENOPOLICY;
++	}
++	struct {
++		uint64_t   in;
++		user_addr_t out;
++	} a;
++	int error = copyin(arg, &a, sizeof(a));
++	if (error == 0) {
++		error = copyout(&sweet_amfi_dyld_flags, a.out, sizeof(sweet_amfi_dyld_flags));
++	}
++	if (sweet_amfi_dyld_calls++ < 4) {
++		printf("SWEET AMFI: dyld policy 0x%llx -> 0x%llx (%d)\n", a.in, sweet_amfi_dyld_flags, error);
++	}
++	return error;
++}
++
++static const struct mac_policy_ops sweet_amfi_dyld_mac_ops = {
++	.mpo_policy_syscall = sweet_amfi_dyld_syscall,
++};
++
++static struct mac_policy_conf sweet_amfi_dyld_mac_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "SWEET dyld policy stand-in",
++	.mpc_ops = &sweet_amfi_dyld_mac_ops,
++};
++
++static mac_policy_handle_t sweet_amfi_dyld_mac_handle;
++
+ /* Called from bsd_init once MAC policies can register, before any exec. */
+ void sweet_amfi_policy_register(void);
+ 
+@@ -379,5 +424,13 @@ sweet_amfi_policy_register(void)
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	uint32_t inject = 1;
++	PE_parse_boot_argn("vivainject", &inject, sizeof(inject));
++	PE_parse_boot_argn("vivadyldpolicy", &sweet_amfi_dyld_flags, sizeof(sweet_amfi_dyld_flags));
++	if (inject) {
++		error = mac_policy_register(&sweet_amfi_dyld_mac_conf, &sweet_amfi_dyld_mac_handle, NULL);
++		printf("SWEET AMFI: dyld policy %s (%d), flags 0x%llx\n", error ? "NOT registered" : "registered", error,
++		    sweet_amfi_dyld_flags);
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
