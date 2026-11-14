@@ -1014,3 +1014,16 @@ from the kernel, for a stuck vivad (launchd starts it again). Build tree for 020
   (66 pt modules, 8 pt gutters, a 320 pt grid at x 0). VivaDisplay (hooks installed once ControlCenterUI loads):
   CCUILayoutOptions itemSpacing 14 (CCItemSpacing), symmetric portrait margins for CCUILayoutView, CCUIStatusBar
   expanded insets, status labels and sensor attribution. Phone: grid 27..333 pt, status strip aligned with it.
+- App Library (user: it moved around and the swipe back home did not work): with SBH type 3 its pod list was 375 pt
+  wide at x -8 on the 360 pt screen. VivaDisplay builds the App Library's lists (SBIconLocationAppLibrary*) and every
+  layout's appLibraryVisualConfiguration with a second SBHDefaultIconListLayoutProvider of the device's own type:
+  pod list 320 pt at x 20, swipe back home works (phone).
+
+### Wired memory (2026-11-14, measurements on 0205-native, 10 min after boot)
+vm.page_wire_count 101,631 pages (16 KiB) at rest (the 2026-11-07 boots started near 53k; freezes near 200k).
+kern.zone_wired_pages 6,139, GPU BOs ~148 MB. 5 screenshots: +0. Settings opened and closed once: +8,586 pages
+(134 MB); three more times: +6,312 (~2k pages = 3 display-sized surfaces per cycle). iOS marks app snapshots and
+CoreAnimation backing stores purgeable (IOSurfaceClientSetPurgeable = IOSurface selector 20, `sel 20` was logged as
+unimplemented): here all surface memory is wired and never discarded. **0206** (NOT tested): link `surf [all]`
+lists live surfaces by creator, volatile bytes, objects alive and memory held outside the surface table, to find who
+keeps it before changing the allocation (pageable/purgeable surfaces would be the real fix).
