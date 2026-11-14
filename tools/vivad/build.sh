@@ -54,3 +54,5 @@ file "$DIR/vivausbd"
 # vevents (user events on the phone for `viva-link.py watch`), next to vivad; HID monitor + SpringBoard entitlements
 build "$DIR/vevents" "$HERE/vevents.c"
 codesign -s - -f --entitlements "$HERE/vevents.entitlements" "$DIR/vevents"
+# vnotify (post Darwin notifications: notifyutil is missing), next to vivad
+build "$DIR/vnotify" "$HERE/vnotify.c"
