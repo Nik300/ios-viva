@@ -1067,7 +1067,7 @@ This patch only gives the Mac side a powered block and DMA memory:
 - Also: `viva-link.py run` of a missing program now exits 127 ("cannot start" ends the run) instead of hanging.
 - Boot image: out/xnu-ufs-rw-0208-native-iobmd.img (0207 + 0208 + 0210, the native-display VIVA_EXTRA).
 
-### 0209: RAM between the SoC carve-outs (2026-11-14, NOT tested yet)
+### 0209: RAM between the SoC carve-outs (2026-11-14, works on the phone)
 - Before: XNU managed only 0xc0000000-0x1be000000 (hw.memsize 4,260,364,288 of 6 GiB). The low bank
   0x40000000-0xc0000000 holds all of LK's fixed reservations (dtb/viva-live.dts mblock-*: 472 MiB of TEE, ATF,
   GenieZone, modem md_mem_usage 256 MiB, SCP/SSPM/ADSP, pstore, LK framebuffer, logs) and was left out entirely.
@@ -1082,5 +1082,12 @@ This patch only gives the Mac side a powered block and DMA memory:
   VM_WIMG_IO in pp_attr_table (LK framebuffer mappings stay uncached), pmap_object offsets from vm_first_phys.
   caches_asm.s invalidate_icache(phys) goes through phystokv.
 - Not used for physically contiguous allocations (vm_page_find_contiguous scans only the vm_pages array); all of
-  it is below 4 GiB. Boot-arg `vivalowmem=0`: off. Images: out/xnu-ufs-rw-0209-lowmem-B.img (with 0210/0211 and
-  vivavdecpool=64), fallback out/xnu-ufs-rw-0211-vdec-A.img (same kernel, CI 43573274272, with vivalowmem=0).
+  it is below 4 GiB. Boot-arg `vivalowmem=0`: off.
+- First try panicked in arm_vm_init (ptov end > physmap_end): SWEET is ARM_LARGE_MEMORY (physmap aperture of its own
+  below VM_MIN_KERNEL_ADDRESS), so physmap_l1_entries/physmap_end must include the pieces, and ml_static_mfree
+  silently skips VAs below VM_MIN_KERNEL_ADDRESS: the pieces are freed with vm_page_create (wire counts adjusted).
+- Phone (CI 43574824148, out/xnu-ufs-rw-0209-lowmem-B2.img with 0210/0211 and vivavdecpool=64): hw.memsize
+  4,260,364,288 -> 5,906,628,608; vm.pages 256,497 -> 356,888; "VIVA LOWMEM: 10 pieces, 1570 MiB below 0xc0000000";
+  3 Settings cycles stable, no panic; WiFi EMI/DMA and the VDEC pool still at 0xcc000000+.
+  Fallback out/xnu-ufs-rw-0211-vdec-A.img: same kernel with vivalowmem=0.
+- Left: the 32 MiB at 0x1be000000-0x1c0000000 (only dramc-rk1's 4 KiB page is reserved) are still outside.
