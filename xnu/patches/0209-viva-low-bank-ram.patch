@@ -83,10 +83,10 @@ index d8592c4..de40f0d 100644
  		assert(VM_PAGE_WIRED(mem));
  		vm_page_lock_queues();
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
-index 56794af..10f5d9d 100644
+index 56794af..ca5db59 100644
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -362,8 +362,89 @@ typedef struct {
+@@ -362,8 +362,96 @@ typedef struct {
  	vm_size_t len;
  } ptov_table_entry;
  
@@ -163,6 +163,13 @@ index 56794af..10f5d9d 100644
 +	return false;
 +}
 +
++/* Physmap VA the pieces take: their length, plus up to a twig each for block alignment (arm_vm_physmap_slide). */
++static vm_size_t
++viva_lowmem_extra(void)
++{
++	return viva_lowmem_total + viva_lowmem_count * ARM_TT_TWIG_SIZE;
++}
++
 +/* A PA the physmap may map: kernel-managed memory or a low-bank piece. */
 +static bool
 +viva_pa_mappable(pmap_paddr_t pa)
@@ -176,7 +183,7 @@ index 56794af..10f5d9d 100644
  SECURITY_READ_ONLY_LATE(static boolean_t)               kva_active = FALSE;
  
  
-@@ -1026,7 +1107,11 @@ arm_vm_page_granular_helper(vm_offset_t start, vm_offset_t _end, vm_offset_t va,
+@@ -1026,7 +1114,11 @@ arm_vm_page_granular_helper(vm_offset_t start, vm_offset_t _end, vm_offset_t va,
  		if ((pa + len) > real_avail_end) {
  			_end -= (pa + len - real_avail_end);
  		}
@@ -188,7 +195,7 @@ index 56794af..10f5d9d 100644
  
  		/* Round up to the nearest PAGE_SIZE boundary when creating mappings:
  		 * PAGE_SIZE may be a multiple of ARM_PGBYTES, and we don't want to leave
-@@ -1117,7 +1202,11 @@ arm_vm_page_granular_prot(vm_offset_t start, unsigned long size, pmap_paddr_t pa
+@@ -1117,7 +1209,11 @@ arm_vm_page_granular_prot(vm_offset_t start, unsigned long size, pmap_paddr_t pa
  
  			tte2 = arm_kva_to_tte(align_start);
  
@@ -200,7 +207,7 @@ index 56794af..10f5d9d 100644
  				tmplate = (pa & ARM_TTE_BLOCK_L2_MASK) | ARM_TTE_TYPE_BLOCK
  				    | ARM_TTE_VALID | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_NX
  				    | ARM_TTE_BLOCK_AP(pte_prot_APX) | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY)
-@@ -1603,6 +1692,14 @@ arm_vm_physmap_init(boot_args *args)
+@@ -1603,6 +1699,14 @@ arm_vm_physmap_init(boot_args *args)
  	arm_vm_physmap_slide(temp_ptov_table, (args->topOfKernelData - gPhysBase + gVirtBase),
  	    real_avail_end - args->topOfKernelData, AP_RWNA, ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT); // rest of physmem
  
@@ -215,16 +222,26 @@ index 56794af..10f5d9d 100644
  	assert((temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len) <= physmap_end);
  
  	// Sort in descending order of segment length.  LUT traversal is linear, so largest (most likely used)
-@@ -1635,6 +1732,17 @@ arm_vm_prot_finalize(boot_args * args __unused)
+@@ -1635,6 +1739,27 @@ arm_vm_prot_finalize(boot_args * args __unused)
  
  	ml_static_mfree(phystokv(gPhysBase), segLOWEST - gVirtBase);
  
 +#if defined(SWEET)
-+	/* 0209: the low bank between the carve-outs */
-+	for (unsigned int i = 0; i < viva_lowmem_count; i++) {
-+		ml_static_mfree(phystokv(viva_lowmem[i].pa), viva_lowmem[i].len);
-+	}
++	/*
++	 * 0209: the low bank between the carve-outs. Not ml_static_mfree: the physmap is below VM_MIN_KERNEL_ADDRESS
++	 * (ARM_LARGE_MEMORY), where it silently frees nothing; the pages are already mapped read-write there. They were
++	 * counted as wired at startup (max_mem includes them), as ml_static_mfree's pages are.
++	 */
 +	if (viva_lowmem_count != 0) {
++		uint32_t freed = 0;
++		for (unsigned int i = 0; i < viva_lowmem_count; i++) {
++			vm_page_create((ppnum_t)atop(viva_lowmem[i].pa), (ppnum_t)atop(viva_lowmem[i].pa + viva_lowmem[i].len));
++			freed += (uint32_t)atop(viva_lowmem[i].len);
++		}
++		vm_page_lockspin_queues();
++		vm_page_wire_count -= freed;
++		vm_page_wire_count_initial -= freed;
++		vm_page_unlock_queues();
 +		printf("VIVA LOWMEM: %u pieces, %lu MiB below 0x%llx given to the VM\n", viva_lowmem_count,
 +		    (unsigned long)(viva_lowmem_total >> 20), (unsigned long long)gPhysBase);
 +	}
@@ -233,7 +250,7 @@ index 56794af..10f5d9d 100644
  	/*
  	 * KTRR support means we will be mucking with these pages and trying to
  	 * protect them; we cannot free the pages to the VM if we do this.
-@@ -1869,6 +1977,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -1869,6 +1994,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  	 */
  	gVirtBase = args->virtBase;
  	gPhysBase = args->physBase;
@@ -243,19 +260,38 @@ index 56794af..10f5d9d 100644
  #if KASAN
  	real_phys_size = args->memSize + (shadow_ptop - shadow_pbase);
  #else
-@@ -1926,6 +2037,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
- #else
- 	static_memory_end = physmap_base + mem_size + ARM64_PHYSMAP_ALIGNMENT_PADDING; // worst possible case for block alignment
- 	physmap_end = physmap_base + real_phys_size + ARM64_PHYSMAP_ALIGNMENT_PADDING;
+@@ -1898,7 +2026,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	}
+ 
+ #if defined(ARM_LARGE_MEMORY)
+-	unsigned long physmap_l1_entries = ((real_phys_size + ARM64_PHYSMAP_SLIDE_RANGE + ARM64_PHYSMAP_ALIGNMENT_PADDING) >> ARM_TT_L1_SHIFT) + 1;
++	unsigned long physmap_l1_entries = ((real_phys_size + ARM64_PHYSMAP_SLIDE_RANGE + ARM64_PHYSMAP_ALIGNMENT_PADDING
 +#if defined(SWEET)
-+	/* 0209: the low-bank pieces follow in the physmap, each may be pushed up to a twig for block alignment */
-+	static_memory_end += viva_lowmem_total + viva_lowmem_count * ARM_TT_TWIG_SIZE;
-+	physmap_end += viva_lowmem_total + viva_lowmem_count * ARM_TT_TWIG_SIZE;
++	    + viva_lowmem_extra()               /* 0209 */
 +#endif
++	    ) >> ARM_TT_L1_SHIFT) + 1;
+ 	physmap_base = VM_MIN_KERNEL_ADDRESS - (physmap_l1_entries << ARM_TT_L1_SHIFT);
+ #else
+ 	physmap_base = phystokv(args->topOfKernelData);
+@@ -1929,6 +2061,17 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  #endif // ARM_LARGE_MEMORY
  #endif
  
-@@ -2251,6 +2367,13 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
++#if defined(SWEET)
++	/*
++	 * 0209: the low-bank pieces follow in the physmap (SWEET is ARM_LARGE_MEMORY: an aperture of its own below
++	 * VM_MIN_KERNEL_ADDRESS, sized by physmap_l1_entries above).
++	 */
++	physmap_end += viva_lowmem_extra();
++#if !defined(ARM_LARGE_MEMORY)
++	static_memory_end += viva_lowmem_extra();
++#endif
++#endif
++
+ #if KASAN && !defined(ARM_LARGE_MEMORY)
+ 	/* add the KASAN stolen memory to the physmap */
+ 	dynamic_memory_begin = static_memory_end + (shadow_ptop - shadow_pbase);
+@@ -2251,6 +2394,13 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  
  	sane_size = mem_size - (avail_start - gPhysBase);
  	max_mem = mem_size;
