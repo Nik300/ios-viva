@@ -1,0 +1,269 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index f6ff29e..9a7367a 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -261,6 +261,7 @@ extern int sweet_console_muted;                                             /* o
+ extern void sweet_ps(const char *arg, char *out, size_t len);                /* bsd/dev/sweet_sample.c (0201) */
+ extern void sweet_kill(const char *arg, char *out, size_t len);
+ extern void sweet_surface_report(const char *arg, char *out, size_t len);     /* iokit/Kernel/arm/SweetSurface.cpp (0206) */
++extern void viva_iobmd_report(const char *arg, char *out, size_t len);        /* iokit/Kernel/IOBufferMemoryDescriptor.cpp (0208) */
+ 
+ extern void viva_battery_usb_changed(void);                                  /* VivaBattery.cpp: poll now */
+ 
+@@ -1762,6 +1763,13 @@ vl_command(void)
+ 		}
+ 		sweet_surface_report(rest, out, sizeof(out));
+ 		vl_reply("%s", out);
++	} else if (IS("iobmd")) {
++		char out[240];
++		while (*rest == ' ') {
++			rest++;
++		}
++		viva_iobmd_report(rest, out, sizeof(out));
++		vl_reply("%s", out);
+ 	} else if (IS("ps") || IS("kill")) {
+ 		char out[160];
+ 		(IS("ps") ? sweet_ps : sweet_kill)(rest, out, sizeof(out));
+@@ -1793,7 +1801,7 @@ vl_command(void)
+ 			delay(5000);
+ 		}
+ 	} else if (IS("help")) {
+-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | surf [all] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | surf [all] | iobmd [SECONDS] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+ 	} else {
+ 		vl_reply("unknown command: %s (try help)\n", c);
+ 	}
+diff --git a/iokit/Kernel/IOBufferMemoryDescriptor.cpp b/iokit/Kernel/IOBufferMemoryDescriptor.cpp
+index 2456769..7e0a772 100644
+--- a/iokit/Kernel/IOBufferMemoryDescriptor.cpp
++++ b/iokit/Kernel/IOBufferMemoryDescriptor.cpp
+@@ -211,6 +211,210 @@ viva_iobmd_trace(task_t inTask, IOOptionBits options, mach_vm_size_t capacity)
+ 	}
+ 	printf("%s\n", line);
+ }
++
++/*
++ * 0208: the live set. 0207 showed the buffers that stay are under 256 KiB (the big ones, GPU BOs, are freed), so every
++ * IOBufferMemoryDescriptor alive is kept here with its size, age, process and backtrace, and the link's "iobmd [SECONDS]"
++ * groups them by backtrace ("IOBMDL" lines, biggest first): with SECONDS, only those made in the last SECONDS seconds,
++ * i.e. what an app cycle left behind. Boot-arg viviobmdlive=0: off.
++ */
++#define VIVA_IOBMD_SLOTS  16384         /* power of two; open addressing, backward-shift deletion */
++#define VIVA_IOBMD_FRAMES 10
++
++struct viva_iobmd_entry {
++	const void *obj;
++	uint64_t    bytes, at;
++	uint32_t    options;
++	char        proc[12];
++	uintptr_t   bt[VIVA_IOBMD_FRAMES];
++};
++
++static struct viva_iobmd_entry viva_iobmd_live[VIVA_IOBMD_SLOTS];
++static uint32_t viva_iobmd_count, viva_iobmd_dropped;
++static int viva_iobmd_on = -1;
++LCK_GRP_DECLARE(viva_iobmd_grp, "viva_iobmd");
++LCK_SPIN_DECLARE(viva_iobmd_lock, &viva_iobmd_grp);
++
++static inline uint32_t
++viva_iobmd_hash(const void *obj)
++{
++	return (uint32_t)(((uintptr_t)obj >> 4) * 2654435761u) & (VIVA_IOBMD_SLOTS - 1);
++}
++
++static void
++viva_iobmd_add(const void *obj, IOOptionBits options, mach_vm_size_t capacity)
++{
++	if (viva_iobmd_on < 0) {
++		uint32_t v = 1;
++		PE_parse_boot_argn("viviobmdlive", &v, sizeof(v));
++		viva_iobmd_on = v != 0;
++	}
++	if (!viva_iobmd_on) {
++		return;
++	}
++	struct viva_iobmd_entry e = {};
++	e.obj = obj;
++	e.bytes = capacity;
++	e.at = mach_absolute_time();
++	e.options = options;
++	proc_selfname(e.proc, sizeof(e.proc));
++	uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
++	for (int f = 0; f < VIVA_IOBMD_FRAMES && fp != 0 && (fp & 7) == 0; f++) {
++		uintptr_t *frame = (uintptr_t *)fp;
++		e.bt[f] = VM_KERNEL_UNSLIDE(frame[1]);
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++	lck_spin_lock(&viva_iobmd_lock);
++	if (viva_iobmd_count >= VIVA_IOBMD_SLOTS * 3 / 4) {
++		viva_iobmd_dropped++;
++	} else {
++		uint32_t i = viva_iobmd_hash(obj);
++		while (viva_iobmd_live[i].obj != NULL && viva_iobmd_live[i].obj != obj) {
++			i = (i + 1) & (VIVA_IOBMD_SLOTS - 1);
++		}
++		if (viva_iobmd_live[i].obj == NULL) {
++			viva_iobmd_count++;
++		}
++		viva_iobmd_live[i] = e;
++	}
++	lck_spin_unlock(&viva_iobmd_lock);
++}
++
++static void
++viva_iobmd_remove(const void *obj)
++{
++	if (viva_iobmd_on <= 0) {
++		return;
++	}
++	lck_spin_lock(&viva_iobmd_lock);
++	uint32_t i = viva_iobmd_hash(obj);
++	while (viva_iobmd_live[i].obj != NULL && viva_iobmd_live[i].obj != obj) {
++		i = (i + 1) & (VIVA_IOBMD_SLOTS - 1);
++	}
++	if (viva_iobmd_live[i].obj != NULL) {
++		viva_iobmd_count--;
++		/* backward shift: move up every later entry of the run that may live here */
++		uint32_t j = i;
++		for (;;) {
++			viva_iobmd_live[i].obj = NULL;
++			for (;;) {
++				j = (j + 1) & (VIVA_IOBMD_SLOTS - 1);
++				if (viva_iobmd_live[j].obj == NULL) {
++					goto done;
++				}
++				uint32_t h = viva_iobmd_hash(viva_iobmd_live[j].obj);
++				/* stays if its home h lies cyclically in (i, j] */
++				if (i <= j ? (i < h && h <= j) : (i < h || h <= j)) {
++					continue;
++				}
++				break;
++			}
++			viva_iobmd_live[i] = viva_iobmd_live[j];
++			i = j;
++		}
++	}
++done:
++	lck_spin_unlock(&viva_iobmd_lock);
++}
++
++extern "C" void
++viva_iobmd_report(const char *arg, char *out, size_t len)
++{
++	if (viva_iobmd_on <= 0) {
++		snprintf(out, len, "iobmd: live tracking off (boot-arg viviobmdlive=0)\n");
++		return;
++	}
++	uint32_t secs = 0;
++	while (*arg >= '0' && *arg <= '9') {
++		secs = secs * 10 + (uint32_t)(*arg++ - '0');
++	}
++	uint64_t now = mach_absolute_time(), window = 0;
++	if (secs != 0) {
++		nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &window);
++	}
++	enum { kGroups = 256 };
++	struct group {
++		uintptr_t bt[VIVA_IOBMD_FRAMES];
++		uint64_t  bytes;
++		uint32_t  count, options;
++		char      proc[12];
++	};
++	struct group *g = IONew(struct group, kGroups);
++	struct viva_iobmd_entry *copy = IONew(struct viva_iobmd_entry, VIVA_IOBMD_SLOTS);
++	if (g == NULL || copy == NULL) {
++		if (g != NULL) {
++			IODelete(g, struct group, kGroups);
++		}
++		if (copy != NULL) {
++			IODelete(copy, struct viva_iobmd_entry, VIVA_IOBMD_SLOTS);
++		}
++		snprintf(out, len, "iobmd: no memory for the report\n");
++		return;
++	}
++	uint32_t n = 0, total = 0, dropped, groups = 0, other = 0;
++	uint64_t totalBytes = 0, matchBytes = 0, otherBytes = 0;
++	lck_spin_lock(&viva_iobmd_lock);
++	for (uint32_t i = 0; i < VIVA_IOBMD_SLOTS; i++) {
++		if (viva_iobmd_live[i].obj == NULL) {
++			continue;
++		}
++		total++;
++		totalBytes += viva_iobmd_live[i].bytes;
++		if (window == 0 || now - viva_iobmd_live[i].at <= window) {
++			copy[n++] = viva_iobmd_live[i];
++		}
++	}
++	dropped = viva_iobmd_dropped;
++	lck_spin_unlock(&viva_iobmd_lock);
++
++	for (uint32_t i = 0; i < n; i++) {
++		matchBytes += copy[i].bytes;
++		uint32_t k;
++		for (k = 0; k < groups && memcmp(g[k].bt, copy[i].bt, sizeof(g[k].bt)) != 0; k++) {
++		}
++		if (k == groups) {
++			if (groups == kGroups) {
++				other++;
++				otherBytes += copy[i].bytes;
++				continue;
++			}
++			bcopy(copy[i].bt, g[k].bt, sizeof(g[k].bt));
++			g[k].bytes = 0;
++			g[k].count = 0;
++			g[k].options = copy[i].options;
++			strlcpy(g[k].proc, copy[i].proc, sizeof(g[k].proc));
++			groups++;
++		}
++		g[k].count++;
++		g[k].bytes += copy[i].bytes;
++	}
++	for (uint32_t shown = 0; shown < 24 && shown < groups; shown++) {
++		uint32_t best = shown;
++		for (uint32_t k = shown + 1; k < groups; k++) {
++			if (g[k].bytes > g[best].bytes) {
++				best = k;
++			}
++		}
++		struct group t = g[shown];
++		g[shown] = g[best];
++		g[best] = t;
++		char line[300];
++		int c = snprintf(line, sizeof(line), "IOBMDL %5u x %8llu KiB %-11s opts 0x%x bt", g[shown].count,
++		    g[shown].bytes >> 10, g[shown].proc, g[shown].options);
++		for (int f = 0; f < VIVA_IOBMD_FRAMES && g[shown].bt[f] != 0 && c < (int)sizeof(line) - 20; f++) {
++			c += snprintf(line + c, sizeof(line) - c, " 0x%lx", (unsigned long)g[shown].bt[f]);
++		}
++		printf("%s\n", line);
++	}
++	snprintf(out, len, "iobmd: %u alive, %llu MiB; %s%u buffers, %llu MiB in %u backtraces (%u more, %llu KiB, ungrouped); "
++	    "%u not tracked (table full); \"IOBMDL\" lines in the log\n", total, totalBytes >> 20,
++	    secs ? "made in the window: " : "", n, matchBytes >> 20, groups, other, otherBytes >> 10, dropped);
++	IODelete(g, struct group, kGroups);
++	IODelete(copy, struct viva_iobmd_entry, VIVA_IOBMD_SLOTS);
++}
+ #endif
+ 
+ bool
+@@ -236,6 +440,7 @@ IOBufferMemoryDescriptor::initWithPhysicalMask(
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	viva_iobmd_trace(inTask, options, capacity);
++	viva_iobmd_add(this, options, capacity);
+ #endif
+ 
+ 	/*
+@@ -729,6 +934,10 @@ IOBufferMemoryDescriptor::free()
+ 	kalloc_heap_t    kheap     = KHEAP_DATA_BUFFERS;
+ 	vm_size_t        rsize;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	viva_iobmd_remove(this);
++#endif
++
+ 	if (alignment >= page_size) {
+ 		if (!round_page_overflow(size, &rsize)) {
+ 			size = rsize;
