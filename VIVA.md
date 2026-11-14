@@ -1049,6 +1049,14 @@ This patch only gives the Mac side a powered block and DMA memory:
   addresses, so the Mac gives vpud iovas = pool physical addresses. `vdec status` prints the port controls.
 - Link `vdec rd OFF N` (<= 1536 bytes, hex, cache invalidated), `vdec wr OFF HEX` (written back), `vdec zero OFF N`,
   `vdec sum OFF N CHUNK` (FNV-1a per chunk, <= 256, so the Mac pulls only changed chunks). vdec reply buffer 4000.
+- Phone (image B2, 2026-11-14): works. First H.264 frame decoded by the VDEC from vpud in the Mac's VM, bit-exact
+  (vdec/docs/TRACING.md). Pool 64 MiB at 0xcc648000.
+
+### 0212: VDEC power-off order, `vdec zero` (NOT in an image yet)
+- `vdec off` failed with 0210/0211: "bus protection step 1 not acknowledged (VDE left on)". The gcon clocks were
+  gated before the bus protection, and a clock-gated VDEC never acks. Now: clocks on, protection steps 1/2 with acks,
+  then clocks off, SRAM, ISO... (the same order done by hand over the link worked: VDE off).
+- `vdec zero` received "ro OFF N" and fell into `sum`: the pool commands now get the whole argument string.
 
 ### Wired memory leak found and fixed (2026-11-14): GPU BO mappings in backboardd
 - **0207** (`viviobmdtrace=KIB`, tested): IOBufferMemoryDescriptor allocations >= KIB with backtrace. **0208**

@@ -1,0 +1,46 @@
+diff --git a/iokit/Kernel/arm/VivaVDEC.cpp b/iokit/Kernel/arm/VivaVDEC.cpp
+--- a/iokit/Kernel/arm/VivaVDEC.cpp
++++ b/iokit/Kernel/arm/VivaVDEC.cpp
+@@ -206,7 +206,8 @@
+ #define SAY(...) do { if (o < len) o += (size_t)snprintf(out + o, len - o, __VA_ARGS__); } while (0)
+ 	uint64_t off = 0, n = 0, chunk = 0;
+ 	uint8_t *va = gPool != NULL ? (uint8_t *)gPool->getBytesNoCopy() : NULL;
+-	const char *p = num(args + 3, &off);
++	const char *p = strchr(args, ' ');
++	p = p != NULL ? num(p, &off) : NULL;
+ 	if (va == NULL) {
+ 		SAY("vdec: no pool (boot-arg vivavdecpool=MB)\n");
+ 	} else if (p == NULL || off >= gPoolSize) {
+@@ -269,9 +270,10 @@
+ 	if (!vdePowered()) {
+ 		return NULL;
+ 	}
+-	wr(gGcon, VDEC_LAT_CKEN_CLR, 1);
+-	wr(gGcon, VDEC_LARB1_CKEN_CLR, 1);
+-	wr(gGcon, VDEC_CKEN_CLR, 1);
++	/* bus protection first, while the VDEC clocks still run: a clock-gated block never acknowledges step 1 */
++	wr(gGcon, VDEC_CKEN_SET, 1);
++	wr(gGcon, VDEC_LARB1_CKEN_SET, 1);
++	wr(gGcon, VDEC_LAT_CKEN_SET, 1);
+ 	wr(gInfra, INFRA_TOPAXI_PROTECTEN_1_SET, VDE_PROT_STEP1);
+ 	if (!waitBits(gInfra, INFRA_TOPAXI_PROTECTEN_STA1_1, VDE_PROT_STEP1, VDE_PROT_STEP1)) {
+ 		return "bus protection step 1 not acknowledged (VDE left on)";
+@@ -280,6 +282,9 @@
+ 	if (!waitBits(gInfra, INFRA_TOPAXI_PROTECTEN_STA1_1, VDE_PROT_STEP2, VDE_PROT_STEP2)) {
+ 		return "bus protection step 2 not acknowledged (VDE left on)";
+ 	}
++	wr(gGcon, VDEC_LAT_CKEN_CLR, 1);
++	wr(gGcon, VDEC_LARB1_CKEN_CLR, 1);
++	wr(gGcon, VDEC_CKEN_CLR, 1);
+ 	wr(gSpm, SPM_POWERON_CONFIG, SPM_PROJECT_KEY);
+ 	uint32_t v = rd(gSpm, SPM_VDE_PWR_CON);
+ 	wr(gSpm, SPM_VDE_PWR_CON, v |= SRAM_PDN);
+@@ -338,7 +343,7 @@
+ 	const char *err = NULL;
+ 	if (strncmp(args, "rd ", 3) == 0 || strncmp(args, "wr ", 3) == 0 || strncmp(args, "zero ", 5) == 0 ||
+ 	    strncmp(args, "sum ", 4) == 0) {
+-		poolCmd(args[0] == 'z' ? args + 2 : args[0] == 's' ? args + 1 : args, out, len, &o);
++		poolCmd(args, out, len, &o);
+ 		IOLockUnlock(gLock);
+ 		return o;
+ 	}
