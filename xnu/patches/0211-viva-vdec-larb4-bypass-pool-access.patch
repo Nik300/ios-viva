@@ -1,0 +1,192 @@
+diff --git a/iokit/Kernel/arm/VivaVDEC.cpp b/iokit/Kernel/arm/VivaVDEC.cpp
+--- a/iokit/Kernel/arm/VivaVDEC.cpp
++++ b/iokit/Kernel/arm/VivaVDEC.cpp
+@@ -8,7 +8,13 @@
+  *   vdec [status]   VDE power state, vdec_sel, clock gates, pool
+  *   vdec on         VDE MTCMOS on, bus protection released, vdec_sel = mainpll_d2_d2 (546 MHz, DTB vdec_step0),
+  *                   vdec_gcon VDEC / LARB1 / LAT clocks on
++ *                   and larb4 VDEC ports 0-11 out of the M4U (physical addresses, as larb7 for JPEG) with the
++ *                   vendor's outstanding limits (smi_conf.h smi_larb4_init_pair)
+  *   vdec off        clocks off, bus protection set (with acks), VDE MTCMOS off
++ *   vdec rd OFF N   N (<= 1536) bytes of the pool at OFF, hex (cache invalidated first: the VDEC wrote them)
++ *   vdec wr OFF HEX bytes into the pool at OFF, written back to DRAM for the VDEC
++ *   vdec zero OFF N zeroes N bytes of the pool
++ *   vdec sum OFF N CHUNK   FNV-1a of each CHUNK bytes in [OFF, OFF+N) (<= 256 sums): the Mac pulls only what changed
+  *
+  * Sequences from Xiaomi viva-r-oss drivers/clk/mediatek/clk-mt6781-pg.c (spm_mtcmos_ctrl_vde) and clk-mt6781.c
+  * (TOP_MUX_VDEC CK_CFG_10 [10:8]; vdec gcon gates GATE_VDEC0/1/2_I: writing the "set" register turns a clock ON).
+@@ -32,6 +38,7 @@
+ #define PA_INFRACFG     0x10001000ull
+ #define PA_SPM          0x10006000ull
+ #define PA_VDEC_GCON    0x1602f000ull
++#define PA_LARB4        0x1602e000ull
+ 
+ /* topckgen */
+ #define CLK_CFG_UPDATE          0x008
+@@ -68,8 +75,13 @@
+ #define VDEC_LARB1_CKEN_CLR     0x00c
+ #define VDEC_LAT_CKEN_SET       0x200
+ #define VDEC_LAT_CKEN_CLR       0x204
++/* smi_larb4 */
++#define LARB_OSTD(port)         (0x200 + 4 * (port))
++#define LARB_PORT_CTRL(port)    (0x380 + 4 * (port))
++#define LARB_PORT_MMU_BITS      0xff01u
++#define LARB4_VDEC_PORTS        12      /* 0 MC .. 11 RG_CTRL_DMA; 12/13 are mini-MDP */
+ 
+-static IOMemoryMap *gTopck, *gInfra, *gSpm, *gGcon;
++static IOMemoryMap *gTopck, *gInfra, *gSpm, *gGcon, *gLarb;
+ static IOBufferMemoryDescriptor *gPool;
+ static uint64_t gPoolPA;
+ static uint32_t gPoolSize;
+@@ -107,8 +119,9 @@
+ 		gInfra = mapRegs(PA_INFRACFG, 0x1000);
+ 		gSpm = mapRegs(PA_SPM, 0x1000);
+ 		gGcon = mapRegs(PA_VDEC_GCON, 0x1000);    /* mapped, not touched while VDE is off */
++		gLarb = mapRegs(PA_LARB4, 0x1000);
+ 	}
+-	return gLock != NULL && gTopck != NULL && gInfra != NULL && gSpm != NULL && gGcon != NULL;
++	return gLock != NULL && gTopck != NULL && gInfra != NULL && gSpm != NULL && gGcon != NULL && gLarb != NULL;
+ }
+ 
+ static bool
+@@ -159,9 +172,96 @@
+ 	wr(gGcon, VDEC_CKEN_SET, 1);
+ 	wr(gGcon, VDEC_LARB1_CKEN_SET, 1);
+ 	wr(gGcon, VDEC_LAT_CKEN_SET, 1);
++	static const uint8_t ostd[LARB4_VDEC_PORTS] = { 0x28, 0x1, 0xc, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x2, 0x18, 0x1 };
++	for (uint32_t p = 0; p < LARB4_VDEC_PORTS; p++) {
++		wr(gLarb, LARB_OSTD(p), ostd[p]);
++		wr(gLarb, LARB_PORT_CTRL(p), rd(gLarb, LARB_PORT_CTRL(p)) & ~LARB_PORT_MMU_BITS);
++	}
+ 	return NULL;
+ }
+ 
++static uint32_t
++hexval(char c)
++{
++	return c >= '0' && c <= '9' ? (uint32_t)(c - '0') : c >= 'a' && c <= 'f' ? (uint32_t)(c - 'a' + 10) :
++	       c >= 'A' && c <= 'F' ? (uint32_t)(c - 'A' + 10) : 16u;
++}
++
++static const char *
++num(const char *s, uint64_t *v)
++{
++	while (*s == ' ') {
++		s++;
++	}
++	const char *e = s;
++	*v = strtoq(s, (char **)&e, 0);
++	return e == s ? NULL : e;
++}
++
++/* Pool access for the Mac (rd / wr / zero / sum). Caller holds gLock. */
++static void
++poolCmd(const char *args, char *out, size_t len, size_t *po)
++{
++	size_t o = *po;
++#define SAY(...) do { if (o < len) o += (size_t)snprintf(out + o, len - o, __VA_ARGS__); } while (0)
++	uint64_t off = 0, n = 0, chunk = 0;
++	uint8_t *va = gPool != NULL ? (uint8_t *)gPool->getBytesNoCopy() : NULL;
++	const char *p = num(args + 3, &off);
++	if (va == NULL) {
++		SAY("vdec: no pool (boot-arg vivavdecpool=MB)\n");
++	} else if (p == NULL || off >= gPoolSize) {
++		SAY("vdec: bad offset\n");
++	} else if (strncmp(args, "rd", 2) == 0) {
++		if (num(p, &n) == NULL || n == 0 || n > 1536 || off + n > gPoolSize) {
++			SAY("vdec: rd OFF N (N <= 1536)\n");
++		} else {
++			gPool->performOperation(kIOMemoryIncoherentIOFlush, off, n);
++			SAY("vdec: rd 0x%llx ", off);
++			for (uint64_t i = 0; i < n; i++) {
++				SAY("%02x", va[off + i]);
++			}
++			SAY("\n");
++		}
++	} else if (strncmp(args, "wr", 2) == 0) {
++		while (*p == ' ') {
++			p++;
++		}
++		for (n = 0; hexval(p[0]) < 16 && hexval(p[1]) < 16 && off + n < gPoolSize; p += 2, n++) {
++			va[off + n] = (uint8_t)(hexval(p[0]) << 4 | hexval(p[1]));
++		}
++		if (n) {
++			gPool->performOperation(kIOMemoryIncoherentIOFlush, off, n);
++		}
++		SAY("vdec: wr 0x%llx %llu\n", off, n);
++	} else if (strncmp(args, "zero", 4) == 0) {
++		if (num(p, &n) == NULL || off + n > gPoolSize) {
++			SAY("vdec: zero OFF N\n");
++		} else {
++			bzero(va + off, n);
++			gPool->performOperation(kIOMemoryIncoherentIOFlush, off, n);
++			SAY("vdec: zero 0x%llx %llu\n", off, n);
++		}
++	} else {
++		const char *q = num(p, &n);
++		if (q == NULL || num(q, &chunk) == NULL || chunk == 0 || off + n > gPoolSize || n / chunk > 256) {
++			SAY("vdec: sum OFF N CHUNK (<= 256 chunks)\n");
++		} else {
++			gPool->performOperation(kIOMemoryIncoherentIOFlush, off, n);
++			SAY("vdec: sum 0x%llx", off);
++			for (uint64_t c = 0; c < n; c += chunk) {
++				uint32_t h = 2166136261u;
++				for (uint64_t i = c; i < c + chunk && i < n; i++) {
++					h = (h ^ va[off + i]) * 16777619u;
++				}
++				SAY(" %08x", h);
++			}
++			SAY("\n");
++		}
++	}
++#undef SAY
++	*po = o;
++}
++
+ /* Clocks off, then spm_mtcmos_ctrl_vde(STA_POWER_DOWN). Caller holds gLock. */
+ static const char *
+ powerOff(void)
+@@ -236,12 +336,18 @@
+ 	}
+ 	IOLockLock(gLock);
+ 	const char *err = NULL;
++	if (strncmp(args, "rd ", 3) == 0 || strncmp(args, "wr ", 3) == 0 || strncmp(args, "zero ", 5) == 0 ||
++	    strncmp(args, "sum ", 4) == 0) {
++		poolCmd(args[0] == 'z' ? args + 2 : args[0] == 's' ? args + 1 : args, out, len, &o);
++		IOLockUnlock(gLock);
++		return o;
++	}
+ 	if (strncmp(args, "on", 2) == 0) {
+ 		err = powerOn();
+ 	} else if (strncmp(args, "off", 3) == 0) {
+ 		err = powerOff();
+ 	} else if (*args != 0 && strncmp(args, "status", 6) != 0) {
+-		SAY("usage: vdec [status|on|off]\n");
++		SAY("usage: vdec [status|on|off|rd OFF N|wr OFF HEX|zero OFF N|sum OFF N CHUNK]\n");
+ 		IOLockUnlock(gLock);
+ 		return o;
+ 	}
+@@ -256,6 +362,11 @@
+ 	if (on) {
+ 		SAY("vdec: gcon cken 0x%08x larb1 0x%08x lat 0x%08x\n", rd(gGcon, VDEC_CKEN_SET), rd(gGcon, VDEC_LARB1_CKEN_SET),
+ 		    rd(gGcon, VDEC_LAT_CKEN_SET));
++		SAY("vdec: larb4 port ctrl");
++		for (uint32_t p = 0; p < LARB4_VDEC_PORTS; p++) {
++			SAY(" %x", rd(gLarb, LARB_PORT_CTRL(p)));
++		}
++		SAY("\n");
+ 	}
+ 	SAY("vdec: pool %s0x%llx, %u MiB (boot-arg vivavdecpool=MB)\n", gPool ? "" : "none ", gPoolPA, gPoolSize >> 20);
+ 	IOLockUnlock(gLock);
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -1737,7 +1737,7 @@
+ 		viva_gpu_link(rest, gpu_reply, sizeof(gpu_reply));
+ 		vl_reply("%s", gpu_reply);
+ 	} else if (IS("vdec")) {
+-		static char vdec_reply[1024];   /* 0210: VivaVDEC.cpp (vpud tracing from the Mac) */
++		static char vdec_reply[4000];   /* 0210/0211: VivaVDEC.cpp (vpud tracing from the Mac; rd replies up to 3 KB) */
+ 		viva_vdec_cmd(rest, vdec_reply, sizeof(vdec_reply));
+ 		vl_reply("%s", vdec_reply);
+ 	} else if (IS("disp")) {

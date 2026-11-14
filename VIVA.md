@@ -1040,6 +1040,15 @@ This patch only gives the Mac side a powered block and DMA memory:
   boot: never read 0x160xxxxx before `vdec on`.
 - boot-arg `vivavdecpool=MB` (default 0: nothing reserved, nothing changes): physically contiguous pool below 4 GiB
   reserved at boot next to the WiFi area; `vdec status` prints its address.
+- CI 43567981842 (image 0208-native-iobmd) SKIPPED 0210 (conflict with 0207/0208 on the viva_usb.c help line), so
+  that kernel has no `vdec`: rebased (686cece).
+
+### 0211: VDEC larb4 out of the M4U, pool access over the link (NOT tested on the phone)
+- `vdec on` also takes smi_larb4 (0x1602e000) VDEC ports 0-11 out of the M4U (PORT_CTRL 0x380+4p &= ~0xff01, as larb7
+  for JPEG) with the vendor's outstanding limits (smi_conf.h smi_larb4_init_pair): the VDEC then DMAs to physical
+  addresses, so the Mac gives vpud iovas = pool physical addresses. `vdec status` prints the port controls.
+- Link `vdec rd OFF N` (<= 1536 bytes, hex, cache invalidated), `vdec wr OFF HEX` (written back), `vdec zero OFF N`,
+  `vdec sum OFF N CHUNK` (FNV-1a per chunk, <= 256, so the Mac pulls only changed chunks). vdec reply buffer 4000.
 
 ### Wired memory leak found and fixed (2026-11-14): GPU BO mappings in backboardd
 - **0207** (`viviobmdtrace=KIB`, tested): IOBufferMemoryDescriptor allocations >= KIB with backtrace. **0208**
