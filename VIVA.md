@@ -1027,3 +1027,16 @@ CoreAnimation backing stores purgeable (IOSurfaceClientSetPurgeable = IOSurface 
 unimplemented): here all surface memory is wired and never discarded. **0206** (NOT tested): link `surf [all]`
 lists live surfaces by creator, volatile bytes, objects alive and memory held outside the surface table, to find who
 keeps it before changing the allocation (pageable/purgeable surfaces would be the real fix).
+
+### 0210: VDEC bring-up for tracing vpud (NOT tested on the phone)
+Video decoding: there is no open vpud (MediaTek's userspace half of the decoder; deep search 2026-11-14). The plan
+(~/Developer/ios-viva/vdec): run the vendor's vpud (32-bit ARM, bionic, from the stock ROM's vendor partition) under
+a patched qemu-arm in a Lima VM on the Mac, with /dev/vcu and /dev/vpu emulated, and forward its register accesses
+to this phone over the link (peek/poke, ~1.3 ms each from the VM) to trace it, then write a clean-room driver.
+This patch only gives the Mac side a powered block and DMA memory:
+- `VivaVDEC.cpp`, link `vdec [status|on|off]`: VDE MTCMOS (SPM VDE_PWR_CON 0x10006340, status bit 16), bus protection
+  (infracfg 0x2a8/0x2ac/0x258 bits 30/17), vdec_sel = mainpll_d2_d2 (CK_CFG_10 [10:8]), vdec_gcon VDEC/LARB1/LAT
+  clocks (set = on). Sequences from viva-r-oss clk-mt6781-pg.c spm_mtcmos_ctrl_vde and clk-mt6781.c. VDE is off at
+  boot: never read 0x160xxxxx before `vdec on`.
+- boot-arg `vivavdecpool=MB` (default 0: nothing reserved, nothing changes): physically contiguous pool below 4 GiB
+  reserved at boot next to the WiFi area; `vdec status` prints its address.

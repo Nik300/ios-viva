@@ -1,0 +1,331 @@
+diff --git a/iokit/Kernel/arm/VivaVDEC.cpp b/iokit/Kernel/arm/VivaVDEC.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaVDEC.cpp
+@@ -0,0 +1,265 @@
++/*
++ * viva (MT6781): video decoder (VDEC) bring-up for tracing MediaTek's vpud on the Mac (0210).
++ *
++ * There is no open vpud (the Android userspace half of MediaTek's decoder): ~/Developer/ios-viva/vdec runs the
++ * vendor blob under qemu on the Mac and forwards its register accesses to this phone over the USB link (peek/poke),
++ * to write a clean-room driver later. The phone side only has to power the block and lend it DMA memory:
++ *
++ *   vdec [status]   VDE power state, vdec_sel, clock gates, pool
++ *   vdec on         VDE MTCMOS on, bus protection released, vdec_sel = mainpll_d2_d2 (546 MHz, DTB vdec_step0),
++ *                   vdec_gcon VDEC / LARB1 / LAT clocks on
++ *   vdec off        clocks off, bus protection set (with acks), VDE MTCMOS off
++ *
++ * Sequences from Xiaomi viva-r-oss drivers/clk/mediatek/clk-mt6781-pg.c (spm_mtcmos_ctrl_vde) and clk-mt6781.c
++ * (TOP_MUX_VDEC CK_CFG_10 [10:8]; vdec gcon gates GATE_VDEC0/1/2_I: writing the "set" register turns a clock ON).
++ * The VDE domain is off at boot (SPM PWR_STATUS bit 16): nothing at 0x160xxxxx may be read before "vdec on"
++ * (a read of a powered-off block can hang the bus).
++ *
++ * DMA memory: boot-arg vivavdecpool=MB (default 0 = none) reserves that much physically contiguous memory below
++ * 4 GiB at boot, before the display's scanout surfaces fragment it (as the WiFi area, VivaWiFi.cpp). Off by
++ * default: the phone already runs short of contiguous memory after long uptimes, and only tracing needs it.
++ * "vdec status" prints its physical address; the Mac side places bitstreams, frames and vpud's working buffers in it.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <pexpert/pexpert.h>
++
++#define PA_TOPCKGEN     0x10000000ull
++#define PA_INFRACFG     0x10001000ull
++#define PA_SPM          0x10006000ull
++#define PA_VDEC_GCON    0x1602f000ull
++
++/* topckgen */
++#define CLK_CFG_UPDATE          0x008
++#define CK_CFG_10               0x0e0   /* vdec_sel [10:8] */
++#define CK_CFG_10_SET           0x0e4
++#define CK_CFG_10_CLR           0x0e8
++#define VDEC_SEL_SHIFT          8
++#define VDEC_SEL_MAINPLL_D2_D2  2       /* 0 clk26m, 1 mainpll_d3, 2 mainpll_d2_d2, 3 univpll_d5, 4 mainpll_d2 ... */
++#define VDEC_SEL_UPDATE         (1u << 10)
++/* SPM */
++#define SPM_POWERON_CONFIG      0x000
++#define SPM_PROJECT_KEY         0x0b160001
++#define SPM_PWR_STATUS          0x16c
++#define SPM_PWR_STATUS_2ND      0x170
++#define SPM_VDE_PWR_CON         0x340
++#define PWR_RST_B               (1u << 0)
++#define PWR_ISO                 (1u << 1)
++#define PWR_ON                  (1u << 2)
++#define PWR_ON_2ND              (1u << 3)
++#define PWR_CLK_DIS             (1u << 4)
++#define SRAM_PDN                (1u << 8)
++#define SRAM_PDN_ACK            (1u << 12)
++#define VDE_STATUS_BIT          (1u << 16)
++/* infracfg_ao bus protection, second set */
++#define INFRA_TOPAXI_PROTECTEN_1_SET    0x2a8
++#define INFRA_TOPAXI_PROTECTEN_1_CLR    0x2ac
++#define INFRA_TOPAXI_PROTECTEN_STA1_1   0x258
++#define VDE_PROT_STEP1          (1u << 30)
++#define VDE_PROT_STEP2          (1u << 17)
++/* vdec_gcon clock gates (set = on) */
++#define VDEC_CKEN_SET           0x000
++#define VDEC_CKEN_CLR           0x004
++#define VDEC_LARB1_CKEN_SET     0x008
++#define VDEC_LARB1_CKEN_CLR     0x00c
++#define VDEC_LAT_CKEN_SET       0x200
++#define VDEC_LAT_CKEN_CLR       0x204
++
++static IOMemoryMap *gTopck, *gInfra, *gSpm, *gGcon;
++static IOBufferMemoryDescriptor *gPool;
++static uint64_t gPoolPA;
++static uint32_t gPoolSize;
++static IOLock *gLock;
++
++static IOMemoryMap *
++mapRegs(uint64_t pa, uint32_t size)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
++	IOMemoryMap *m = md != NULL ? md->map(kIOMapInhibitCache) : NULL;
++	OSSafeReleaseNULL(md);
++	return m;
++}
++
++static inline uint32_t
++rd(IOMemoryMap *m, uint32_t off)
++{
++	return *(volatile uint32_t *)(m->getVirtualAddress() + off);
++}
++
++static inline void
++wr(IOMemoryMap *m, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(m->getVirtualAddress() + off) = v;
++}
++
++static bool
++maps(void)
++{
++	if (gLock == NULL) {
++		gLock = IOLockAlloc();
++	}
++	if (gTopck == NULL) {
++		gTopck = mapRegs(PA_TOPCKGEN, 0x1000);
++		gInfra = mapRegs(PA_INFRACFG, 0x1000);
++		gSpm = mapRegs(PA_SPM, 0x1000);
++		gGcon = mapRegs(PA_VDEC_GCON, 0x1000);    /* mapped, not touched while VDE is off */
++	}
++	return gLock != NULL && gTopck != NULL && gInfra != NULL && gSpm != NULL && gGcon != NULL;
++}
++
++static bool
++vdePowered(void)
++{
++	return (rd(gSpm, SPM_PWR_STATUS) & VDE_STATUS_BIT) && (rd(gSpm, SPM_PWR_STATUS_2ND) & VDE_STATUS_BIT);
++}
++
++static bool
++waitBits(IOMemoryMap *m, uint32_t off, uint32_t mask, uint32_t want)
++{
++	for (int i = 0; i < 1000; i++) {
++		if ((rd(m, off) & mask) == want) {
++			return true;
++		}
++		IODelay(10);
++	}
++	return false;
++}
++
++/* spm_mtcmos_ctrl_vde(STA_POWER_ON), then the clocks. Caller holds gLock. */
++static const char *
++powerOn(void)
++{
++	wr(gTopck, CK_CFG_10_CLR, 0x7u << VDEC_SEL_SHIFT);
++	wr(gTopck, CK_CFG_10_SET, VDEC_SEL_MAINPLL_D2_D2 << VDEC_SEL_SHIFT);
++	wr(gTopck, CLK_CFG_UPDATE, VDEC_SEL_UPDATE);
++	if (!vdePowered()) {
++		wr(gSpm, SPM_POWERON_CONFIG, SPM_PROJECT_KEY);
++		uint32_t v = rd(gSpm, SPM_VDE_PWR_CON);
++		wr(gSpm, SPM_VDE_PWR_CON, v |= PWR_ON);
++		wr(gSpm, SPM_VDE_PWR_CON, v |= PWR_ON_2ND);
++		if (!waitBits(gSpm, SPM_PWR_STATUS, VDE_STATUS_BIT, VDE_STATUS_BIT) ||
++		    !waitBits(gSpm, SPM_PWR_STATUS_2ND, VDE_STATUS_BIT, VDE_STATUS_BIT)) {
++			return "VDE power status did not come up";
++		}
++		wr(gSpm, SPM_VDE_PWR_CON, v &= ~PWR_CLK_DIS);
++		wr(gSpm, SPM_VDE_PWR_CON, v &= ~PWR_ISO);
++		wr(gSpm, SPM_VDE_PWR_CON, v |= PWR_RST_B);
++		wr(gSpm, SPM_VDE_PWR_CON, v &= ~SRAM_PDN);
++		if (!waitBits(gSpm, SPM_VDE_PWR_CON, SRAM_PDN_ACK, 0)) {
++			return "VDE SRAM did not power up";
++		}
++		wr(gInfra, INFRA_TOPAXI_PROTECTEN_1_CLR, VDE_PROT_STEP2);
++		wr(gInfra, INFRA_TOPAXI_PROTECTEN_1_CLR, VDE_PROT_STEP1);
++	}
++	/* only now is 0x160xxxxx on the bus */
++	wr(gGcon, VDEC_CKEN_SET, 1);
++	wr(gGcon, VDEC_LARB1_CKEN_SET, 1);
++	wr(gGcon, VDEC_LAT_CKEN_SET, 1);
++	return NULL;
++}
++
++/* Clocks off, then spm_mtcmos_ctrl_vde(STA_POWER_DOWN). Caller holds gLock. */
++static const char *
++powerOff(void)
++{
++	if (!vdePowered()) {
++		return NULL;
++	}
++	wr(gGcon, VDEC_LAT_CKEN_CLR, 1);
++	wr(gGcon, VDEC_LARB1_CKEN_CLR, 1);
++	wr(gGcon, VDEC_CKEN_CLR, 1);
++	wr(gInfra, INFRA_TOPAXI_PROTECTEN_1_SET, VDE_PROT_STEP1);
++	if (!waitBits(gInfra, INFRA_TOPAXI_PROTECTEN_STA1_1, VDE_PROT_STEP1, VDE_PROT_STEP1)) {
++		return "bus protection step 1 not acknowledged (VDE left on)";
++	}
++	wr(gInfra, INFRA_TOPAXI_PROTECTEN_1_SET, VDE_PROT_STEP2);
++	if (!waitBits(gInfra, INFRA_TOPAXI_PROTECTEN_STA1_1, VDE_PROT_STEP2, VDE_PROT_STEP2)) {
++		return "bus protection step 2 not acknowledged (VDE left on)";
++	}
++	wr(gSpm, SPM_POWERON_CONFIG, SPM_PROJECT_KEY);
++	uint32_t v = rd(gSpm, SPM_VDE_PWR_CON);
++	wr(gSpm, SPM_VDE_PWR_CON, v |= SRAM_PDN);
++	if (!waitBits(gSpm, SPM_VDE_PWR_CON, SRAM_PDN_ACK, SRAM_PDN_ACK)) {
++		return "VDE SRAM did not power down";
++	}
++	wr(gSpm, SPM_VDE_PWR_CON, v |= PWR_ISO);
++	wr(gSpm, SPM_VDE_PWR_CON, v |= PWR_CLK_DIS);
++	wr(gSpm, SPM_VDE_PWR_CON, v &= ~PWR_RST_B);
++	wr(gSpm, SPM_VDE_PWR_CON, v &= ~PWR_ON);
++	wr(gSpm, SPM_VDE_PWR_CON, v &= ~PWR_ON_2ND);
++	if (!waitBits(gSpm, SPM_PWR_STATUS, VDE_STATUS_BIT, 0) || !waitBits(gSpm, SPM_PWR_STATUS_2ND, VDE_STATUS_BIT, 0)) {
++		return "VDE power status did not go down";
++	}
++	return NULL;
++}
++
++/* At boot (VivaPwrap::start, with the WiFi area): the tracing pool, only with vivavdecpool=MB. */
++extern "C" void
++viva_vdec_reserve(void)
++{
++	uint32_t mb = 0;
++	if (!PE_parse_boot_argn("vivavdecpool", &mb, sizeof(mb)) || mb == 0) {
++		return;
++	}
++	mb = mb > 256 ? 256 : mb;
++	gPool = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, (vm_size_t)mb << 20, 0x00000000fffff000ull);
++	if (gPool != NULL) {
++		IOByteCount len = 0;
++		gPoolPA = gPool->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
++		gPoolSize = mb << 20;
++		if (gPoolPA == 0 || len < gPoolSize) {
++			OSSafeReleaseNULL(gPool);
++			gPoolPA = 0;
++			gPoolSize = 0;
++		}
++	}
++	IOLog("VIVA VDEC: tracing pool %s %u MiB at 0x%llx\n", gPool ? "reserved" : "NOT reserved", mb, gPoolPA);
++}
++
++/* The link's "vdec" command (bsd/dev/viva_usb.c). */
++extern "C" size_t
++viva_vdec_cmd(const char *args, char *out, size_t len)
++{
++	size_t o = 0;
++#define SAY(...) do { if (o < len) o += (size_t)snprintf(out + o, len - o, __VA_ARGS__); } while (0)
++	while (*args == ' ') {
++		args++;
++	}
++	if (!maps()) {
++		SAY("vdec: register maps failed\n");
++		return o;
++	}
++	IOLockLock(gLock);
++	const char *err = NULL;
++	if (strncmp(args, "on", 2) == 0) {
++		err = powerOn();
++	} else if (strncmp(args, "off", 3) == 0) {
++		err = powerOff();
++	} else if (*args != 0 && strncmp(args, "status", 6) != 0) {
++		SAY("usage: vdec [status|on|off]\n");
++		IOLockUnlock(gLock);
++		return o;
++	}
++	if (err != NULL) {
++		SAY("vdec: %s\n", err);
++	}
++	bool on = vdePowered();
++	SAY("vdec: VDE %s (PWR_STATUS 0x%08x/0x%08x, VDE_PWR_CON 0x%08x), vdec_sel %u (CK_CFG_10 0x%08x), "
++	    "bus protection 0x%08x\n", on ? "on" : "off", rd(gSpm, SPM_PWR_STATUS), rd(gSpm, SPM_PWR_STATUS_2ND),
++	    rd(gSpm, SPM_VDE_PWR_CON), (rd(gTopck, CK_CFG_10) >> VDEC_SEL_SHIFT) & 7, rd(gTopck, CK_CFG_10),
++	    rd(gInfra, INFRA_TOPAXI_PROTECTEN_STA1_1));
++	if (on) {
++		SAY("vdec: gcon cken 0x%08x larb1 0x%08x lat 0x%08x\n", rd(gGcon, VDEC_CKEN_SET), rd(gGcon, VDEC_LARB1_CKEN_SET),
++		    rd(gGcon, VDEC_LAT_CKEN_SET));
++	}
++	SAY("vdec: pool %s0x%llx, %u MiB (boot-arg vivavdecpool=MB)\n", gPool ? "" : "none ", gPoolPA, gPoolSize >> 20);
++	IOLockUnlock(gLock);
++#undef SAY
++	return o;
++}
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/VivaPwrap.cpp b/iokit/Kernel/arm/VivaPwrap.cpp
+--- a/iokit/Kernel/arm/VivaPwrap.cpp
++++ b/iokit/Kernel/arm/VivaPwrap.cpp
+@@ -88,6 +88,7 @@
+ OSDefineMetaClassAndStructors(VivaPwrap, IOService);
+ 
+ extern "C" void viva_wifi_reserve(void);
++extern "C" void viva_vdec_reserve(void);     /* VivaVDEC.cpp: tracing pool (vivavdecpool=MB), 0210 */
+ extern "C" int viva_rtc_read(uint64_t *secs);        /* VivaWiFi.cpp: CONNSYS memory, before the scanout fragments it */
+ extern "C" void viva_cpufreq_start(void);       /* osfmk/arm64/viva_cpufreq.c: CPU DVFS needs the PMIC */
+ 
+@@ -133,6 +134,7 @@
+ 	    top, topint, con, mask, sta, raw, ret);
+ 
+ 	viva_wifi_reserve();
++	viva_vdec_reserve();
+ 	{
+ 		/* Shut Down / restart (powerOff, restart): vivapoweroff=0 keeps the old behaviour (no haltRestart:
+ 		 * CPU spins, "Halt/Restart Timed Out" panic after 30 s). TOPRGU mapped now, not on the halt path. */
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -255,6 +255,7 @@
+ extern void viva_battery_link(const char *args, char *out, size_t outLen);   /* iokit/Kernel/arm/VivaBattery.cpp */
+ extern void viva_wifi_link(const char *args, char *out, size_t outLen);      /* bsd/dev/viva_wifi.c */
+ extern void viva_gpu_link(const char *args, char *out, size_t outLen);       /* iokit/Kernel/arm/VivaGPU.cpp */
++extern size_t viva_vdec_cmd(const char *args, char *out, size_t len);                      /* VivaVDEC.cpp (0210) */
+ extern void viva_cpufreq_link(const char *args, char *out, size_t outLen);   /* osfmk/arm64/viva_cpufreq.c */
+ extern void viva_disp_link(const char *args, char *out, size_t outLen);      /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+ extern int sweet_console_muted;                                             /* osfmk/console/serial_console.c */
+@@ -1734,6 +1735,10 @@
+ 		static char gpu_reply[4000];  /* vl.reply holds 4096 */
+ 		viva_gpu_link(rest, gpu_reply, sizeof(gpu_reply));
+ 		vl_reply("%s", gpu_reply);
++	} else if (IS("vdec")) {
++		static char vdec_reply[1024];   /* 0210: VivaVDEC.cpp (vpud tracing from the Mac) */
++		viva_vdec_cmd(rest, vdec_reply, sizeof(vdec_reply));
++		vl_reply("%s", vdec_reply);
+ 	} else if (IS("disp")) {
+ 		static char disp_reply[4000];
+ 		viva_disp_link(rest, disp_reply, sizeof(disp_reply));
+@@ -1793,7 +1798,7 @@
+ 			delay(5000);
+ 		}
+ 	} else if (IS("help")) {
+-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | surf [all] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | vdec [status|on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | surf [all] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+ 	} else {
+ 		vl_reply("unknown command: %s (try help)\n", c);
+ 	}
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -30,6 +30,7 @@
+ iokit/Kernel/arm/VivaScaler.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/VivaMDP.cpp                                     optional iokitcpp
+ iokit/Kernel/arm/VivaJPEGHW.cpp                                  optional iokitcpp
++iokit/Kernel/arm/VivaVDEC.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/VivaJPEG.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/VivaKeypad.cpp                              optional iokitcpp
