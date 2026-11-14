@@ -1066,3 +1066,21 @@ This patch only gives the Mac side a powered block and DMA memory:
 - Possible kernel hardening (not done): GEM_CLOSE could remove the client's mappings of the BO itself.
 - Also: `viva-link.py run` of a missing program now exits 127 ("cannot start" ends the run) instead of hanging.
 - Boot image: out/xnu-ufs-rw-0208-native-iobmd.img (0207 + 0208 + 0210, the native-display VIVA_EXTRA).
+
+### 0209: RAM between the SoC carve-outs (2026-11-14, NOT tested yet)
+- Before: XNU managed only 0xc0000000-0x1be000000 (hw.memsize 4,260,364,288 of 6 GiB). The low bank
+  0x40000000-0xc0000000 holds all of LK's fixed reservations (dtb/viva-live.dts mblock-*: 472 MiB of TEE, ATF,
+  GenieZone, modem md_mem_usage 256 MiB, SCP/SSPM/ADSP, pstore, LK framebuffer, logs) and was left out entirely.
+- tools/mkadt.py `VIVA_RESERVED` (the mblock list) -> `viva_lowmem()`: the free pieces, 1 MiB clear of every
+  reservation, >= 8 MiB: 10 pieces, 1570 MiB, in /chosen `viva-lowmem` (<base size> u64 pairs).
+- Kernel (osfmk only; gPhysBase/gVirtBase/start.s unchanged: start.s already maps only from the kernel header up):
+  arm_vm_init.c reads the list (viva_lowmem_init), maps each piece in the physmap (own ptov entry, PTOV_TABLE_SIZE
+  32; carve-outs never mapped, so nothing prefetches TrustZone memory), widens physmap/static_memory_end, adds the
+  pieces to sane_size/max_mem/mem_actual (hw.memsize ~5.5 GiB) and frees them with ml_static_mfree in
+  arm_vm_prot_finalize ("VIVA LOWMEM: N pieces, M MiB" in the log). pmap: vm_first_phys = first piece, per-page
+  tables sized from there (pages are managed and cacheable, not I/O), carve-out pages inside the range default to
+  VM_WIMG_IO in pp_attr_table (LK framebuffer mappings stay uncached), pmap_object offsets from vm_first_phys.
+  caches_asm.s invalidate_icache(phys) goes through phystokv.
+- Not used for physically contiguous allocations (vm_page_find_contiguous scans only the vm_pages array); all of
+  it is below 4 GiB. Boot-arg `vivalowmem=0`: off. Images: out/xnu-ufs-rw-0209-lowmem-B.img (with 0210/0211 and
+  vivavdecpool=64), fallback out/xnu-ufs-rw-0211-vdec-A.img (same kernel, CI 43573274272, with vivalowmem=0).
