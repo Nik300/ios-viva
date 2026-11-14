@@ -1010,3 +1010,7 @@ from the kernel, for a stuck vivad (launchd starts it again). Build tree for 020
 - Freeze 01:48 (user forced a restart): again the wired-memory exhaustion (wired ~197k pages, 112 failed 10 MB
   vm_page_find_contiguous) after ~15 min with many SpringBoard restarts, screenshots and an app reinstall (uicache).
   Open: find what keeps that memory wired (IOSurfaces of killed SpringBoards? display pages?).
+- Control Center (PIANO-DISPLAY-NATIVO.md section 10): ControlCenterUI's size tables put 360 pt in the iPhone SE bucket
+  (66 pt modules, 8 pt gutters, a 320 pt grid at x 0). VivaDisplay (hooks installed once ControlCenterUI loads):
+  CCUILayoutOptions itemSpacing 14 (CCItemSpacing), symmetric portrait margins for CCUILayoutView, CCUIStatusBar
+  expanded insets, status labels and sensor attribution. Phone: grid 27..333 pt, status strip aligned with it.
