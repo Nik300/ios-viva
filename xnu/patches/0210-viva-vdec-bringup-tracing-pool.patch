@@ -298,7 +298,7 @@ diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
  extern void viva_cpufreq_link(const char *args, char *out, size_t outLen);   /* osfmk/arm64/viva_cpufreq.c */
  extern void viva_disp_link(const char *args, char *out, size_t outLen);      /* iokit/Kernel/arm/SweetFramebuffer.cpp */
  extern int sweet_console_muted;                                             /* osfmk/console/serial_console.c */
-@@ -1734,6 +1735,10 @@
+@@ -1735,6 +1736,10 @@
  		static char gpu_reply[4000];  /* vl.reply holds 4096 */
  		viva_gpu_link(rest, gpu_reply, sizeof(gpu_reply));
  		vl_reply("%s", gpu_reply);
@@ -309,12 +309,12 @@ diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
  	} else if (IS("disp")) {
  		static char disp_reply[4000];
  		viva_disp_link(rest, disp_reply, sizeof(disp_reply));
-@@ -1793,7 +1798,7 @@
+@@ -1801,7 +1806,7 @@
  			delay(5000);
  		}
  	} else if (IS("help")) {
--		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | surf [all] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
-+		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | vdec [status|on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | surf [all] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | surf [all] | iobmd [SECONDS] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | vdec [status|on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | surf [all] | iobmd [SECONDS] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
  	} else {
  		vl_reply("unknown command: %s (try help)\n", c);
  	}
