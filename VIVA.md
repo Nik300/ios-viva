@@ -1040,3 +1040,20 @@ This patch only gives the Mac side a powered block and DMA memory:
   boot: never read 0x160xxxxx before `vdec on`.
 - boot-arg `vivavdecpool=MB` (default 0: nothing reserved, nothing changes): physically contiguous pool below 4 GiB
   reserved at boot next to the WiFi area; `vdec status` prints its address.
+
+### Wired memory leak found and fixed (2026-11-14): GPU BO mappings in backboardd
+- **0207** (`viviobmdtrace=KIB`, tested): IOBufferMemoryDescriptor allocations >= KIB with backtrace. **0208**
+  (tested): live set of every IOBufferMemoryDescriptor (size, age, process, backtrace; `viviobmdlive=0` off), link
+  `iobmd [SECONDS]` prints "IOBMDL" lines grouped by backtrace, biggest first, only buffers made in the last SECONDS
+  when given (= what an app cycle left alive). Symbolicate with the CI kernel (addresses are unslid).
+- Result: 2089 buffers / 793 MB alive from `VivaGPUUserClient::createBO` in backboardd while VivaGPUBO objects were
+  ~520 (BOs freed, memory not), IOMemoryMap count = IOBufferMemoryDescriptor count. Cause, in userspace:
+  libdrm-xnu kept BO mappings (drmUnmap only marks them idle) and dropped them in map_cache_drop *after*
+  GEM_CLOSE; IOConnectUnmapMemory64 finds the mapping via clientMemoryForType(handle), which fails once the handle is
+  closed, so the IOMemoryMap and the BO's wired memory stayed until backboardd exited (~140 MB per app cycle).
+- Fix (gpu repo, libdrm-xnu, CI run 43569933944, pushed as VivaMTLDriver + backboardd restarted): mappings dropped
+  before GEM_CLOSE. Phone: 3 Settings cycles 42,013 -> 40,868 wired pages (before: +9-12k per cycle), IOBMD 715 -> 717.
+  What remains made in a window is Panfrost's BO cache (backboardd ~218 MB, 469 BOs).
+- Possible kernel hardening (not done): GEM_CLOSE could remove the client's mappings of the BO itself.
+- Also: `viva-link.py run` of a missing program now exits 127 ("cannot start" ends the run) instead of hanging.
+- Boot image: out/xnu-ufs-rw-0208-native-iobmd.img (0207 + 0208 + 0210, the native-display VIVA_EXTRA).

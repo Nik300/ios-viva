@@ -372,13 +372,20 @@ def run(link, args):
         link.echo_output = echo
 
 
+def run_status(e):
+    """Exit status from an end line: "exit N", "signal N" (128 + N), "cannot start ..." (127, as a shell)."""
+    if e.group(1) == b'cannot start':
+        return 127
+    return int(e.group(2)) if e.group(1) == b'exit' else 128 + int(e.group(2))
+
+
 def run_lines(link, args):
     reply = link.command('run ' + ' '.join('"%s"' % a if ' ' in a else a for a in args))
     m = re.search(r'vivad: (\d+) queued', reply)
     if not m:
         sys.exit(reply.strip())
     tag = b'[%s] ' % m.group(1).encode()
-    end = re.compile(rb'\[%s\] (exit|signal) (-?\d+)' % m.group(1).encode())
+    end = re.compile(rb'\[%s\] (exit|signal|cannot start) (-?\d+)?' % m.group(1).encode())
     done = 0                                # bytes of link.output already looked at
     while True:
         link.output_event.wait(1)
@@ -395,7 +402,7 @@ def run_lines(link, args):
                     sys.stdout.flush()
                 e = end.match(line)
                 if e:
-                    sys.exit(int(e.group(2)) if e.group(1) == b'exit' else 128 + int(e.group(2)))
+                    sys.exit(run_status(e))
         done = max(done, cut)
         if link.port is None:
             sys.exit('link lost')
@@ -411,7 +418,7 @@ def run_capture(link, args):
     if not m:
         sys.exit(reply.strip())
     tag = b'[%s] ' % m.group(1).encode()
-    end = re.compile(rb'\[%s\] (exit|signal) (-?\d+)' % m.group(1).encode())
+    end = re.compile(rb'\[%s\] (exit|signal|cannot start) (-?\d+)?' % m.group(1).encode())
     while True:
         link.output_event.wait(30)
         link.output_event.clear()
@@ -423,7 +430,7 @@ def run_capture(link, args):
         if e:
             break
     lines = [l[len(tag):] for l in out.split(b'\n') if l.startswith(tag) and not end.match(l)]
-    status = int(e.group(2)) if e.group(1) == b'exit' else 128 + int(e.group(2))
+    status = run_status(e)
     return b'\n'.join(lines).decode(errors='replace') + '\n', status
 
 
