@@ -1,0 +1,55 @@
+# CPU DVFS control loop of ios-viva (kernel patches 0107/0115/0137, 0145/0147/0183/0192/0194).
+# Rendered with D2 through kroki.io:
+#   curl -X POST https://kroki.io/d2/svg -H 'Content-Type: text/plain' --data-binary @dvfs-cpu.d2 -o ../dvfs-cpu.svg
+vars: {
+  d2-config: {
+    theme-id: 0
+    layout-engine: elk
+    pad: 24
+  }
+}
+direction: right
+classes: {
+  sig: {style: {fill: "#eef4ff"; stroke: "#4a7bd0"; border-radius: 8; font-size: 14}}
+  gov: {style: {fill: "#fff4e0"; stroke: "#d08a2a"; stroke-width: 2; border-radius: 10; font-size: 15}}
+  cap: {style: {fill: "#fdecec"; stroke: "#c84b4b"; border-radius: 8; font-size: 14}}
+  hw: {style: {fill: "#e9f7ee"; stroke: "#3c9a5f"; border-radius: 8; font-size: 14}}
+  lane: {style: {fill: "#fafafa"; stroke: "#9aa0a6"; stroke-dash: 3; border-radius: 12; font-size: 18; bold: true}}
+  limit: {style: {stroke: "#c84b4b"; stroke-dash: 4}}
+}
+
+in: "Inputs" {
+  style.fill: transparent
+  style.stroke: transparent
+  busy: "Foreground busy of the busiest CPU\nper cluster (every 16 ms,\n100 ms when idle at the floor)" {class: sig}
+  low: "Low-priority time\n(background / maintenance QoS)" {class: sig}
+  touch: "Touch reports (GT9896)" {class: sig}
+  swap: "Frames presented (SwapEnd)" {class: sig}
+}
+gov: "CPU governor\n\nboost active: at least the boost clock\nbusy >= 80 % twice: ceiling\nelse slowest OPP <= 50 % busy\nstep down after 3 samples" {class: gov}
+caps: "Ceilings" {
+  style.fill: transparent
+  style.stroke: transparent
+  therm: "LVTS die sensors (9, every 256 ms)\n>= 75 °C: one OPP down per sample\n>= 105 °C: floor" {class: cap}
+  skin: "Battery temperature (skin proxy)\n>= 42 °C: down to LL 1175 / big 1169" {class: cap}
+  lpm: "Low Power Mode or display off\nbig 1530, LL 1500, CCI 1050" {class: cap}
+}
+out: "Hardware" {
+  style.fill: transparent
+  style.stroke: transparent
+  ll: "6x Cortex-A55 (LL)\n500 - 2000 MHz\nVproc12 + ARMPLL_LL" {class: hw}
+  big: "2x Cortex-A76 (big)\n774 - 2050 MHz\nVproc11 + ARMPLL_BL" {class: hw}
+  cci: "CCI\n500 - 1400 MHz\nat most 2 OPPs below big" {class: hw}
+  sched: "Scheduler: foreground threads\nprefer the A76s while boosted" {class: hw}
+}
+in.busy -> gov
+in.low -> gov: "alone: max 1075 MHz"
+in.touch -> gov: "UI boost, 250 ms"
+in.swap -> gov: "frame boost, 1670 MHz"
+caps.therm -> gov {class: limit}
+caps.skin -> gov {class: limit}
+caps.lpm -> gov {class: limit}
+gov -> out.ll: "up: Vproc, then PLL\ndown: PLL, then Vproc"
+gov -> out.big
+gov -> out.cci
+gov -> out.sched

@@ -1,203 +1,96 @@
-# ios-sweet
+# ios-viva
 
-**Apple's iOS 16 running on a Redmi Note 10 Pro.**
+**Apple's iOS 16 running on a Redmi Note 11 Pro 4G.**
 
-This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 10 Pro (`sweet`, Qualcomm SM7150 / Snapdragon 732G). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
+ios-viva ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 11 Pro 4G (`viva`, MediaTek Helio G96 / MT6781). The **unmodified iOS 16.7.16 (20H392) userland of the iPhone X** runs on top of it, from launchd to SpringBoard and the stock apps. It is a fork of [ios-sweet](https://github.com/dipa-studio/ios-sweet), which did the same for the Redmi Note 10 Pro. The boot shim, the patch series and the tooling come from there. This branch adds the MediaTek drivers next to them.
 
-As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver.
+Graphics are hardware accelerated. Metal, and with it CoreAnimation, SpringBoard, Safari and the apps, runs on the phone's Mali-G57 MC2 through a separate driver project:
 
-> Experimental bring-up, not a usable phone OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**.
+> **GPU driver → [Nik300/viva-gpu](https://github.com/Nik300/viva-gpu)**: a Metal driver for iOS 16 built on Mesa's Panfrost, with its own AIR → Valhall shader compiler.
+
+> Experimental bring-up, not a usable phone OS. Apple's security model is mostly switched off, many services are stubbed, and installing it **erases Android's user data**.
 
 ## What works
 
 | Area | State |
 | --- | --- |
-| Boot | Stock Xiaomi bootloader → `fastboot boot` of our shim → XNU. Nothing is flashed to the boot partitions |
-| CPU | 6 of the 8 cores (the six Cortex-A55s) via PSCI, 16K pages, GICv3 interrupts, timers |
-| Memory | About 3.95 GiB of the upper DDR bank |
-| Storage | Own UFS host driver; the iOS root is a journaled HFS+ volume in `userdata`, read/write |
-| iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
-| Display | Kernel IOSurface + IOMobileFramebuffer (`AppleCLCD`) services; CoreAnimation renders in software; frames are copied into the bootloader's framebuffer. Presented to iOS as an iPhone X panel (1125×2436) |
-| GUI | backboardd, SpringBoard, lock screen, home screen, Control Center, notification center, Settings |
-| Touch | Goodix GT9896 over I²C (GENI), rail enabled through RPMh, delivered as HID digitizer events |
-| Buttons | Power, volume up/down (PMIC through SPMI) as HID consumer keys; lock/wake works |
-| Battery | IOPMPowerSource service (static 100 %, charging icon; real fuel-gauge readout prepared) |
-| Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
-| Activation | Native "Hactivation" path of mobileactivationd, chosen through device-tree security status. No Apple servers involved |
+| Boot | Stock MediaTek LK → our shim in `boot_b` → XNU. Only `boot_b` and `userdata` are ever written |
+| CPU | All 8 cores (6× Cortex-A55 + 2× Cortex-A76) via PSCI, with our own DVFS ([below](#dvfs-cpu-and-gpu-clocks-under-load)) |
+| Memory | About 5.5 GiB, including the RAM between the SoC carve-outs |
+| Storage | MediaTek UFS on LUN 2; the iOS root is an HFS+ volume in `userdata`, read/write |
+| GPU | Mali-G57 MC2 kernel driver (`VivaGPUAccelerator`), Metal through [viva-gpu](https://github.com/Nik300/viva-gpu) |
+| Display | 1080×2400 DSC panel at 60 or 120 Hz, direct scanout of GPU surfaces, brightness and Night Shift |
+| Input | Goodix GT9896 touch, power and volume keys (MT6366 PMIC) |
+| Power | Battery gauge, charger, Low Power Mode, RTC, panel sleep, shutdown and restart |
+| Other | Wi-Fi (experimental, CONNSYS), hardware JPEG encoder, MDP scaler, USB link to a host (`tools/viva-link.py`) |
 
-## What does not work (yet)
+Not working: cellular, Bluetooth, audio, camera, sensors, GPS, Face ID / SEP. There is no App Store or Apple ID.
 
-- **Navigation:** you cannot leave an app (the home gesture and AssistiveTouch Home do nothing yet).
-- **No Wi-Fi, Bluetooth, cellular, audio, camera, sensors, GPS or SEP / Face ID.** Daemons for them start and fail or keep relaunching.
-- **No GPU.** Everything is drawn by the CPU at roughly 20–30 fps. The two Cortex-A76 cores are not used yet.
-- **Few apps.** The image has only what is on the system volume. There is no App Store, no Apple ID, and some Settings pages are empty.
-- **Slow boot:** about 4 minutes on the Apple logo.
-- **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection. Do not put anything personal on it.
+## DVFS: CPU and GPU clocks under load
 
-## How it boots
+When the port started, nothing touched the clocks. They stayed where the bootloader left them: A55s at 1866 MHz, **A76s at 1085 MHz** (slower than the little cores), CCI at 612 MHz and GPU at a fixed operating point. Stock Android does DVFS through the MCUPM firmware, which this port does not use. Instead the kernel runs its own governors on the application processor. They program the PMIC rails and PLLs directly, using the phone's own efuse-binned OPP tables from the live device tree.
 
-```
-ABL (stock Xiaomi bootloader, unlocked)
-  -> fastboot boot shim-boot.img              (temporary; nothing is flashed to boot)
-     -> shim: own MMU setup, reads the live FDT, loads the payload from the ramdisk
-        -> XNU Mach-O + generated Apple Device Tree (ADT) + boot-args
-           -> XNU -> UFS driver -> HFS+ root in the userdata partition
-              -> dyld + shared cache -> launchd -> daemons -> backboardd + SpringBoard
-```
+### CPU governor (`osfmk/arm64/viva_cpufreq.c`, patches 0145, 0147, 0183, 0192, 0194)
 
-There is no serial port (the debug UART is wired as SPI on this board). The kernel draws its console into the framebuffer that ABL leaves at `0x9c000000`, and keeps a persistent 4 MiB log ring at the end of `userdata`. You read that log from OrangeFox recovery with `tools/sweet-log-pull.sh`, so you don't have to film the screen.
+![CPU DVFS control loop](docs/dvfs-cpu.svg)
 
-## How to do it yourself
+- **Three domains**: LL (6× A55, 500–2000 MHz, Vproc12), big (2× A76, 774–2050 MHz, Vproc11) and the CCI (500–1400 MHz, kept at most two OPPs below big). Going up, the rail is raised and its readback awaited before the PLL changes. Going down, the PLL changes first. Vsram follows Vproc in hardware.
+- **Load**: every 16 ms (100 ms while idle at the floor, with timer leeway so the wakeups coalesce), the governor reads the busiest CPU of each cluster. Two samples at ≥ 80 % jump to the ceiling. Otherwise it picks the slowest OPP that would be ≤ 50 % busy, and only steps down after 3 samples in a row.
+- **Foreground vs background** (0194): the scheduler counts per CPU the time spent on low-priority threads (background and maintenance QoS). That time does not count toward the governor's decisions, and background work alone can raise a cluster to at most 1075 MHz. A single PowerLog SQLite thread had held the A55s at 2 GHz for hours.
+- **UI boost** (0183, 0192): a UI thread that works 8 ms out of every 33 is only 25 % busy and never moved the clocks. Touch reports now boost both clusters for 250 ms, and presented frames give a lighter boost (1670 MHz) right after a touch or after a pause in drawing. While boosted, foreground threads prefer the A76s. Settings scrolling went from 42.9 to 19.9 ms per frame.
+- **Ceilings**: LVTS die sensors (9 points, read every 256 ms) take one OPP off per sample at ≥ 75 °C and go to the floor at 105 °C. The battery temperature acts as a skin proxy and caps both clusters from 42 °C. Low Power Mode and display-off apply their own caps.
 
-You need a Redmi Note 10 Pro (`sweet`, global or Indian variant, SM7150) with an **unlocked bootloader**, a Linux PC, and a GitHub account for the kernel build. This is the exact path used for the screenshots above; other variants or firmware may need changes. **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist partitions are never touched.
+### GPU governor (`VivaGPU.cpp`, patches 0107, 0115, 0137)
 
-### 0. Back up the phone
+![GPU DVFS control loop](docs/dvfs-gpu.svg)
 
-Boot OrangeFox (or any recovery with adb root) temporarily and pull at least `persist`, `modemst1`, `modemst2`, `fsg`, `fsc` and `boot`, `dtbo`, `vbmeta`. They contain per-device calibration data. Keep them off git; `.gitignore` already excludes `backup/`, `dtb/` and `recovery/`.
+- **49 OPPs from 300 to 950 MHz**, with VGPU and VSRAM_GPU raised before the MFGPLL. The rails move 50 mV at a time while jobs keep running (about 1 ms, gated). While the PLL relocks, the GPU runs from a 218 MHz fallback clock.
+- **Load**: every 50 ms, the share of time a job chain was on the hardware. At ≥ 85 % it jumps to the fastest OPP. Otherwise it drops to the slowest OPP that would still be ≤ 70 % busy, but not within 200 ms of a step up.
+- **Display boost** (0137): when the display has a frame queued that the GPU has not finished, the GPU goes straight to its fastest OPP. Bursty frames otherwise kept the average load, and with it the clock, low, and each frame of GPU latency costs a frame per second.
+- **Ceilings**: `vivagpufreq` (floor), `vivagpufreqmax` and 550 MHz in Low Power Mode.
 
-The shim needs the stock DTB. Unpack your phone's stock `boot.img`:
+### Knobs
 
-```sh
-python3 tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked   # -> dtb/boot_unpacked/dtb
-```
+Everything is a boot-arg and can be changed live over the USB link (`cpu …`, `gpu …`), or from the Viva Manager app.
 
-### 1. Build the kernel
+| Boot-arg | Default | Effect |
+| --- | --- | --- |
+| `vivacpufreq` | `1` | `0` leave the clocks alone, `1` governor, `2` manual (link only) |
+| `vivacpull` / `vivacpubig` / `vivacpucci` | 2000 / 2050 / 1400 | ceilings in MHz |
+| `vivacpuboost`, `vivacpuboostms` | fastest OPP, 250 | UI boost clock and duration (`0` ms = off) |
+| `vivacpubg` | 1075 | ceiling for background-only load (`0` = off) |
+| `vivacpufast` | `2` | A76 preference: `0` never, `1` always, `2` while boosted |
+| `vivathermtrip`, `vivaskintrip` | 75, 42 | die and skin trip points in °C (`vivatherm=0` disables LVTS) |
+| `vivagpudvfs` | `1` | GPU governor on/off |
+| `vivagpufreq`, `vivagpufreqmax` | 300, 950 | GPU floor and ceiling in MHz |
+| `vivagpuboost` | `1` | fastest GPU OPP while the display waits for a frame |
+| `vivalpmcpu`, `vivalpmgpu` | 1530, 550 | big-cluster and GPU ceilings in Low Power Mode |
 
-The kernel builds on GitHub's macOS runners with [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build). The workflow fetches xnu-8796, applies `xnu/patches/` in order, and also stages the pinned open-source libpthread, HFS and BearSSL sources it needs. Fork the repo (public repos get free macOS minutes) and run:
+Over the link, `cpu` and `gpu dvfs` print the current OPPs, load, temperatures, boosts and time spent at each OPP.
 
-```sh
-gh workflow run xnu.yml -R YOU/ios-sweet
-gh run download RUN_ID -R YOU/ios-sweet -n xnu-kernel -D xnu/out
-```
+## Building and booting
 
-To check a patch locally before spending a CI run, `tools/xnu-cc.py` replays the compile commands of a previous CI log for single files.
-
-### 2. Build the iOS root image
-
-Download the iPhone X (iPhone10,3) iOS 16.7.16 (20H392) IPSW from Apple. Then, on Linux, with `apfs-fuse`, `hfsprogs` and sudo:
+The full procedure, device facts and a log of every patch are in **[VIVA.md](VIVA.md)**. In short:
 
 ```sh
-# OS, SystemOS and AppOS disk images from the IPSW (see BuildManifest.plist for their names)
-tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
-sudo fsck.hfsplus -fy ios16-root.img
-sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
-sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
-sudo umount /mnt/iosroot
-img2simg ios16-root.img ios16-root.simg
+gh workflow run xnu.yml -R YOU/ios-viva --ref viva          # kernel (GitHub Actions, macOS runner)
+gh run download RUN_ID -R YOU/ios-viva -n xnu-kernel -D xnu/out
+tools/viva-mkboot.sh xnu/out/kernel.development.sweet STOCK/boot.img ufs-rw
+fastboot flash boot_b shim/out/viva-boot.img && fastboot reboot
 ```
 
-`mkiosroot.sh` copies the OS volume and both cryptexes into one case-sensitive journaled HFS+ volume. It adds the dyld cache links, the plain system keybag and the log directories the daemons expect. `sweet-root-tweaks.py` applies the bring-up changes: it skips Setup, seeds the activation state, removes the baseband daemon, disables the watchdogs that kill slow apps and the crash-looping media paths, and so on. The script's header explains each change.
-
-The device tree builder copies `/product` from the real iPhone X device tree, which MobileGestalt needs. Extract it once, without downloading the whole IPSW:
-
-```sh
-python3 tools/remotezip.py IPSW_URL DeviceTree.d22ap.im4p research/ipsw-x/dt
-ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im4p -o research/ipsw-x/d22ap.adt
-```
-
-### 3. Build the boot image
-
-Needs `aarch64-linux-gnu-gcc` and `mkbootimg`.
-
-```sh
-python3 tools/mkadt.py shim/out/sweet.adt --highmem
-python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/sweet.adt shim/out/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpus=6 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30'
-shim/build.sh ../shim/out/payload.bin      # -> shim/out/shim-boot.img
-```
-
-What the less obvious boot-args do:
-
-| Boot-arg | Effect |
-| --- | --- |
-| `rd=ufsroot0 ufsrw=1 rootrw=1` | Root on the `userdata` partition, writable |
-| `cpus=6` | Start the six A55 cores; `cpus=1` is the safe fallback |
-| `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
-| `wdt=-1 wdt_test=no_user_checkin` | No hardware watchdog |
-| `sweetfb_noconsole=1` | Stop drawing kernel text over the GUI. It still goes to the persistent log; panics are drawn |
-| `sweetfb_hz=30` | Panel refresh rate of the CPU copy |
-| `sweettouch=0`, `sweetkeys=0` | Disable the touch or button driver |
-
-### 4. Flash the root and boot
-
-```sh
-fastboot -S 512M flash userdata ios16-root.simg   # ~7 minutes; do not unplug
-# Xiaomi's fastboot often hangs after a large flash: re-enter fastboot with Power + Volume down
-fastboot boot shim/out/shim-boot.img
-```
-
-The first boot takes about 4–5 minutes on the Apple logo, then the lock screen appears. Swipe up to unlock. To get back to fastboot, hold Power + Volume down.
-
-### 5. Read the kernel log
-
-```sh
-fastboot boot recovery/recovery.img        # OrangeFox, temporary
-tools/sweet-log-pull.sh logs/boot.txt      # 4 MiB console ring from the end of userdata
-adb reboot bootloader
-```
-
-The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces of backboardd and SpringBoard, and the drivers' `SWEET ...` lines. `tools/sweet-crash.py` symbolicates them against the shared cache.
-
-### QEMU
-
-`tools/qemu-sweet.py` boots the same kernel on QEMU `virt` with a test RAM-disk root. It is useful for kernel-only changes; see `NOTES.md`.
+The iOS root is built on macOS from the iPhone X 16.7.16 IPSW (`tools/viva-mkiosroot-macos.sh`) and flashed into `userdata`. The GPU driver bundle is built and installed separately, see [viva-gpu](https://github.com/Nik300/viva-gpu).
 
 ## Repository layout
 
 | Path | What |
 | --- | --- |
-| `shim/` | Bare-metal boot shim (C + asm) packed as an Android boot.img v2 |
-| `xnu/patches/` | The XNU patch series (applied in order by CI), plus staging scripts for libpthread, HFS and BearSSL |
-| `.github/workflows/xnu.yml` | Kernel CI build |
-| `tools/mkadt.py` | Generates the Apple Device Tree from sweet's MMIO layout and the iPhone X identity |
-| `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
-| `tools/mkiosroot.sh` | Builds the HFS+ iOS root from the IPSW images |
-| `tools/sweet-root-tweaks.py` | Bring-up changes to the root (Setup skip, activation, daemons) |
-| `tools/sweet-log-pull.sh`, `sweet-log.py` | Read the persistent kernel log from recovery |
-| `tools/sweet-crash.py` | Symbolicate console crash reports |
-| `tools/xnu-cc.py` | Local single-file compile check from a CI log |
-| `tools/qemu-sweet.py` | QEMU test boots with framebuffer text decoding |
-| `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | Helpers |
-| `NOTES.md` | Detailed engineering log: every boot, crash and decision, plus hardware facts |
-
-Not in git: partition backups, live device trees, recovery images, Apple firmware and root images, and downloaded or generated build trees. They contain device serials and calibration data, or Apple's copyrighted files.
-
-## Kernel patches
-
-| # | What |
-| --- | --- |
-| 0001–0009 | Toolchain compatibility, SWEET machine config, non-PAC arm64, stubs for Apple-internal pieces |
-| 0010–0018 | Early framebuffer console, physmap fix, PRNG without corecrypto, device-tree platform expert, timer PPI, boot CPU driver |
-| 0019–0020 | Apple open-source libpthread kernel provider; BearSSL AES |
-| 0021–0027 | RAM-disk root, mockfs, SHA-256, minimal AMFI, Apple open-source HFS+, MD5 |
-| 0028–0034 | UFS host driver and root device, read/write root, DMA above 4 GiB |
-| 0035–0045 | Entitlements, bindfs, AppleKeyStore stub, IOWatchdog, console crash reports |
-| 0046 | IOSurface (IOCoreSurfaceRoot) and IOMobileFramebuffer (AppleCLCD) services |
-| 0047–0055 | Diagnostics: persistent log, /dev/null tee, IOKit trace, heap strings and user stack sampler on crash; permissive Sandbox policy; HFS rename-swap; AppleKeyStore selectors |
-| 0056–0057 | Throttled panel copy; no external identity resolver |
-| 0058 | HID event services. Apple's IOHIDFamily-1915.140.3 user client and event queue, matching the iOS 16.7 userland |
-| 0059 | iPhone X identity (`hw.product` / `hw.target` from the device tree) |
-| 0060 | Power and volume keys over SPMI; touch over GENI I²C |
-| 0061 | Present the display as 1125×2436 |
-| 0062 | RPMh regulator vote for the touch rail; battery power source |
-| 0063 | GENI FIFO packing fix and the Goodix GT9896 protocol |
-| 0064 | Grant PRIV_WORK_INTERVAL (UIKit's CoreAnimation work interval) |
-| 0065 | SMP: secondary A55 cores via PSCI CPU_ON |
-| 0066–0067 | Fault-region crash info; console mute |
-| 0068 | IOSurface lookup semantics for already-mapped surfaces |
-| 0069 | Batched persistent-log flushes |
-
-## Key hardware facts
-
-- RAM: payloads use the upper bank, `0x100000000` + `0xfcc00000` (about 3.95 GiB), above Qualcomm's protected carve-outs.
-- GICv3 with security extensions: the timer goes through Group 1 IRQ (virtual timer INTID 19), not FIQ as on Apple silicon.
-- PSCI through `smc`, 19.2 MHz timer, ARMv8.2 without pointer authentication. MPIDR uses Aff1 for the core number.
-- Panel: 1080×2400 DSC video mode, continuous splash from ABL, no refresh kick needed.
-- Touch: Goodix GT9896 at I²C `0x5d` on QUP SE7 (`0xa84000`), powered by PM6150L LDO11 through RPMh.
-- Buttons: power and volume down on the PM6150 PON block, volume up on PM6150L GPIO2 (SPMI SID 4).
-
-More in [`NOTES.md`](NOTES.md).
+| `xnu/patches/` | XNU patch series, applied in order by CI. `0090`+ are viva's (MediaTek drivers, GPU, display, DVFS, Wi-Fi…) |
+| `shim/` | Boot shim; `shim/viva.c` and `build-viva.sh` for this phone |
+| `tools/` | ADT generator (`mkadt.py --viva`), boot image and root image builders, USB link host (`viva-link.py`) |
+| `VIVA.md` | Device facts, build steps and the per-patch engineering log for viva |
+| `NOTES.md` | ios-sweet's original engineering log |
 
 ## Credits
 
-Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Qualcomm/Xiaomi's published Linux kernel sources for the hardware details, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
+Built on [ios-sweet](https://github.com/dipa-studio/ios-sweet) by dipa-studio, Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build) and [ipsw](https://github.com/blacktop/ipsw), and on Xiaomi's published `viva` Linux kernel sources for the hardware details. iOS itself is Apple's and is not distributed here.
