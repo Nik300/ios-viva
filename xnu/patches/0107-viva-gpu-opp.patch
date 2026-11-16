@@ -8,9 +8,9 @@ index 11f3572..2ae1790 100644
   *   mfgcfg    BG3D clock gate, async/global/Q-channel setup, timestamp.
 - * One fixed operating point for now (300 MHz, VGPU 0.65 V, VSRAM 0.85 V:
 - * OPP 48 of the table plus 50 mV), no DVFS.
-+ * One operating point, chosen by boot-arg vivagpufreq (MHz, default 300;
-+ * vendor table up to 950) or "gpu freq MHz" on the USB link, VGPU raised by
-+ * vivagpumv (default 50 mV, capped at 0.9 V); no DVFS yet.
++ * Operating points from the vendor table (300..950 MHz), VGPU raised by
++ * vivagpumv (default 50 mV, capped at 0.9 V). Floor: vivagpufreq or "gpu freq
++ * MHz" on the USB link; DVFS governor above it: dvfsSample (0115, 0137).
   *
   * Mali (job-manager Valhall), written from the register map of the
   * architecture; behaviour as Panfrost expects it from Linux:
