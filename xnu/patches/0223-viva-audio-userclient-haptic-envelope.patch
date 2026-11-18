@@ -1,0 +1,380 @@
+diff --git a/iokit/Kernel/arm/VivaAudio.cpp b/iokit/Kernel/arm/VivaAudio.cpp
+index b411adc..0709d3e 100644
+--- a/iokit/Kernel/arm/VivaAudio.cpp
++++ b/iokit/Kernel/arm/VivaAudio.cpp
+@@ -12,6 +12,11 @@
+  * loudspeaker), 10 ms periods; the period interrupt (IRQ0, SPI 169) advances a frame counter with its host time.
+  * Outputs are a mask (VA_OUT_RCV, VA_OUT_SPK) chosen per stream; the amps load the vendor "music" or "rcv" scene.
+  *
++ * iOS: the AudioServerPlugIn /System/Library/Audio/Plug-Ins/HAL/VivaAudio.driver (fork/tools/vivaaudio) opens
++ * VivaAudioUserClient: memory type 0 = the status page (struct va_status, read-only), 1 = the SRAM ring
++ * (write-combined); selector 0 start(outputs, receiverScene), 1 stop, 2 the actuator envelope for VivaHaptic.
++ * A client that goes away stops the output.
++ *
+  * Link: "aud" status, "aud tone [spk|rcv|both]" AFE sine generator, "aud play [spk|rcv|both] [HZ]" a sine through
+  * DL1 and the interrupt, "aud off", "aud rd PMICADDR [N]" and "aud wr PMICADDR VAL" (codec registers),
+  * "aud peek OFF [N]" (AFE registers). Boot-arg vivaaudio=0: off.
+@@ -21,6 +26,8 @@
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOCommandGate.h>
+ #include <IOKit/IOFilterInterruptEventSource.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/param.h>
+ 
+@@ -92,6 +99,23 @@ static const uint8_t gAmpRcv[] = {
+ 	0x74, 0x6c, 0x01, 0x7c, 0xff, 0x31,
+ };
+ 
++/* Shared with tools/vivaaudio/vivaaudio.h: keep in sync. */
++struct va_status {
++	uint64_t seq;           /* odd while the interrupt updates frames/hostTime */
++	uint64_t frames;        /* frames played at the last period interrupt (multiple of periodFrames) */
++	uint64_t hostTime;      /* mach_absolute_time of that interrupt */
++	uint64_t startSeed;     /* +1 at each start */
++	uint32_t rate, channels, frameBytes, periodFrames, ringFrames, running, outputs, irqs;
++};
++#define VA_UC_START             0
++#define VA_UC_STOP              1
++#define VA_UC_HAPTIC            2       /* struct { uint32 count; { uint16 ms; uint8 gain; uint8 r; } steps[32]; } */
++#define VA_HAPTIC_STEPS         32
++
++extern "C" int viva_haptic_envelope(const void *steps, uint32_t n);     /* VivaHaptic.cpp */
++#define VA_MAP_STATUS           0
++#define VA_MAP_RING             1
++
+ class VivaAudio : public IOService {
+ 	OSDeclareDefaultStructors(VivaAudio);
+ public:
+@@ -105,6 +129,10 @@ public:
+ 	/* Frames played (period granularity) and the host time of the last period interrupt. */
+ 	void clock(uint64_t *frames, uint64_t *hostTime);
+ 	volatile uint8_t *ring(uint32_t *bytes) { *bytes = fRingBytes; return (volatile uint8_t *)fSRAM; }
++	virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++	IOMemoryDescriptor *statusMemory(void) { return fStatusMD; }
++	IOMemoryDescriptor *ringMemory(void) { return getProvider()->getDeviceMemoryWithIndex(1); }
+ 
+ private:
+ 	static bool irqFilter(OSObject *owner, IOFilterInterruptEventSource *src);
+@@ -146,8 +174,26 @@ private:
+ 	uint32_t             fPmicErrors, fI2CErrors;
+ 	volatile uint64_t    fFrames, fHostTime;
+ 	volatile uint32_t    fIrqs, fOtherIrqs;
++	IOBufferMemoryDescriptor *fStatusMD;
++	struct va_status    *fStatus;
++};
++
++class VivaAudioUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(VivaAudioUserClient);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
++	    IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++private:
++	VivaAudio *fAudio;
++	bool       fStarted;
+ };
+ 
++OSDefineMetaClassAndStructors(VivaAudioUserClient, IOUserClient);
++
+ OSDefineMetaClassAndStructors(VivaAudio, IOService);
+ 
+ static VivaAudio *gVivaAudio;
+@@ -424,6 +470,7 @@ VivaAudio::memifGated(bool on)
+ 		bits(AFE_IRQ_MCU_CON0, 1, 0);
+ 		wr(AFE_IRQ_MCU_CLR, 1);
+ 		fMemifOn = false;
++		fStatus->running = 0;
+ 		return;
+ 	}
+ 	bits(AFE_DAC_CON0, 1u << 4, 0);
+@@ -436,6 +483,12 @@ VivaAudio::memifGated(bool on)
+ 	    ((uint32_t)VA_RATE_MEMIF << 24) | (1u << 5) | 2u);
+ 	fFrames = 0;
+ 	fHostTime = mach_absolute_time();
++	__atomic_store_n(&fStatus->seq, fStatus->seq + 1, __ATOMIC_RELEASE);
++	fStatus->frames = 0;
++	fStatus->hostTime = fHostTime;
++	fStatus->startSeed++;
++	__atomic_store_n(&fStatus->seq, fStatus->seq + 1, __ATOMIC_RELEASE);
++	fStatus->running = 1;
+ 	bits(AFE_DAC_CON0, 1u << 4, 1u << 4);
+ 	bits(AFE_IRQ_MCU_CNT0, 0x3ffff, VA_PERIOD_FRAMES);
+ 	bits(AFE_IRQ_MCU_CON1, 0xf, VA_RATE_MEMIF);
+@@ -482,6 +535,7 @@ VivaAudio::outputsGated(uint32_t outputs, bool rcvScene, bool tone)
+ 		codecDownGated();
+ 		addaDownGated();
+ 		fOutputs = 0;
++		fStatus->outputs = 0;
+ 		return kIOReturnSuccess;
+ 	}
+ 	afeUpGated();
+@@ -510,6 +564,7 @@ VivaAudio::outputsGated(uint32_t outputs, bool rcvScene, bool tone)
+ 	}
+ 	fOutputs = outputs;
+ 	fRcvScene = rcvScene;
++	fStatus->outputs = outputs;
+ 	return kIOReturnSuccess;
+ }
+ 
+@@ -548,9 +603,15 @@ VivaAudio::irqFilter(OSObject *owner, IOFilterInterruptEventSource *src __unused
+ 	VivaAudio *me = (VivaAudio *)owner;
+ 	uint32_t st = me->rd(AFE_IRQ_MCU_STATUS) & 0x87ffffff;
+ 	if (st & 1) {
++		struct va_status *s = me->fStatus;
+ 		me->fHostTime = mach_absolute_time();
+ 		me->fFrames += VA_PERIOD_FRAMES;
+ 		me->fIrqs++;
++		__atomic_store_n(&s->seq, s->seq + 1, __ATOMIC_RELEASE);
++		s->frames = me->fFrames;
++		s->hostTime = me->fHostTime;
++		__atomic_store_n(&s->seq, s->seq + 1, __ATOMIC_RELEASE);
++		s->irqs = me->fIrqs;
+ 	}
+ 	if (st & ~1u) {
+ 		me->fOtherIrqs++;
+@@ -678,6 +739,19 @@ VivaAudio::start(IOService *provider)
+ 	fAmpAddr[1] = dt("spk-amp", 0, 0x5b);
+ 	fAmpReset[1] = dt("spk-amp", 1, 25);
+ 
++	fStatusMD = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, PAGE_SIZE,
++	    PAGE_SIZE);
++	if (fStatusMD == NULL) {
++		return false;
++	}
++	fStatus = (struct va_status *)fStatusMD->getBytesNoCopy();
++	bzero(fStatus, PAGE_SIZE);
++	fStatus->rate = VA_RATE;
++	fStatus->channels = 2;
++	fStatus->frameBytes = VA_FRAME_BYTES;
++	fStatus->periodFrames = VA_PERIOD_FRAMES;
++	fStatus->ringFrames = fRingBytes / VA_FRAME_BYTES;
++
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	fGate = fWorkLoop ? IOCommandGate::commandGate(this) : NULL;
+ 	fIrq = fWorkLoop ? IOFilterInterruptEventSource::filterInterruptEventSource(this, &VivaAudio::irqAction,
+@@ -697,6 +771,92 @@ VivaAudio::start(IOService *provider)
+ 	return true;
+ }
+ 
++IOReturn
++VivaAudio::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler)
++{
++	VivaAudioUserClient *uc = new VivaAudioUserClient;
++	if (uc == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (!uc->initWithTask(owningTask, securityID, type) || !uc->attach(this)) {
++		uc->release();
++		return kIOReturnError;
++	}
++	if (!uc->start(this)) {
++		uc->detach(this);
++		uc->release();
++		return kIOReturnError;
++	}
++	*handler = uc;
++	return kIOReturnSuccess;
++}
++
++bool
++VivaAudioUserClient::start(IOService *provider)
++{
++	fAudio = OSDynamicCast(VivaAudio, provider);
++	return fAudio != NULL && IOUserClient::start(provider);
++}
++
++IOReturn
++VivaAudioUserClient::clientClose(void)
++{
++	if (fStarted) {
++		fStarted = false;
++		fAudio->stopOutput();
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++VivaAudioUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	switch (selector) {
++	case VA_UC_START: {
++		if (args->scalarInputCount != 2) {
++			return kIOReturnBadArgument;
++		}
++		uint32_t bytes;
++		volatile uint8_t *r = fAudio->ring(&bytes);
++		for (uint32_t i = 0; i < bytes; i += 4) {
++			*(volatile uint32_t *)(r + i) = 0;
++		}
++		IOReturn ret = fAudio->startOutput((uint32_t)args->scalarInput[0], args->scalarInput[1] != 0);
++		fStarted = ret == kIOReturnSuccess;
++		return ret;
++	}
++	case VA_UC_STOP:
++		fStarted = false;
++		return fAudio->stopOutput();
++	case VA_UC_HAPTIC: {
++		if (args->structureInput == NULL || args->structureInputSize < 4 + 4 * VA_HAPTIC_STEPS) {
++			return kIOReturnBadArgument;
++		}
++		uint32_t n = MIN(*(const uint32_t *)args->structureInput, (uint32_t)VA_HAPTIC_STEPS);
++		return viva_haptic_envelope((const uint8_t *)args->structureInput + 4, n) == 0 ? kIOReturnSuccess :
++		       kIOReturnNotReady;
++	}
++	default:
++		return kIOReturnUnsupported;
++	}
++}
++
++IOReturn
++VivaAudioUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	IOMemoryDescriptor *md = type == VA_MAP_STATUS ? fAudio->statusMemory() :
++	    (type == VA_MAP_RING ? fAudio->ringMemory() : NULL);
++	if (md == NULL) {
++		return kIOReturnBadArgument;
++	}
++	md->retain();
++	*options = type == VA_MAP_STATUS ? kIOMapReadOnly : kIOMapWriteCombineCache;
++	*memory = md;
++	return kIOReturnSuccess;
++}
++
+ /* viva_usb.c: link "aud ..." */
+ extern "C" void
+ viva_audio_link(const char *args, char *out, size_t len)
+diff --git a/iokit/Kernel/arm/VivaHaptic.cpp b/iokit/Kernel/arm/VivaHaptic.cpp
+index 0789335..8a4d616 100644
+--- a/iokit/Kernel/arm/VivaHaptic.cpp
++++ b/iokit/Kernel/arm/VivaHaptic.cpp
+@@ -65,6 +65,11 @@ public:
+ 	/* FigVibrator: a pattern dictionary, or a number (0) to stop */
+ 	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	void link(const char *args, char *out, size_t len);
++	/*
++	 * Closed-loop haptics (0223, VivaAudio.driver's "Actuator"): `n` steps of ms[i] at gain[i] replace what is
++	 * playing. Unlike a pattern, the motor is not stopped between two non-zero steps (the CONT drive keeps its level).
++	 */
++	IOReturn envelope(const uint16_t *ms, const uint8_t *gain, uint32_t n);
+ 
+ private:
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *src);
+@@ -93,6 +98,8 @@ private:
+ 	uint32_t            fSteps, fStep;
+ 	bool                fRepeat;
+ 	uint64_t            fRepeatUntil;   /* mach_absolute_time */
++	bool                fEnvelope;      /* the steps are an iOS actuator envelope */
++	uint32_t            fEnvelopes;
+ };
+ 
+ OSDefineMetaClassAndStructors(VivaHaptic, IOService);
+@@ -249,6 +256,7 @@ VivaHaptic::playGated(uint32_t ms)
+ 	fStepGain[0] = 0x80;
+ 	fSteps = 1;
+ 	fRepeat = false;
++	fEnvelope = false;
+ 	fStep = 0;
+ 	driveGated(0x80);
+ 	fTimer->setTimeoutMS(ms);
+@@ -275,7 +283,7 @@ VivaHaptic::stepGated(void)
+ 	}
+ 	uint8_t prev = fStepGain[fStep], gain = fStepGain[next];
+ 	fStep = next;
+-	if (prev != 0 && gain != prev) {
++	if (prev != 0 && gain != prev && !(fEnvelope && gain != 0)) {
+ 		stopGated();            /* off, or another intensity: CONT levels are set before GO */
+ 	}
+ 	if (gain != 0 && !fPlaying) {
+@@ -366,6 +374,7 @@ VivaHaptic::setProperties(OSObject *properties)
+ 		bcopy(p.gain, fStepGain, n * sizeof(p.gain[0]));
+ 		fSteps = n;
+ 		fRepeat = repeat;
++		fEnvelope = false;
+ 		fStep = 0;
+ 		fPatterns++;
+ 		uint64_t limit;
+@@ -379,6 +388,44 @@ VivaHaptic::setProperties(OSObject *properties)
+ 	});
+ }
+ 
++IOReturn
++VivaHaptic::envelope(const uint16_t *ms, const uint8_t *gain, uint32_t n)
++{
++	struct {
++		uint32_t ms[HAP_MAX_STEPS];
++		uint8_t  gain[HAP_MAX_STEPS];
++	} p;
++	n = MIN(n, (uint32_t)HAP_MAX_STEPS);
++	for (uint32_t i = 0; i < n; i++) {
++		p.ms[i] = MIN((uint32_t)ms[i], 1000u);
++		p.gain[i] = MIN(gain[i], (uint8_t)0x80);
++	}
++	return fGate->runActionBlock(^IOReturn {
++		fTimer->cancelTimeout();
++		if (n == 0 || (n == 1 && p.gain[0] == 0)) {
++			if (fPlaying) {
++				stopGated();
++			}
++			fSteps = 0;
++			return kIOReturnSuccess;
++		}
++		bcopy(p.ms, fStepMs, n * sizeof(p.ms[0]));
++		bcopy(p.gain, fStepGain, n * sizeof(p.gain[0]));
++		fSteps = n;
++		fRepeat = false;
++		fEnvelope = true;
++		fStep = 0;
++		fEnvelopes++;
++		if (fStepGain[0] == 0 && fPlaying) {
++			stopGated();
++		} else if (fStepGain[0] != 0 && !fPlaying) {
++			driveGated(fStepGain[0]);
++		}
++		fTimer->setTimeoutMS(MAX(fStepMs[0], 1u));
++		return kIOReturnSuccess;
++	});
++}
++
+ IOReturn
+ VivaHaptic::vibrate(uint32_t ms)
+ {
+@@ -427,10 +474,10 @@ VivaHaptic::link(const char *args, char *out, size_t len)
+ 		uint8_t s = 0xff;
+ 		rd(AW_REG_GLBRD5, &s);
+ 		snprintf(out, len, "hap: %s (ID 0x%02x%s) at I2C%u 0x%02x, state 0x%02x, %s, %u plays, %u iOS patterns, "
+-		"%u I2C errors\n",
++		"%u I2C errors, %u envelopes\n",
+ 		fIs8622x ? (fVariant == 1 ? "AW86223" : "AW86224/5") : (fChipId == AW_ID_AW8624 ? "AW8624 (not driven yet)" :
+ 		"unknown chip"), fChipId, fIs8622x ? (fVariant == 1 ? ", EFRD9 0x01" : ", EFRD9 0x00") : "", fBus->busId(),
+-		fAddr, s, fPlaying ? "playing" : "idle", fPlays, fPatterns, fErrors);
++		fAddr, s, fPlaying ? "playing" : "idle", fPlays, fPatterns, fErrors, fEnvelopes);
+ 		return kIOReturnSuccess;
+ 	});
+ }
+@@ -497,3 +544,18 @@ viva_haptic_vibrate(uint32_t ms)
+ {
+ 	return gVivaHaptic != NULL && gVivaHaptic->vibrate(ms) == kIOReturnSuccess ? 0 : -1;
+ }
++
++/* VivaAudio.cpp (0223): the iOS actuator envelope, {ms, gain, reserved} x n */
++extern "C" int
++viva_haptic_envelope(const void *steps, uint32_t n)
++{
++	const uint8_t *b = (const uint8_t *)steps;
++	uint16_t ms[HAP_MAX_STEPS];
++	uint8_t gain[HAP_MAX_STEPS];
++	n = MIN(n, (uint32_t)HAP_MAX_STEPS);
++	for (uint32_t i = 0; i < n; i++) {
++		ms[i] = (uint16_t)(b[4 * i] | (b[4 * i + 1] << 8));
++		gain[i] = b[4 * i + 2];
++	}
++	return gVivaHaptic != NULL && gVivaHaptic->envelope(ms, gain, n) == kIOReturnSuccess ? 0 : -1;
++}

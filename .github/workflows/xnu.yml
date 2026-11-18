@@ -123,6 +123,10 @@ jobs:
         if: always()
         run: bash tools/vivad/build.sh out/vivad || echo "vivad build failed"
 
+      - name: VivaAudio.driver (HAL AudioServerPlugIn for mediaserverd, iOS arm64)
+        if: always()
+        run: bash tools/vivaaudio/build.sh out || echo "VivaAudio.driver build failed"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
