@@ -1125,3 +1125,15 @@ Kernel 0220 + mkadt:
 - Link: `hap` (status), `hap MS`, `hap stop`, `hap rd REG [N]`, `hap wr REG VAL`. Boot-arg vivahaptic=0: off.
 Audio plan (not started): AudioServerPlugIn (userspace HAL plug-in in mediaserverd, like AppleUSBAudio.driver) +
 a thin kernel driver (AFE DL1 memif -> ADDA -> MT6366 LOL/HS -> AW87559 amps); IOAudio2 (Apple's closed ABI) only if needed.
+
+### 0221: haptics seen by iOS (2026-11-19, `out/xnu-ufs-rw-0221-haptic.img`, CI 44415877301)
+- The /product "haptics" property alone left MobileGestalt DeviceSupportsHaptics / VibratorCapability / haptics false
+  (checked with a small MGCopyAnswer tool, viva-tests/vmgq). libMobileGestalt reads the node IODeviceTree:/product/haptics
+  (real D22AP: closed-loop = 1, supports-3rd-party-haptics = 1); VibratorCapability = DeviceSupportsHaptics or a
+  "vibrator" / "audio-actuator*" / "maggie-arc" device tree node. mkadt now adds /product/haptics with
+  supports-3rd-party-haptics = 1 and no closed-loop: after the boot (MobileGestalt cache deleted first) all three are true,
+  closed-loop false.
+- Settings > Sounds: the vibration switches (VIBRATE_GROUP) also need the "ringer-switch" capability (false: no switch).
+- 0221 logs every iOS pattern. At boot mediaserverd starts "2 steps repeat: on 400 g108 off 100" and never stops it
+  (probably an alert sound with vibration whose audio never finishes: there is no audio device yet); the 60 s cap
+  stopped it.
