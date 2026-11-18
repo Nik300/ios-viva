@@ -1099,3 +1099,29 @@ This patch only gives the Mac side a powered block and DMA memory:
   3 Settings cycles stable, no panic; WiFi EMI/DMA and the VDEC pool still at 0xcc000000+.
   Fallback out/xnu-ufs-rw-0211-vdec-A.img: same kernel with vivalowmem=0.
 - Left: the 32 MiB at 0x1be000000-0x1c0000000 (only dramc-rk1's 4 KiB page is reserved) are still outside.
+
+### 0220: haptics (2026-11-18, NOT tested yet)
+Research (stock vendor + Xiaomi viva-r-oss drivers/misc/mediatek/haptic_nv, iOS 16 20H392 MediaExperience/UIKit/
+CoreHaptics disassembly; reports in the session scratchpad):
+- Hardware: Z-axis linear motor (LRA, f0 ~205 Hz) behind an Awinic AW8622x or AW8624 on I2C7 (0x11004000) at 0x5A,
+  alt 0x58, reset GPIO23 (low = held in reset, as LK leaves it), IRQ GPIO10. Chip ID reg 0x00: 0x24 = AW8624,
+  0x00 = AW8622x (EFRD9 0x64 & 0x41: 1 = AW86223). Speakers: two AW87559 amps on I2C5 (0x11016000), 0x58 reset
+  GPIO19 (receiver/top, fed by the codec's HS output) and 0x5B reset GPIO25 (speaker, LOL); MT6366 codec via pwrap.
+- iOS: the iPhone X's Taptic Engine is an audio output (AppleEmbeddedAudio "Actuator" device, CoreHaptics). Without
+  closed-loop haptics and without that device, MediaExperience's FigVibrator_IOKit uses
+  IOServiceNameMatching("vibrator") and IORegistryEntrySetCFProperties: {"hertz_millisecs": [ {"intensity": 16.16} |
+  false, ms, ...], "repeat": bool} plays, a number 0 stops. MobileGestalt DeviceSupportsHaptics (cBy4BcYs5YWtFHbBpt4C6A)
+  = /product "haptics"; VibratorCapability (/9luHerXthRoPoNt/PVkTg) = that or a DT node named vibrator*;
+  DeviceSupportsClosedLoopHaptics (gqDnklGQnpv5ilgh5uHckw) = /product/haptics "closed-loop" (kept off). UIKit
+  feedback level 1 (UIFeedbackGenerator through system-sound vibes) when DeviceSupportsHaptics.
+Kernel 0220 + mkadt:
+- /arm-io/i2c5 and /arm-io/i2c7 (VivaI2C, IMP_IIC_WRAP bits 5/7; pins already muxed by LK), GPIO output pins + 19/23/25.
+- VivaHaptic.cpp on i2c7/haptic ("awinic,aw862xx-haptic"): reset pulse, probe, AW8622x init (aw8622x_haptic_init with
+  the live DT's aw8622x_vib_* values, offset calibration, HW VBAT mode), plays in CONT mode (f0 tracking, DRV1/DRV2
+  levels scaled by intensity) with a timer for durations and FigVibrator patterns (up to 64 segments, repeat).
+  Named "vibrator" in the service plane (the DT node is "haptic" so only one service matches). AW8624: detected and
+  reported only. No vendor RAM firmware needed.
+- /product haptics = 1. The on-device MobileGestalt cache must get the two keys (or be regenerated).
+- Link: `hap` (status), `hap MS`, `hap stop`, `hap rd REG [N]`, `hap wr REG VAL`. Boot-arg vivahaptic=0: off.
+Audio plan (not started): AudioServerPlugIn (userspace HAL plug-in in mediaserverd, like AppleUSBAudio.driver) +
+a thin kernel driver (AFE DL1 memif -> ADDA -> MT6366 LOL/HS -> AW87559 amps); IOAudio2 (Apple's closed ABI) only if needed.
