@@ -521,7 +521,12 @@ def build(seed=None, qemu=False, highmem=False, viva=False, viva_ufs=False):
         # system-sound vibes through the "vibrator" service (VivaHaptic). No /product/haptics "closed-loop": that
         # would select CoreHaptics' audio actuator path, which viva does not have.
         product_props = [(k, v) for k, v in product_props if k != 'haptics'] + [('haptics', u32(1))]
-    product = [node('product', [ph()] + product_props)] if product_props else []
+    # 2026-11-18: the property alone left DeviceSupportsHaptics, VibratorCapability and haptics false (vmgq on the
+    # phone). libMobileGestalt reads the child node IODeviceTree:/product/haptics, which the real D22AP has as
+    # { closed-loop = 1, supports-3rd-party-haptics = 1 }; VibratorCapability is DeviceSupportsHaptics or a
+    # "vibrator" / "audio-actuator*" / "maggie-arc" device tree node. viva keeps closed-loop out (see above).
+    product_children = [node('haptics', [ph(), ('supports-3rd-party-haptics', u32(1))])] if product_props and viva else []
+    product = [node('product', [ph()] + product_props, product_children)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the
     # dram-size we expose, so XNU maps it but never allocates into it.

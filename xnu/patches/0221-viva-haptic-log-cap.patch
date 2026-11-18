@@ -1,0 +1,102 @@
+diff --git a/iokit/Kernel/arm/VivaHaptic.cpp b/iokit/Kernel/arm/VivaHaptic.cpp
+index ed0e304..0789335 100644
+--- a/iokit/Kernel/arm/VivaHaptic.cpp
++++ b/iokit/Kernel/arm/VivaHaptic.cpp
+@@ -26,6 +26,8 @@
+ 
+ #include "VivaIO.h"
+ 
++extern "C" void proc_selfname(char *buf, int size);
++
+ /* AW8622x (aw8622x_reg.h) */
+ #define AW_REG_ID               0x00    /* read: chip ID; write 0xAA: soft reset */
+ #define AW_REG_SYSINTM          0x03
+@@ -50,6 +52,7 @@
+ 
+ #define HAP_MAX_MS              5000
+ #define HAP_MAX_STEPS           64      /* pattern steps (on/off segments) */
++#define HAP_REPEAT_MAX_MS       60000   /* a repeating pattern stops by itself after this (a missed stop) */
+ 
+ class VivaHaptic : public IOService {
+ 	OSDeclareDefaultStructors(VivaHaptic);
+@@ -89,6 +92,7 @@ private:
+ 	uint8_t             fStepGain[HAP_MAX_STEPS];
+ 	uint32_t            fSteps, fStep;
+ 	bool                fRepeat;
++	uint64_t            fRepeatUntil;   /* mach_absolute_time */
+ };
+ 
+ OSDefineMetaClassAndStructors(VivaHaptic, IOService);
+@@ -261,6 +265,12 @@ VivaHaptic::stepGated(void)
+ 			fSteps = 0;
+ 			return;
+ 		}
++		if (mach_absolute_time() > fRepeatUntil) {
++			printf("VIVA HAPTIC: repeating pattern stopped after %u ms without a stop\n", HAP_REPEAT_MAX_MS);
++			stopGated();
++			fSteps = 0;
++			return;
++		}
+ 		next = 0;
+ 	}
+ 	uint8_t prev = fStepGain[fStep], gain = fStepGain[next];
+@@ -289,14 +299,25 @@ VivaHaptic::setProperties(OSObject *properties)
+ {
+ 	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+ 	if (d == NULL) {
+-		if (OSDynamicCast(OSNumber, properties) != NULL) {
+-			return vibrate(0);
+-		}
+-		return kIOReturnBadArgument;
++		char name[20];
++		proc_selfname(name, sizeof(name));
++		printf("VIVA HAPTIC: %s stop (%s)\n", name, properties ? properties->getMetaClass()->getClassName() : "NULL");
++		return vibrate(0);     /* FigVibrator stops with a number 0; anything else that is not a pattern: stop too */
+ 	}
+ 	OSArray *a = OSDynamicCast(OSArray, d->getObject("hertz_millisecs"));
+ 	if (a == NULL) {
+-		return kIOReturnBadArgument;
++		/* not a pattern: logged (the keys), and taken as a stop rather than leaving a repeat running */
++		char name[20], keys[120] = "";
++		proc_selfname(name, sizeof(name));
++		OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++		OSSymbol *k;
++		int c = 0;
++		while (it != NULL && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL && c < (int)sizeof(keys) - 24) {
++			c += snprintf(keys + c, sizeof(keys) - c, " %s", k->getCStringNoCopy());
++		}
++		OSSafeReleaseNULL(it);
++		printf("VIVA HAPTIC: %s dictionary without hertz_millisecs (keys:%s): stop\n", name, keys);
++		return vibrate(0);
+ 	}
+ 	OSBoolean *rep = OSDynamicCast(OSBoolean, d->getObject("repeat"));
+ 	struct {
+@@ -327,6 +348,18 @@ VivaHaptic::setProperties(OSObject *properties)
+ 		return vibrate(0);
+ 	}
+ 	bool repeat = rep != NULL && rep->isTrue();
++	/* who asks for what (the first 200): "VIVA HAPTIC: mediaserverd pattern 3 steps repeat: on 30 ms g128, off 100..." */
++	static volatile SInt32 logged;
++	if (OSIncrementAtomic(&logged) < 200) {
++		char name[20], line[200];
++		proc_selfname(name, sizeof(name));
++		int c = snprintf(line, sizeof(line), "VIVA HAPTIC: %s pattern %u steps%s:", name, n, repeat ? " repeat" : "");
++		for (uint32_t i = 0; i < n && c < (int)sizeof(line) - 24; i++) {
++			c += p.gain[i] ? snprintf(line + c, sizeof(line) - c, " on %u g%u", p.ms[i], p.gain[i]) :
++			    snprintf(line + c, sizeof(line) - c, " off %u", p.ms[i]);
++		}
++		printf("%s\n", line);
++	}
+ 	return fGate->runActionBlock(^IOReturn {
+ 		stopGated();
+ 		bcopy(p.ms, fStepMs, n * sizeof(p.ms[0]));
+@@ -335,6 +368,9 @@ VivaHaptic::setProperties(OSObject *properties)
+ 		fRepeat = repeat;
+ 		fStep = 0;
+ 		fPatterns++;
++		uint64_t limit;
++		nanoseconds_to_absolutetime((uint64_t)HAP_REPEAT_MAX_MS * NSEC_PER_MSEC, &limit);
++		fRepeatUntil = mach_absolute_time() + limit;
+ 		if (fStepGain[0] != 0) {
+ 			driveGated(fStepGain[0]);
+ 		}
