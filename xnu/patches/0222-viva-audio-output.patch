@@ -1,0 +1,944 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index 97b0c2e..53c8dd2 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -264,6 +264,7 @@ extern void sweet_kill(const char *arg, char *out, size_t len);
+ extern void sweet_surface_report(const char *arg, char *out, size_t len);     /* iokit/Kernel/arm/SweetSurface.cpp (0206) */
+ extern void viva_iobmd_report(const char *arg, char *out, size_t len);        /* iokit/Kernel/IOBufferMemoryDescriptor.cpp (0208) */
+ extern void viva_haptic_link(const char *args, char *out, size_t len);        /* iokit/Kernel/arm/VivaHaptic.cpp (0220) */
++extern void viva_audio_link(const char *args, char *out, size_t len);         /* iokit/Kernel/arm/VivaAudio.cpp (0222) */
+ 
+ extern void viva_battery_usb_changed(void);                                  /* VivaBattery.cpp: poll now */
+ 
+@@ -1773,6 +1774,10 @@ vl_command(void)
+ 		char out[240];
+ 		viva_haptic_link(rest, out, sizeof(out));
+ 		vl_reply("%s", out);
++	} else if (IS("aud")) {
++		char out[400];
++		viva_audio_link(rest, out, sizeof(out));
++		vl_reply("%s", out);
+ 	} else if (IS("iobmd")) {
+ 		char out[240];
+ 		while (*rest == ' ') {
+@@ -1811,7 +1816,7 @@ vl_command(void)
+ 			delay(5000);
+ 		}
+ 	} else if (IS("help")) {
+-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | vdec [status|on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | surf [all] | iobmd [SECONDS] | hap [MS|stop|rd REG [N]|wr REG V] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | vdec [status|on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | surf [all] | iobmd [SECONDS] | hap [MS|stop|rd REG [N]|wr REG V] | aud [tone|play [spk|rcv|both] [HZ]|off|rd|wr PMICADDR|peek OFF] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+ 	} else {
+ 		vl_reply("unknown command: %s (try help)\n", c);
+ 	}
+diff --git a/iokit/Kernel/arm/VivaAudio.cpp b/iokit/Kernel/arm/VivaAudio.cpp
+new file mode 100644
+index 0000000..b411adc
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaAudio.cpp
+@@ -0,0 +1,709 @@
++/*
++ * viva (Redmi Note 11 Pro 4G): audio output hardware. MT6781 AFE (0x11210000) DL1 memif -> ADDA DL -> MTKAIF ->
++ * MT6366 codec (through the PMIC wrapper) DAC L -> HS -> AW87559 0x58 (receiver / top speaker, reset GPIO19) and
++ * DAC R -> LOL -> AW87559 0x5B (loudspeaker, reset GPIO25), both amps on I2C5. Sequences from Xiaomi viva-r-oss
++ * (sound/soc/mediatek/mt6781, sound/soc/codecs/mt6358.c, sound/soc/codecs/aw87xxx and the vendor aw87xxx_pid_5a_*
++ * scene files); the bring-up recipe with sources is in the session research notes (VIVA.md, 0222).
++ *
++ * LK leaves the audio infra clocks open, audio_sel on 26 MHz, VAUD28 on, GPIO183 in mode 1 and AFE_IRQ_MCU_EN at
++ * ~0 (read 2026-11-19); 184-186 are switched to mode 1 here.
++ *
++ * Playback: DL1 reads a ring in AFE SRAM (0x11212000), 48 kHz, stereo, S32_LE (left = receiver, right =
++ * loudspeaker), 10 ms periods; the period interrupt (IRQ0, SPI 169) advances a frame counter with its host time.
++ * Outputs are a mask (VA_OUT_RCV, VA_OUT_SPK) chosen per stream; the amps load the vendor "music" or "rcv" scene.
++ *
++ * Link: "aud" status, "aud tone [spk|rcv|both]" AFE sine generator, "aud play [spk|rcv|both] [HZ]" a sine through
++ * DL1 and the interrupt, "aud off", "aud rd PMICADDR [N]" and "aud wr PMICADDR VAL" (codec registers),
++ * "aud peek OFF [N]" (AFE registers). Boot-arg vivaaudio=0: off.
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOCommandGate.h>
++#include <IOKit/IOFilterInterruptEventSource.h>
++#include <pexpert/pexpert.h>
++#include <sys/param.h>
++
++#include "VivaIO.h"
++#include "VivaPMIC.h"
++
++/* AFE (mt6781-reg.h) */
++#define AUDIO_TOP_CON0          0x000   /* gates, 1 = off: 2 AFE, 24 ADC, 25 DAC, 26 DAC_PREDIS */
++#define AFE_DAC_CON0            0x010   /* 0 AFE_ON, 4 DL1_ON */
++#define AFE_CONN3               0x02c   /* O03 = ADDA DL CH1: bit 5 = I05 DL1_CH1 */
++#define AFE_CONN4               0x030   /* O04 = ADDA DL CH2: bit 6 = I06 DL1_CH2 */
++#define AFE_CONN_24BIT          0x048
++#define AFE_DL1_CON0            0x04c   /* MODE[27:24], MINLEN[23:20], PBUF[13:12], MONO 8, NORMAL_MODE 5, HD[1:0] */
++#define AFE_DL1_BASE_MSB        0x050
++#define AFE_DL1_BASE            0x054
++#define AFE_DL1_CUR             0x05c
++#define AFE_DL1_END_MSB         0x060
++#define AFE_DL1_END             0x064
++#define AFE_ADDA_DL_SRC2_CON0   0x108
++#define AFE_ADDA_DL_SRC2_CON1   0x10c
++#define AFE_ADDA_UL_DL_CON0     0x124
++#define AFE_SINEGEN_CON2        0x1dc
++#define AFE_SINEGEN_CON0        0x1f0
++#define AFE_ADDA_PREDIS_CON0    0x260
++#define AFE_ADDA_PREDIS_CON1    0x264
++#define AFE_IRQ_MCU_CON1        0x2e4   /* [3:0] IRQ0 rate */
++#define AFE_IRQ_MCU_CNT0        0x300   /* [17:0] frames per IRQ0 */
++#define AFE_IRQ_MCU_DSP2_EN     0x30c
++#define AFE_IRQ_MCU_CON0        0x3a0   /* bit n: IRQn on */
++#define AFE_IRQ_MCU_STATUS      0x3a4
++#define AFE_IRQ_MCU_CLR         0x3a8
++#define AFE_IRQ_MCU_EN          0x3b4   /* routed to the AP */
++#define AFE_IRQ_MCU_DSP_EN      0x3d0
++#define AFE_IRQ_MCU_SCP_EN      0x3d4
++#define AFE_MEMIF_CON0          0x8cc
++#define AFE_CONN_24BIT_1        0x994
++#define AFE_ADDA_DL_SDM_DCCOMP_CON 0xc50
++#define AFE_ADDA_DL_SDM_DITHER_CON 0xc70
++#define AFE_ADDA_DL_SDM_AUTO_RESET_CON 0xc74
++#define AFE_ADDA_MTKAIF_CFG0    0xe00
++
++#define VA_RATE                 48000
++#define VA_RATE_MEMIF           10      /* memif/IRQ rate index of 48 kHz */
++#define VA_FRAME_BYTES          8       /* stereo S32_LE */
++#define VA_PERIOD_FRAMES        480     /* 10 ms */
++#define VA_PERIODS              10
++
++#define VA_OUT_RCV              1       /* HS, DAC L, AW87559 0x58 */
++#define VA_OUT_SPK              2       /* LOL, DAC R, AW87559 0x5B */
++
++#define CODEC_GAIN_LOL          10      /* -2 dB, vendor media tuning */
++#define CODEC_GAIN_HS           8       /* 0 dB (the Linux driver starts at +8 dB) */
++
++/* AW87559 scenes (vendor aw87xxx_pid_5a_{music,rcv}_{0,1}.bin): {reg, val} pairs; *_0 = 0x58, *_1 = 0x5B */
++static const uint8_t gAmpCommon[] = {
++	0x62, 0xb5, 0x78, 0x39, 0x79, 0xe5, 0x77, 0xc1, 0x77, 0xc1, 0x78, 0x7a, 0x79, 0x6c, 0x77, 0x81, 0x66, 0x69,
++	0x58, 0x00,
++};
++static const uint8_t gAmpMusic[] = {
++	0x02, 0x49, 0x03, 0x0a, 0x04, 0x80, 0x05, 0x08, 0x06, 0x0c, 0x07, 0x81, 0x08, 0x4e, 0x09, 0x0b, 0x0a, 0x08,
++	0x0b, 0x4b, 0x0c, 0x03, 0x0d, 0x77, 0x0e, 0x7a, 0x0f, 0x51, 0x10, 0x58, 0x60, 0x26, 0x61, 0x15, 0x63, 0x5a,
++	0x64, 0xd5, 0x65, 0x57, 0x67, 0x28, 0x68, 0x35, 0x69, 0x98, 0x70, 0x1c, 0x71, 0x9c, 0x72, 0x33, 0x73, 0x40,
++	0x74, 0x6c, 0x01, 0x78, 0xff, 0x11,
++};
++static const uint8_t gAmpRcv[] = {
++	0x02, 0x09, 0x03, 0x0a, 0x04, 0x80, 0x05, 0x08, 0x06, 0x00, 0x07, 0x93, 0x08, 0x4e, 0x09, 0x0b, 0x0a, 0x08,
++	0x0b, 0x4b, 0x0c, 0x00, 0x0d, 0x77, 0x0e, 0x7a, 0x0f, 0x51, 0x10, 0x40, 0x60, 0x26, 0x61, 0x15, 0x63, 0x5a,
++	0x64, 0xd5, 0x65, 0x57, 0x67, 0x28, 0x68, 0x22, 0x69, 0xa4, 0x70, 0x1c, 0x71, 0x9c, 0x72, 0xb3, 0x73, 0x44,
++	0x74, 0x6c, 0x01, 0x7c, 0xff, 0x31,
++};
++
++class VivaAudio : public IOService {
++	OSDeclareDefaultStructors(VivaAudio);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOWorkLoop *getWorkLoop(void) const APPLE_KEXT_OVERRIDE { return fWorkLoop; }
++	void link(const char *args, char *out, size_t len);
++
++	/* Playback from the SRAM ring with `outputs` (VA_OUT_*; 0 stops); `receiverScene` loads the amps' "rcv" scene. */
++	IOReturn startOutput(uint32_t outputs, bool receiverScene);
++	IOReturn stopOutput(void);
++	/* Frames played (period granularity) and the host time of the last period interrupt. */
++	void clock(uint64_t *frames, uint64_t *hostTime);
++	volatile uint8_t *ring(uint32_t *bytes) { *bytes = fRingBytes; return (volatile uint8_t *)fSRAM; }
++
++private:
++	static bool irqFilter(OSObject *owner, IOFilterInterruptEventSource *src);
++	static void irqAction(OSObject *owner, IOInterruptEventSource *src, int count) {}
++	inline uint32_t rd(uint32_t off) { return *(volatile uint32_t *)(fAFE + off); }
++	inline void wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(fAFE + off) = v; }
++	inline void bits(uint32_t off, uint32_t mask, uint32_t v) { wr(off, (rd(off) & ~mask) | v); }
++	void pw(uint32_t addr, uint32_t mask, uint32_t v);
++	uint32_t dt(const char *key, uint32_t idx, uint32_t dflt);
++
++	void afeUpGated(void);
++	void addaUpGated(void);
++	void addaDownGated(void);
++	void codecUpGated(void);
++	void codecDownGated(void);
++	void ncpUpGated(void);
++	void ncpDownGated(void);
++	void lolGated(bool on);
++	void hsGated(bool on);
++	void ampGated(uint32_t out, bool on, bool rcvScene);
++	void routeGated(uint32_t outputs);
++	void memifGated(bool on);
++	void toneGated(bool on);
++	IOReturn outputsGated(uint32_t outputs, bool rcvScene, bool tone);
++
++	IOWorkLoop          *fWorkLoop;
++	IOCommandGate       *fGate;
++	IOFilterInterruptEventSource *fIrq;
++	IOMemoryMap         *fAFEMap, *fSRAMMap;
++	vm_offset_t          fAFE, fSRAM;
++	uint64_t             fSRAMPhys;
++	uint32_t             fRingBytes;
++	VivaPwrap           *fPwrap;
++	VivaGPIO            *fGPIO;
++	VivaI2C             *fAmpBus;
++	uint32_t             fAmpAddr[2], fAmpReset[2];     /* [0] receiver 0x58, [1] loudspeaker 0x5B */
++	bool                 fAfeUp, fAddaUp, fCodecUp, fNcpUp, fMemifOn, fToneOn, fRcvScene;
++	uint32_t             fOutputs;
++	uint32_t             fPmicErrors, fI2CErrors;
++	volatile uint64_t    fFrames, fHostTime;
++	volatile uint32_t    fIrqs, fOtherIrqs;
++};
++
++OSDefineMetaClassAndStructors(VivaAudio, IOService);
++
++static VivaAudio *gVivaAudio;
++
++uint32_t
++VivaAudio::dt(const char *key, uint32_t idx, uint32_t dflt)
++{
++	OSData *d = OSDynamicCast(OSData, getProvider()->getProperty(key));
++	return (d != NULL && d->getLength() >= 4 * (idx + 1)) ? ((const uint32_t *)d->getBytesNoCopy())[idx] : dflt;
++}
++
++void
++VivaAudio::pw(uint32_t addr, uint32_t mask, uint32_t v)
++{
++	fPmicErrors += fPwrap->writeAudio(addr, mask, v) != kIOReturnSuccess;
++}
++
++/* mt6781_afe_enable_clock + runtime_resume: AFE, DAC and DAC predistortion clocks, 24-bit CONN, AFE_ON. */
++void
++VivaAudio::afeUpGated(void)
++{
++	if (fAfeUp) {
++		return;
++	}
++	bits(AUDIO_TOP_CON0, (1u << 2) | (1u << 25) | (1u << 26), 0);
++	wr(AFE_CONN_24BIT, 0xffffffff);
++	wr(AFE_CONN_24BIT_1, 0xffffffff);
++	bits(AFE_MEMIF_CON0, 1u << 1, 0);
++	bits(AFE_DAC_CON0, 1, 1);
++	wr(AFE_IRQ_MCU_CLR, 0xffffffff);
++	bits(AFE_IRQ_MCU_SCP_EN, 1, 0);
++	bits(AFE_IRQ_MCU_DSP_EN, 1, 0);
++	bits(AFE_IRQ_MCU_DSP2_EN, 1, 0);
++	if (!(rd(AFE_IRQ_MCU_EN) & 1)) {
++		bits(AFE_IRQ_MCU_EN, 1, 1);
++	}
++	wr(AFE_ADDA_MTKAIF_CFG0, 0);    /* MTKAIF protocol 1 */
++	for (uint32_t pin = 183; pin <= 186; pin++) {
++		fGPIO->setMode(pin, 1);
++	}
++	fAfeUp = true;
++}
++
++/* mtk_dai_adda_hw_params (48 kHz) + "ADDA Enable" + "ADDA Playback Enable" */
++void
++VivaAudio::addaUpGated(void)
++{
++	if (fAddaUp) {
++		return;
++	}
++	wr(AFE_ADDA_PREDIS_CON0, 0);
++	wr(AFE_ADDA_PREDIS_CON1, 0);
++	wr(AFE_ADDA_DL_SRC2_CON0, 0x83001802);  /* 48 kHz in, x8 up-sampling, mutes off, gain on */
++	wr(AFE_ADDA_DL_SRC2_CON1, 0xf74f0000);  /* -0.3 dB */
++	bits(AFE_ADDA_DL_SDM_DCCOMP_CON, (1u << 28) | 0x3f, 0x1d);
++	bits(AFE_ADDA_DL_SDM_DITHER_CON, 1u << 20, 1u << 20);
++	bits(AFE_ADDA_DL_SDM_AUTO_RESET_CON, 1u << 28, 1u << 28);
++	wr(AFE_ADDA_DL_SDM_AUTO_RESET_CON, 0x00190000);
++	bits(AFE_ADDA_DL_SDM_AUTO_RESET_CON, 1u << 31, 1u << 31);
++	bits(AFE_ADDA_UL_DL_CON0, 1, 1);
++	bits(AFE_ADDA_DL_SRC2_CON0, 1, 1);
++	fAddaUp = true;
++}
++
++void
++VivaAudio::addaDownGated(void)
++{
++	if (!fAddaUp) {
++		return;
++	}
++	bits(AFE_ADDA_DL_SRC2_CON0, 1, 0);
++	IODelay(125);
++	bits(AFE_ADDA_UL_DL_CON0, 1, 0);
++	bits(AUDIO_TOP_CON0, (1u << 25) | (1u << 26), (1u << 25) | (1u << 26));
++	fAddaUp = false;
++	fAfeUp = false;     /* the DAC clocks are gated again: afeUpGated reopens them */
++}
++
++/* MT6366: "DL Power Supply" + "DL Digital Clock" supplies, then AIF_RX (mt_aif_in_event, playback_gpio_set) */
++void
++VivaAudio::codecUpGated(void)
++{
++	if (fCodecUp) {
++		return;
++	}
++	pw(0x07ac, 0x2000, 0x2000);     /* DCXO_CW14: audio clock buffer */
++	pw(0x2422, 0x0010, 0);          /* AUDDEC_ANA_CON13: AUDGLB on */
++	pw(0x2394, 0x0002, 0);          /* AUDENC_ANA_CON6: CLKSQ input from DCXO */
++	pw(0x2394, 0x0001, 1);          /* CLKSQ on */
++	pw(0x220c, 0x0064, 0);          /* AUD_TOP_CKPDN_CON0: AUDNCP, ZCD13M, AUDIF clocks */
++	pw(0x220c, 0x0002, 0);          /* AUD_CK */
++	IODelay(250);
++	pw(0x2292, 0x0044, 0);          /* AUDIO_TOP_CON0: PDN_DAC_CTL, PWR_CLK_DIS_CTL */
++	pw(0x2292, 0x0080, 0);          /* PDN_AFE_CTL */
++	IODelay(250);
++	pw(0x2288, 0x0001, 1);          /* AFE_UL_DL_CON0: AFE_ON */
++	pw(0x00dc, 0xffff, 0x01f8);     /* GPIO_MODE2_CLR */
++	pw(0x00da, 0xffff, 0x0249);     /* GPIO_MODE2_SET: MOSI pads -> MTKAIF */
++	pw(0x00d8, 0xffff, 0x0249);
++	pw(0x0030, 0x0ff0, 0x0ff0);     /* SMT_CON1 */
++	pw(0x229a, 0xffff, 0x0006);     /* AFUNC_AUD_CON2: SDM FIFO clock */
++	pw(0x2296, 0xffff, 0xcfa1);     /* AFUNC_AUD_CON0: scrambler clock, left inverted */
++	pw(0x229a, 0xffff, 0x0003);     /* SDM power */
++	pw(0x229a, 0xffff, 0x000b);     /* SDM FIFO on */
++	pw(0x228a, 0x0001, 1);          /* AFE_DL_SRC2_CON0_L: DL_2_SRC_ON */
++	fCodecUp = true;
++}
++
++void
++VivaAudio::codecDownGated(void)
++{
++	if (!fCodecUp) {
++		return;
++	}
++	pw(0x228a, 0x0001, 0);
++	pw(0x229a, 0xffff, 0);
++	pw(0x2296, 0xffff, 0xcfa0);
++	pw(0x00dc, 0xffff, 0x01f8);     /* playback_gpio_reset */
++	pw(0x00d8, 0x01f8, 0);
++	pw(0x0088, 0x0f00, 0);
++	pw(0x0030, 0x0ff0, 0);
++	pw(0x2288, 0x0001, 0);
++	pw(0x2292, 0x0080, 0x0080);
++	IODelay(250);
++	pw(0x2292, 0x0044, 0x0044);
++	pw(0x220c, 0x0002, 0x0002);
++	IODelay(250);
++	pw(0x220c, 0x0064, 0x0064);
++	pw(0x2394, 0x0001, 0);
++	pw(0x2422, 0x0010, 0x0010);
++	pw(0x07ac, 0x2000, 0);
++	fCodecUp = false;
++}
++
++/* The negative charge pump, cap-less LDOs and NV regulator shared by LOL and HS (mt_lo_event / mt_rcv_event). */
++void
++VivaAudio::ncpUpGated(void)
++{
++	if (fNcpUp) {
++		return;
++	}
++	pw(0x240c, 0xffff, 0x4000);     /* AUDDEC_ANA_CON2: AU_REFN ESD resistance */
++	pw(0x223c, 0xffff, 0x0001);     /* AUDNCP_CLKDIV_CON1 */
++	pw(0x223e, 0xffff, 0x002c);     /* CON2: 26 MHz / 43 */
++	pw(0x223a, 0xffff, 0x0001);     /* CON0: RG_DIVCKS_CHG */
++	pw(0x2242, 0xffff, 0x0003);     /* CON4: soft start */
++	pw(0x2240, 0xffff, 0x0000);     /* CON3: NCP on */
++	IODelay(250);
++	pw(0x2424, 0x1055, 0x1055);     /* AUDDEC_ANA_CON14: cap-less LDOs */
++	pw(0x2426, 0xffff, 0x0001);     /* CON15: NV regulator */
++	IODelay(100);
++	pw(0x2488, 0xffff, 0x0000);     /* ZCD_CON0: ZCD off */
++	pw(0x2420, 0xffff, 0x0055);     /* AUDDEC_ANA_CON12: IBIST */
++	pw(0x241e, 0xffff, 0x4900);     /* CON11: driver bias */
++	fNcpUp = true;
++}
++
++void
++VivaAudio::ncpDownGated(void)
++{
++	if (!fNcpUp) {
++		return;
++	}
++	pw(0x2422, 0x0001, 0);          /* AUD_CLK */
++	pw(0x241a, 0xff00, 0x0200);     /* AUDDEC_ANA_CON9 */
++	pw(0x2420, 0x0100, 0x0100);     /* IBIST off */
++	pw(0x2426, 0x0001, 0);
++	pw(0x2424, 0x1055, 0);
++	pw(0x2240, 0x0001, 1);          /* NCP off */
++	fNcpUp = false;
++}
++
++/* LOL -> loudspeaker amp: mt_lo_event (DAC R) */
++void
++VivaAudio::lolGated(bool on)
++{
++	if (on) {
++		pw(0x2416, 0x0010, 0x0010);     /* AUDDEC_ANA_CON7: LOL short-circuit protection off */
++		pw(0x248a, 0xffff, 0x0912);     /* ZCD_CON1: -10 dB while powering up */
++		pw(0x2416, 0x0100, 0x0100);     /* LO stability enhance */
++		pw(0x241a, 0xffff, 0x0000);     /* CMFB loop off */
++		pw(0x241c, 0xffff, 0x0000);
++		pw(0x2416, 0x0002, 0x0002);     /* LO driver bias */
++		pw(0x2416, 0x0001, 0x0001);     /* LO driver core */
++		pw(0x248a, 0x0f9f, (CODEC_GAIN_LOL << 7) | CODEC_GAIN_LOL);
++		pw(0x2422, 0x0001, 0x0001);     /* AUD_CLK */
++		pw(0x2408, 0x0006, 0x0006);     /* AUDDEC_ANA_CON0: DAC R */
++		pw(0x241a, 0xffff, 0x0001);     /* DAC low-noise mode */
++		pw(0x2416, 0x000c, 0x0004);     /* LOL mux = DAC R */
++	} else {
++		pw(0x2416, 0x000c, 0);
++		pw(0x2408, 0x0006, 0);
++		pw(0x248a, 0xffff, 0x0f9f);     /* -40 dB */
++		pw(0x2416, 0x0001, 0);
++		pw(0x2416, 0x0002, 0);
++	}
++}
++
++/* HS -> receiver amp: mt_rcv_event (DAC L) */
++void
++VivaAudio::hsGated(bool on)
++{
++	if (on) {
++		pw(0x2414, 0xffff, 0x0010);     /* AUDDEC_ANA_CON6: HS short-circuit protection off */
++		pw(0x2414, 0xffff, 0x0090);     /* HS stability enhance */
++		pw(0x241a, 0xffff, 0x0000);
++		pw(0x241c, 0xffff, 0x0000);
++		pw(0x2414, 0xffff, 0x0092);     /* HS driver bias */
++		pw(0x2414, 0xffff, 0x0093);     /* HS driver core */
++		pw(0x248e, 0x001f, CODEC_GAIN_HS);
++		pw(0x2422, 0x0001, 0x0001);
++		pw(0x2408, 0x0009, 0x0009);     /* DAC L */
++		pw(0x241a, 0xffff, 0x0001);
++		pw(0x2414, 0xffff, 0x009b);     /* HS mux = DAC L */
++	} else {
++		pw(0x2414, 0x000c, 0);
++		pw(0x2408, 0x0009, 0);
++		pw(0x248e, 0x001f, 0x001f);
++		pw(0x2414, 0x0001, 0);
++		pw(0x2414, 0x0002, 0);
++	}
++}
++
++/* aw87xxx_hw_on + scene, or the "off" scene (SYSCTRL 0) + reset low */
++void
++VivaAudio::ampGated(uint32_t out, bool on, bool rcvScene)
++{
++	unsigned int i = out == VA_OUT_SPK;
++	uint8_t a = (uint8_t)fAmpAddr[i];
++	if (!on) {
++		uint8_t b[2] = { 0x01, 0x00 };
++		fI2CErrors += fAmpBus->transfer(a, b, 2, NULL, 0) != kIOReturnSuccess;
++		fGPIO->setOutput(fAmpReset[i], false);
++		return;
++	}
++	fGPIO->setOutput(fAmpReset[i], false);
++	IODelay(2000);
++	fGPIO->setOutput(fAmpReset[i], true);
++	IODelay(2000);
++	const uint8_t *scene = rcvScene ? gAmpRcv : gAmpMusic;
++	size_t n = rcvScene ? sizeof(gAmpRcv) : sizeof(gAmpMusic);
++	for (size_t k = 0; k < sizeof(gAmpCommon); k += 2) {
++		fI2CErrors += fAmpBus->transfer(a, &gAmpCommon[k], 2, NULL, 0) != kIOReturnSuccess;
++	}
++	for (size_t k = 0; k < n; k += 2) {
++		uint8_t b[2] = { scene[k], scene[k + 1] };
++		if (!rcvScene && i == 1 && b[0] == 0x07) {
++			b[1] = 0x8a;            /* music_1 */
++		}
++		if (b[0] == 0xff) {
++			b[1] &= (uint8_t)~1;    /* *_1 files end with an even value, *_0 with an odd one */
++			b[1] |= (uint8_t)(i == 0);
++		}
++		fI2CErrors += fAmpBus->transfer(a, b, 2, NULL, 0) != kIOReturnSuccess;
++	}
++}
++
++/* DL1 CH1 -> ADDA DL CH1 (receiver), DL1 CH2 -> CH2 (loudspeaker) */
++void
++VivaAudio::routeGated(uint32_t outputs)
++{
++	bits(AFE_CONN3, 1u << 5, (outputs & VA_OUT_RCV) ? 1u << 5 : 0);
++	bits(AFE_CONN4, 1u << 6, (outputs & VA_OUT_SPK) ? 1u << 6 : 0);
++}
++
++void
++VivaAudio::memifGated(bool on)
++{
++	if (on == fMemifOn) {
++		return;
++	}
++	if (!on) {
++		bits(AFE_DAC_CON0, 1u << 4, 0);
++		bits(AFE_IRQ_MCU_CON0, 1, 0);
++		wr(AFE_IRQ_MCU_CLR, 1);
++		fMemifOn = false;
++		return;
++	}
++	bits(AFE_DAC_CON0, 1u << 4, 0);
++	wr(AFE_DL1_BASE_MSB, (uint32_t)(fSRAMPhys >> 32));
++	wr(AFE_DL1_BASE, (uint32_t)fSRAMPhys);
++	wr(AFE_DL1_END_MSB, (uint32_t)((fSRAMPhys + fRingBytes - 1) >> 32));
++	wr(AFE_DL1_END, (uint32_t)(fSRAMPhys + fRingBytes - 1));
++	/* 48 kHz, stereo, normal (SRAM) mode, S32_LE, PBUF/MINLEN 0 for 10 ms periods */
++	bits(AFE_DL1_CON0, (0xfu << 24) | (0xfu << 20) | (3u << 12) | (1u << 8) | (1u << 5) | 3u,
++	    ((uint32_t)VA_RATE_MEMIF << 24) | (1u << 5) | 2u);
++	fFrames = 0;
++	fHostTime = mach_absolute_time();
++	bits(AFE_DAC_CON0, 1u << 4, 1u << 4);
++	bits(AFE_IRQ_MCU_CNT0, 0x3ffff, VA_PERIOD_FRAMES);
++	bits(AFE_IRQ_MCU_CON1, 0xf, VA_RATE_MEMIF);
++	wr(AFE_IRQ_MCU_CLR, 1);
++	bits(AFE_IRQ_MCU_CON0, 1, 1);
++	fMemifOn = true;
++}
++
++/* AFE sine generator in place of ADDA DL CH1/CH2 (mt6781-misc-control.c "O3O4") */
++void
++VivaAudio::toneGated(bool on)
++{
++	if (on) {
++		bits(AFE_SINEGEN_CON2, 0xff, 132);
++		wr(AFE_SINEGEN_CON0, 0x04ac2ac1);
++	} else {
++		wr(AFE_SINEGEN_CON0, 0);
++		bits(AFE_SINEGEN_CON2, 0xff, 0x3f);
++	}
++	fToneOn = on;
++}
++
++IOReturn
++VivaAudio::outputsGated(uint32_t outputs, bool rcvScene, bool tone)
++{
++	uint32_t old = fOutputs;
++	/* amps off first, before anything under them changes */
++	for (uint32_t o = VA_OUT_RCV; o <= VA_OUT_SPK; o <<= 1) {
++		if ((old & o) && (!(outputs & o) || rcvScene != fRcvScene)) {
++			ampGated(o, false, false);
++		}
++	}
++	if (outputs == 0) {
++		memifGated(false);
++		toneGated(false);
++		routeGated(0);
++		if (old & VA_OUT_SPK) {
++			lolGated(false);
++		}
++		if (old & VA_OUT_RCV) {
++			hsGated(false);
++		}
++		ncpDownGated();
++		codecDownGated();
++		addaDownGated();
++		fOutputs = 0;
++		return kIOReturnSuccess;
++	}
++	afeUpGated();
++	addaUpGated();
++	codecUpGated();
++	ncpUpGated();
++	if ((outputs & VA_OUT_SPK) != (old & VA_OUT_SPK)) {
++		lolGated(outputs & VA_OUT_SPK);
++	}
++	if ((outputs & VA_OUT_RCV) != (old & VA_OUT_RCV)) {
++		hsGated(outputs & VA_OUT_RCV);
++	}
++	routeGated(outputs);
++	if (tone) {
++		memifGated(false);
++		toneGated(true);
++	} else {
++		toneGated(false);
++		memifGated(true);
++	}
++	IOSleep(10);    /* one period before the amps (POST_PMU) */
++	for (uint32_t o = VA_OUT_RCV; o <= VA_OUT_SPK; o <<= 1) {
++		if ((outputs & o) && (!(old & o) || rcvScene != fRcvScene)) {
++			ampGated(o, true, rcvScene);
++		}
++	}
++	fOutputs = outputs;
++	fRcvScene = rcvScene;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++VivaAudio::startOutput(uint32_t outputs, bool receiverScene)
++{
++	return fGate->runActionBlock(^IOReturn {
++		return outputsGated(outputs & (VA_OUT_RCV | VA_OUT_SPK), receiverScene, false);
++	});
++}
++
++IOReturn
++VivaAudio::stopOutput(void)
++{
++	return fGate->runActionBlock(^IOReturn {
++		return outputsGated(0, false, false);
++	});
++}
++
++void
++VivaAudio::clock(uint64_t *frames, uint64_t *hostTime)
++{
++	uint64_t f, t;
++	do {
++		f = fFrames;
++		t = fHostTime;
++	} while (f != fFrames);
++	*frames = f;
++	*hostTime = t;
++}
++
++/* Primary interrupt context: count the period and take its time here, before any scheduling delay. */
++bool
++VivaAudio::irqFilter(OSObject *owner, IOFilterInterruptEventSource *src __unused)
++{
++	VivaAudio *me = (VivaAudio *)owner;
++	uint32_t st = me->rd(AFE_IRQ_MCU_STATUS) & 0x87ffffff;
++	if (st & 1) {
++		me->fHostTime = mach_absolute_time();
++		me->fFrames += VA_PERIOD_FRAMES;
++		me->fIrqs++;
++	}
++	if (st & ~1u) {
++		me->fOtherIrqs++;
++	}
++	me->wr(AFE_IRQ_MCU_CLR, st ? st : 1);
++	return false;
++}
++
++static uint32_t
++parseOutputs(const char **args)
++{
++	while (**args == ' ') {
++		(*args)++;
++	}
++	uint32_t o = VA_OUT_SPK;
++	if (strncmp(*args, "rcv", 3) == 0) {
++		o = VA_OUT_RCV;
++	} else if (strncmp(*args, "both", 4) == 0) {
++		o = VA_OUT_RCV | VA_OUT_SPK;
++	}
++	while (**args && **args != ' ') {
++		(*args)++;
++	}
++	return o;
++}
++
++void
++VivaAudio::link(const char *args, char *out, size_t len)
++{
++	while (*args == ' ') {
++		args++;
++	}
++	int c = 0;
++	if (strncmp(args, "rd ", 3) == 0 || strncmp(args, "wr ", 3) == 0) {
++		char *end;
++		uint32_t a = (uint32_t)strtoul(args + 3, &end, 0);
++		uint32_t v = (uint32_t)strtoul(end, NULL, 0);
++		if (args[0] == 'w') {
++			IOReturn r = fPwrap->writeAudio(a, 0xffff, v & 0xffff);
++			snprintf(out, len, "aud pmic 0x%04x <- 0x%04x: 0x%x\n", a, v & 0xffff, r);
++		} else {
++			v = MIN(MAX(v, 1u), 16u);
++			c = snprintf(out, len, "aud pmic 0x%04x:", a);
++			for (uint32_t i = 0; i < v && c < (int)len - 8; i++) {
++				uint32_t x = 0;
++				fPwrap->readPMIC(a + 2 * i, &x);
++				c += snprintf(out + c, len - c, " %04x", x);
++			}
++			snprintf(out + c, len - c, "\n");
++		}
++		return;
++	}
++	if (strncmp(args, "peek ", 5) == 0) {
++		char *end;
++		uint32_t off = (uint32_t)strtoul(args + 5, &end, 0) & 0x1ffc;
++		uint32_t n = MIN(MAX((uint32_t)strtoul(end, NULL, 0), 1u), 16u);
++		c = snprintf(out, len, "aud afe 0x%03x:", off);
++		for (uint32_t i = 0; i < n && off + 4 * i < 0x2000 && c < (int)len - 10; i++) {
++			c += snprintf(out + c, len - c, " %08x", rd(off + 4 * i));
++		}
++		snprintf(out + c, len - c, "\n");
++		return;
++	}
++	if (strncmp(args, "tone", 4) == 0 || strncmp(args, "play", 4) == 0) {
++		bool tone = args[0] == 't';
++		const char *p = args + 4;
++		uint32_t o = parseOutputs(&p);
++		uint32_t hz = (uint32_t)strtoul(p, NULL, 10);
++		hz = hz ? MIN(MAX(hz, 50u), 8000u) : 1000;
++		if (!tone) {
++			/* one period-aligned ring of a sine, -12 dB: Bhaskara's approximation, no FP in the kernel */
++			volatile int32_t *s = (volatile int32_t *)fSRAM;
++			uint32_t frames = fRingBytes / VA_FRAME_BYTES;
++			for (uint32_t i = 0; i < frames; i++) {
++				uint32_t ph = (uint32_t)(((uint64_t)i * hz * 360 / VA_RATE) % 360);
++				int64_t x = ph % 180, y = 4 * x * (180 - x) * 0x20000000ll / (40500 - x * (180 - x));
++				int32_t v = (int32_t)(ph < 180 ? y : -y);
++				s[2 * i] = v;
++				s[2 * i + 1] = v;
++			}
++		}
++		fGate->runActionBlock(^IOReturn {
++			return outputsGated(o, o == VA_OUT_RCV, tone);
++		});
++	} else if (strncmp(args, "off", 3) == 0) {
++		stopOutput();
++	}
++	uint64_t f, t;
++	clock(&f, &t);
++	uint32_t cur = fMemifOn ? rd(AFE_DL1_CUR) - (uint32_t)fSRAMPhys : 0;
++	snprintf(out, len, "aud: outputs %s%s%s%s, %s, %llu frames, %u period IRQs (%u other), DL1 at %u/%u, "
++	    "AUDIO_TOP_CON0 %08x DAC_CON0 %08x IRQ_EN %08x, codec ID %04x, %u PMIC / %u I2C errors\n",
++	    fOutputs & VA_OUT_RCV ? "rcv " : "", fOutputs & VA_OUT_SPK ? "spk " : "", fOutputs ? "" : "none ",
++	    fRcvScene ? "(rcv scene)" : "", fToneOn ? "sine generator" : (fMemifOn ? "DL1 running" : "idle"), f, fIrqs,
++	    fOtherIrqs, cur, fRingBytes, rd(AUDIO_TOP_CON0), rd(AFE_DAC_CON0), rd(AFE_IRQ_MCU_EN),
++	    ({ uint32_t id = 0; fPwrap->readPMIC(0x2200, &id); id; }), fPmicErrors, fI2CErrors);
++}
++
++bool
++VivaAudio::start(IOService *provider)
++{
++	int enable = 1;
++	PE_parse_boot_argn("vivaaudio", &enable, sizeof(enable));
++	if (!enable || !IOService::start(provider)) {
++		return false;
++	}
++	fPwrap = VivaPwrap::wait();
++	fGPIO = VivaGPIO::wait();
++	fAmpBus = VivaI2C::wait(dt("amp-bus", 0, 5));
++	fAFEMap = provider->mapDeviceMemoryWithIndex(0);
++	fSRAMMap = provider->mapDeviceMemoryWithIndex(1, kIOMapWriteCombineCache);
++	if (fPwrap == NULL || fGPIO == NULL || fAmpBus == NULL || fAFEMap == NULL || fSRAMMap == NULL) {
++		IOLog("VIVA AUDIO: missing pwrap %p gpio %p i2c %p afe %p sram %p\n", fPwrap, fGPIO, fAmpBus, fAFEMap,
++		    fSRAMMap);
++		return false;
++	}
++	fAFE = (vm_offset_t)fAFEMap->getVirtualAddress();
++	fSRAM = (vm_offset_t)fSRAMMap->getVirtualAddress();
++	fSRAMPhys = fSRAMMap->getPhysicalAddress();
++	uint32_t bytes = MIN(dt("sram-bytes", 0, 0x9c00), (uint32_t)fSRAMMap->getLength());
++	fRingBytes = MIN(bytes / (VA_PERIOD_FRAMES * VA_FRAME_BYTES), (uint32_t)VA_PERIODS) *
++	    VA_PERIOD_FRAMES * VA_FRAME_BYTES;
++	fAmpAddr[0] = dt("rcv-amp", 0, 0x58);
++	fAmpReset[0] = dt("rcv-amp", 1, 19);
++	fAmpAddr[1] = dt("spk-amp", 0, 0x5b);
++	fAmpReset[1] = dt("spk-amp", 1, 25);
++
++	fWorkLoop = IOWorkLoop::workLoop();
++	fGate = fWorkLoop ? IOCommandGate::commandGate(this) : NULL;
++	fIrq = fWorkLoop ? IOFilterInterruptEventSource::filterInterruptEventSource(this, &VivaAudio::irqAction,
++	    &VivaAudio::irqFilter, provider, 0) : NULL;
++	if (fGate == NULL || fIrq == NULL || fWorkLoop->addEventSource(fGate) != kIOReturnSuccess ||
++	    fWorkLoop->addEventSource(fIrq) != kIOReturnSuccess) {
++		return false;
++	}
++	fIrq->enable();
++	uint32_t id = 0;
++	fPwrap->readPMIC(0x2200, &id);
++	IOLog("VIVA AUDIO: AFE at %#llx, ring %u bytes in SRAM at %#llx, codec AUD_TOP_ID %04x, amps 0x%02x/0x%02x "
++	    "on I2C%u\n", (uint64_t)fAFEMap->getPhysicalAddress(), fRingBytes, fSRAMPhys, id, fAmpAddr[0], fAmpAddr[1],
++	    fAmpBus->busId());
++	gVivaAudio = this;
++	registerService();
++	return true;
++}
++
++/* viva_usb.c: link "aud ..." */
++extern "C" void
++viva_audio_link(const char *args, char *out, size_t len)
++{
++	if (gVivaAudio == NULL) {
++		snprintf(out, len, "aud: no audio driver (vivaaudio=0 or start failed, see the boot log)\n");
++		return;
++	}
++	gVivaAudio->link(args, out, len);
++}
+diff --git a/iokit/Kernel/arm/VivaIO.cpp b/iokit/Kernel/arm/VivaIO.cpp
+index f59fe0a..82e591e 100644
+--- a/iokit/Kernel/arm/VivaIO.cpp
++++ b/iokit/Kernel/arm/VivaIO.cpp
+@@ -23,6 +23,7 @@
+ #define GPIO_DIR        0x000
+ #define GPIO_DOUT       0x100
+ #define GPIO_DIN        0x200
++#define GPIO_MODE       0x300   /* 4 bits per pin, 8 pins per 0x10 */
+ #define GPIO_SET        0x4
+ #define GPIO_CLR        0x8
+ #define GPIO_PINS       203
+@@ -46,7 +47,12 @@ VivaGPIO::start(IOService *provider)
+ 	if (fOutputs != NULL) {
+ 		fOutputs->retain();
+ 	}
+-	IOLog("VIVA GPIO: %u output pins allowed\n", fOutputs ? fOutputs->getLength() / 4 : 0);
++	fModePins = OSDynamicCast(OSData, provider->getProperty("mode-pins"));
++	if (fModePins != NULL) {
++		fModePins->retain();
++	}
++	IOLog("VIVA GPIO: %u output pins allowed, %u mode pins\n", fOutputs ? fOutputs->getLength() / 4 : 0,
++	    fModePins ? fModePins->getLength() / 4 : 0);
+ 	gVivaGPIO = this;
+ 	registerService();
+ 	return true;
+@@ -89,6 +95,34 @@ VivaGPIO::setOutput(uint32_t pin, bool high)
+ 	return kIOReturnSuccess;
+ }
+ 
++IOReturn
++VivaGPIO::setMode(uint32_t pin, uint32_t mode)
++{
++	bool allowed = false;
++	const uint32_t *pins = fModePins ? (const uint32_t *)fModePins->getBytesNoCopy() : NULL;
++	for (unsigned int i = 0; pins != NULL && i < fModePins->getLength() / 4; i++) {
++		allowed |= pins[i] == pin;
++	}
++	if (pin >= GPIO_PINS || mode > 7 || !allowed) {
++		IOLog("VIVA GPIO: refused mode %u on pin %u\n", mode, pin);
++		return kIOReturnNotPermitted;
++	}
++	uint32_t reg = GPIO_MODE + 0x10 * (pin / 8), shift = 4 * (pin % 8);
++	wr32(reg + GPIO_CLR, 0xfu << shift);
++	wr32(reg + GPIO_SET, mode << shift);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++VivaGPIO::getMode(uint32_t pin, uint32_t *mode)
++{
++	if (pin >= GPIO_PINS || mode == NULL) {
++		return kIOReturnBadArgument;
++	}
++	*mode = (rd32(GPIO_MODE + 0x10 * (pin / 8)) >> (4 * (pin % 8))) & 0xf;
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ VivaGPIO::getInput(uint32_t pin, bool *high)
+ {
+diff --git a/iokit/Kernel/arm/VivaIO.h b/iokit/Kernel/arm/VivaIO.h
+index 24552c9..a81a726 100644
+--- a/iokit/Kernel/arm/VivaIO.h
++++ b/iokit/Kernel/arm/VivaIO.h
+@@ -28,6 +28,9 @@ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	IOReturn setOutput(uint32_t pin, bool high);
+ 	IOReturn getInput(uint32_t pin, bool *high);
++	/* Pin function (MODE register, 4 bits per pin) for the pins of the DT's "mode-pins" only (audio, 0222). */
++	IOReturn setMode(uint32_t pin, uint32_t mode);
++	IOReturn getMode(uint32_t pin, uint32_t *mode);
+ 	/* The started instance, waiting for it if needed (NULL after timeout). */
+ 	static VivaGPIO *wait(void);
+ 
+@@ -39,6 +42,7 @@ private:
+ 	IOMemoryMap *fMap;
+ 	vm_offset_t  fRegs;
+ 	OSData      *fOutputs;
++	OSData      *fModePins;
+ };
+ 
+ class VivaI2C : public IOService {
+diff --git a/iokit/Kernel/arm/VivaPMIC.h b/iokit/Kernel/arm/VivaPMIC.h
+index d690b7e..b6d1c44 100644
+--- a/iokit/Kernel/arm/VivaPMIC.h
++++ b/iokit/Kernel/arm/VivaPMIC.h
+@@ -38,6 +38,12 @@ public:
+ 	 * read-modify-write of the bits in `mask`, read back. Everything else is refused.
+ 	 */
+ 	IOReturn writeRegulator(uint32_t addr, uint32_t mask, uint32_t value);
++	/*
++	 * Audio (VivaAudio, 0222): read-modify-write of `mask` in the MT6366 codec block 0x2200-0x24FF, its PMIC pads
++	 * (GPIO_MODE2/3 + SET/CLR, SMT_CON1, DRV_CON3, GPIO_DIR0 bits) and the audio bit of DCXO_CW14. mask 0xffff
++	 * writes `value` without reading first. Everything else is refused.
++	 */
++	IOReturn writeAudio(uint32_t addr, uint32_t mask, uint32_t value);
+ 	/* The started instance, waiting for it if needed (NULL after timeout). */
+ 	static VivaPwrap *wait(void);
+ 	/*
+diff --git a/iokit/Kernel/arm/VivaPwrap.cpp b/iokit/Kernel/arm/VivaPwrap.cpp
+index 33df473..376f5d6 100644
+--- a/iokit/Kernel/arm/VivaPwrap.cpp
++++ b/iokit/Kernel/arm/VivaPwrap.cpp
+@@ -319,6 +319,64 @@ VivaPwrap::writeRegulator(uint32_t addr, uint32_t mask, uint32_t value)
+ 	return ret;
+ }
+ 
++/*
++ * Audio (0222; mt6358.c of viva-r-oss, the MT6366 uses the MT6358 map): the codec block, its pads and the shared
++ * DCXO_CW14 audio clock-buffer bit. {addr, mask of writable bits}.
++ */
++static const struct {
++	uint16_t addr, mask;
++} gVivaAudioRegs[] = {
++	{ 0x0030, 0x0ff0 },     /* SMT_CON1: MTKAIF pad Schmitt triggers */
++	{ 0x003c, 0xffff },     /* DRV_CON3: MISO pad drive */
++	{ 0x0088, 0xff00 },     /* GPIO_DIR0: audio pads */
++	{ 0x00d8, 0xffff },     /* GPIO_MODE2 (+ SET 0xda, CLR 0xdc): MOSI pads */
++	{ 0x00da, 0xffff },
++	{ 0x00dc, 0xffff },
++	{ 0x00de, 0xffff },     /* GPIO_MODE3 (+ SET 0xe0, CLR 0xe2): MISO pads */
++	{ 0x00e0, 0xffff },
++	{ 0x00e2, 0xffff },
++	{ 0x07ac, 0x2000 },     /* DCXO_CW14: RG_XO_AUDIO_EN_M only */
++};
++
++IOReturn
++VivaPwrap::writeAudio(uint32_t addr, uint32_t mask, uint32_t value)
++{
++	uint32_t allowed = 0;
++	if (addr >= 0x2200 && addr <= 0x24fe && (addr & 1) == 0) {
++		allowed = 0xffff;
++	}
++	for (unsigned int i = 0; i < sizeof(gVivaAudioRegs) / sizeof(gVivaAudioRegs[0]); i++) {
++		if (gVivaAudioRegs[i].addr == addr) {
++			allowed = gVivaAudioRegs[i].mask;
++		}
++	}
++	if (mask == 0 || (mask & ~allowed) || (value & ~mask)) {
++		IOLog("VIVA PWRAP: refused audio write 0x%04x mask 0x%x <- 0x%x\n", addr, mask, value);
++		return kIOReturnNotPermitted;
++	}
++	IOReturn ret = kIOReturnSuccess;
++	uint32_t old = 0;
++	IOLockLock(fLock);
++	if (mask != 0xffff) {
++		ret = readNoLock(addr, &old);
++	}
++	if (ret == kIOReturnSuccess) {
++		ret = kIOReturnTimeout;
++		if (WACS_FSM(rd32(PWRAP_WACS2_RDATA)) == WACS_FSM_WFVLDCLR) {
++			wr32(PWRAP_WACS2_VLDCLR, 1);
++		}
++		if (waitFSM(WACS_FSM_IDLE)) {
++			wr32(PWRAP_WACS2_CMD, 0x80000000u | ((addr >> 1) << 16) | (((old & ~mask) | value) & 0xffff));
++			ret = waitFSM(WACS_FSM_IDLE) ? kIOReturnSuccess : kIOReturnTimeout;
++		}
++	}
++	IOLockUnlock(fLock);
++	if (ret != kIOReturnSuccess) {
++		IOLog("VIVA PWRAP: audio write 0x%04x failed (0x%x)\n", addr, ret);
++	}
++	return ret;
++}
++
+ VivaPwrap *
+ VivaPwrap::wait(void)
+ {
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index ffd23a2..3bf0053 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -128,6 +128,11 @@ const char * gIOKernelConfigTables =
+     "     'IONameMatch'     = 'awinic,aw862xx-haptic';"
+     "   },"
+     "   {"
++    "     'IOClass'         = VivaAudio;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'mediatek,mt6781-afe';"
++    "   },"
++    "   {"
+     "     'IOClass'         = VivaWLAN;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+     "     'IONameMatch'     = 'mediatek,mt6781-wlan';"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index e072ca2..dad40e5 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -26,6 +26,7 @@ iokit/Kernel/arm/VivaGPUUserClient.cpp                           optional iokitc
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/VivaBattery.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/VivaHaptic.cpp                                  optional iokitcpp
++iokit/Kernel/arm/VivaAudio.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/VivaWiFi.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/VivaWLAN.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/VivaScaler.cpp                                  optional iokitcpp

@@ -206,6 +206,23 @@ def viva_devices(ph, phandle, gic_ph, ecid):
             ('compatible', cstr('mediatek,mt6781-gpio')),
             ('reg', io(0x10005000, 0x1000)),
             ('output-pins', u32(17, 19, 23, 25, 73, 166)),
+            # pins whose function VivaGPIO::setMode may change: the AFE <-> MT6366 MTKAIF link (183 CLK, 184 SYNC,
+            # 185/186 DAT MOSI, 189/190 DAT MISO; mode 1), VivaAudio.cpp (0222)
+            ('mode-pins', u32(183, 184, 185, 186, 189, 190)),
+        ]),
+        # Audio front end (afe@11210000, GIC SPI 169 level; reg 1 = AFE SRAM 0x11212000, the DL1 buffer):
+        # iokit/Kernel/arm/VivaAudio.cpp (0222). DL1 -> ADDA DL -> MTKAIF -> MT6366 (pwrap) DAC L -> HS -> AW87559
+        # 0x58 (receiver, reset GPIO19) and DAC R -> LOL -> AW87559 0x5B (loudspeaker, reset GPIO25) on I2C5.
+        node('afe', [
+            ph(),
+            ('compatible', cstr('mediatek,mt6781-afe')),
+            ('reg', io(0x11210000, 0x2000) + io(0x11212000, 0xd000)),
+            ('interrupt-parent', u32(gic_ph)),
+            ('interrupts', spi(169, IRQ_LEVEL_HIGH)),
+            ('amp-bus', u32(5)),
+            ('rcv-amp', u32(0x58, 19)),
+            ('spk-amp', u32(0x5b, 25)),
+            ('sram-bytes', u32(0x9c00)),
         ]),
         # I2C0 (i2c0@11007000, SPI 105 level): VivaIO.cpp, MediaTek I2C v2 in FIFO mode.
         # Source clock: CK_CFG_6 i2c_sel = 3 = univpll_d5_d2 = 2496 MHz / 2 / 5 / 2 (univ2pll
