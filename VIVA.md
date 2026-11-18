@@ -1058,6 +1058,21 @@ This patch only gives the Mac side a powered block and DMA memory:
   then clocks off, SRAM, ISO... (the same order done by hand over the link worked: VDE off).
 - `vdec zero` received "ro OFF N" and fell into `sum`: the pool commands now get the whole argument string.
 
+### 0213: VDEC register-program runner + VivaVDEC user client (NOT in an image yet)
+- The clean-room decoder (vdec repo: tools/refgen.py, tools/refgen265.py, lib/vivavdec_h264) decodes H.264 and H.265
+  bit-exact on the phone driving the registers over the link; the kernel now executes a whole picture's program.
+- `viva_vdec_uapi.h`: struct vvdec_op {kind WR/RD/POLL/IRQ, pa, value, mask}. Every op must lie in the VDEC window
+  0x16020000-0x1602ffff (checked before the first one runs); POLL waits for (*pa & mask) == value, IRQ for VDEC_MISC
+  +0xa4 bit 16 then clears it; spin 2 ms, then IOSleep(1). Read values are written back into the program.
+- Link: `vdec run OFF N [MS]` runs the program at pool offset OFF (vdec tools/vdecplay.py --kernel: one command per
+  picture instead of ~700 peek/poke). `vdec status` also shows client counts.
+- Service `VivaVDEC` (IOResources match): user client type 'vdec', root or entitlement com.viva.vdec only (larb4
+  bypasses the M4U: a program can DMA anywhere). Selectors INFO / POWER (refcounted) / ARENA (the boot pool if free,
+  else a contiguous buffer below 4 GiB; map type 0) / SYNC (cache maintenance of an arena range) / RUN (program
+  buffer = map type 1, VVDEC_MAX_OPS 16384).
+- Applies with `git apply` before 0220-0223 (checked in order); local compile of VivaVDEC.cpp + KernelConfigTables.cpp
+  OK, only existing kernel symbols imported.
+
 ### Wired memory leak found and fixed (2026-11-14): GPU BO mappings in backboardd
 - **0207** (`viviobmdtrace=KIB`, tested): IOBufferMemoryDescriptor allocations >= KIB with backtrace. **0208**
   (tested): live set of every IOBufferMemoryDescriptor (size, age, process, backtrace; `viviobmdlive=0` off), link

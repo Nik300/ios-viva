@@ -1,0 +1,548 @@
+diff --git a/iokit/Kernel/arm/VivaVDEC.cpp b/iokit/Kernel/arm/VivaVDEC.cpp
+index d4feda8..0f08acb 100644
+--- a/iokit/Kernel/arm/VivaVDEC.cpp
++++ b/iokit/Kernel/arm/VivaVDEC.cpp
+@@ -15,6 +15,13 @@
+  *   vdec wr OFF HEX bytes into the pool at OFF, written back to DRAM for the VDEC
+  *   vdec zero OFF N zeroes N bytes of the pool
+  *   vdec sum OFF N CHUNK   FNV-1a of each CHUNK bytes in [OFF, OFF+N) (<= 256 sums): the Mac pulls only what changed
++ *   vdec run OFF N [MS]    executes the register program at pool offset OFF (N struct vvdec_op, viva_vdec_uapi.h),
++ *                   read values written back in place (0213): one link command per picture instead of ~700 pokes
++ *
++ * 0213: the clean-room decoder runs on the phone. The kernel knows no codec: userspace builds the register program of
++ * each picture (vdec lib/), the service VivaVDEC (user client, viva_vdec_uapi.h) checks every access against the
++ * VDEC register window, executes it and waits for decode done; it also lends the client a physically contiguous
++ * arena (the boot pool when there is one) mapped into the task.
+  *
+  * Sequences from Xiaomi viva-r-oss drivers/clk/mediatek/clk-mt6781-pg.c (spm_mtcmos_ctrl_vde) and clk-mt6781.c
+  * (TOP_MUX_VDEC CK_CFG_10 [10:8]; vdec gcon gates GATE_VDEC0/1/2_I: writing the "set" register turns a clock ON).
+@@ -32,13 +39,21 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+ 
++#include "viva_vdec_uapi.h"
++
+ #define PA_TOPCKGEN     0x10000000ull
+ #define PA_INFRACFG     0x10001000ull
+ #define PA_SPM          0x10006000ull
+ #define PA_VDEC_GCON    0x1602f000ull
+ #define PA_LARB4        0x1602e000ull
++#define PA_VDEC_WINDOW  ((uint64_t)VVDEC_WINDOW_BASE)
++#define VDEC_IRQ_CFG    0x50a4u         /* VDEC_MISC (0x16025000) + 0xa4, relative to the window */
++#define VDEC_IRQ_DONE   (1u << 16)
+ 
+ /* topckgen */
+ #define CLK_CFG_UPDATE          0x008
+@@ -81,11 +96,13 @@
+ #define LARB_PORT_MMU_BITS      0xff01u
+ #define LARB4_VDEC_PORTS        12      /* 0 MC .. 11 RG_CTRL_DMA; 12/13 are mini-MDP */
+ 
+-static IOMemoryMap *gTopck, *gInfra, *gSpm, *gGcon, *gLarb;
++static IOMemoryMap *gTopck, *gInfra, *gSpm, *gGcon, *gLarb, *gWin;
+ static IOBufferMemoryDescriptor *gPool;
+ static uint64_t gPoolPA;
+ static uint32_t gPoolSize;
+ static IOLock *gLock;
++static bool gPoolOwned;                 /* a VivaVDEC client has the boot pool as its arena */
++static uint32_t gClients, gClientsPowered;
+ 
+ static IOMemoryMap *
+ mapRegs(uint64_t pa, uint32_t size)
+@@ -120,8 +137,10 @@ maps(void)
+ 		gSpm = mapRegs(PA_SPM, 0x1000);
+ 		gGcon = mapRegs(PA_VDEC_GCON, 0x1000);    /* mapped, not touched while VDE is off */
+ 		gLarb = mapRegs(PA_LARB4, 0x1000);
++		gWin = mapRegs(PA_VDEC_WINDOW, VVDEC_WINDOW_SIZE);
+ 	}
+-	return gLock != NULL && gTopck != NULL && gInfra != NULL && gSpm != NULL && gGcon != NULL && gLarb != NULL;
++	return gLock != NULL && gTopck != NULL && gInfra != NULL && gSpm != NULL && gGcon != NULL && gLarb != NULL &&
++	       gWin != NULL;
+ }
+ 
+ static bool
+@@ -302,6 +321,112 @@ powerOff(void)
+ 	return NULL;
+ }
+ 
++
++static uint64_t
++nowUs(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++/*
++ * The register program of one picture (viva_vdec_uapi.h). Every op is checked before the first one runs. Polls and
++ * the decode-done wait first spin (a decode takes a few ms), then sleep a millisecond at a time. Caller holds gLock
++ * (sleeping with it is fine: the link and the clients serialize on it anyway).
++ */
++static uint32_t
++runProgram(struct vvdec_op *ops, uint32_t n, uint32_t timeoutMs, uint32_t out[5])
++{
++	uint64_t t0 = nowUs(), hw = 0;
++	out[0] = VVDEC_OK;
++	out[1] = out[2] = out[3] = out[4] = 0;
++	if (!vdePowered()) {
++		return out[0] = VVDEC_ERR_POWER;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t off = ops[i].pa - VVDEC_WINDOW_BASE;
++		if (ops[i].kind < VVDEC_OP_WR || ops[i].kind > VVDEC_OP_IRQ) {
++			out[1] = i;
++			return out[0] = VVDEC_ERR_KIND;
++		}
++		if (ops[i].kind != VVDEC_OP_IRQ && (off >= VVDEC_WINDOW_SIZE || (off & 3))) {
++			out[1] = i;
++			return out[0] = VVDEC_ERR_ADDRESS;
++		}
++	}
++	uint64_t limit = (uint64_t)(timeoutMs ? timeoutMs : 1000) * 1000;
++	for (uint32_t i = 0; i < n; i++) {
++		struct vvdec_op *op = &ops[i];
++		uint32_t off = op->pa - VVDEC_WINDOW_BASE;
++		if (op->kind == VVDEC_OP_WR) {
++			wr(gWin, off, op->value);
++		} else if (op->kind == VVDEC_OP_RD) {
++			op->value = rd(gWin, off);
++		} else {
++			bool irq = op->kind == VVDEC_OP_IRQ;
++			uint32_t at = irq ? VDEC_IRQ_CFG : off, mask = irq ? VDEC_IRQ_DONE : op->mask;
++			uint32_t want = irq ? VDEC_IRQ_DONE : op->value, v = 0;
++			uint64_t s = nowUs();
++			for (uint32_t spin = 0;; spin++) {
++				v = rd(gWin, at);
++				if ((v & mask) == want) {
++					break;
++				}
++				if (nowUs() - s > limit) {
++					out[1] = i;
++					out[2] = v;
++					return out[0] = VVDEC_ERR_TIMEOUT;
++				}
++				if (spin < 400) {
++					IODelay(5);
++				} else {
++					IOSleep(1);
++				}
++			}
++			if (irq) {
++				hw += nowUs() - s;
++				wr(gWin, VDEC_IRQ_CFG, rd(gWin, VDEC_IRQ_CFG) | 0x11);
++				wr(gWin, VDEC_IRQ_CFG, rd(gWin, VDEC_IRQ_CFG) & ~0x10u);
++				op->value = out[2] = v;
++			} else {
++				op->mask = v;
++			}
++		}
++	}
++	out[3] = (uint32_t)hw;
++	out[4] = (uint32_t)(nowUs() - t0);
++	return VVDEC_OK;
++}
++
++/* "vdec run OFF N [MS]": the program at pool offset OFF. Caller holds gLock. */
++static void
++runCmd(const char *args, char *out, size_t len, size_t *po)
++{
++	size_t o = *po;
++#define SAY(...) do { if (o < len) o += (size_t)snprintf(out + o, len - o, __VA_ARGS__); } while (0)
++	uint64_t off = 0, n = 0, ms = 0;
++	const char *p = num(args + 3, &off);
++	p = p != NULL ? num(p, &n) : NULL;
++	if (p != NULL) {
++		num(p, &ms);
++	}
++	if (gPool == NULL) {
++		SAY("vdec: no pool (boot-arg vivavdecpool=MB)\n");
++	} else if (p == NULL || (off & 3) || n == 0 || n > VVDEC_MAX_OPS || off + n * sizeof(struct vvdec_op) > gPoolSize) {
++		SAY("vdec: run OFF N [MS] (N <= %u ops)\n", VVDEC_MAX_OPS);
++	} else {
++		struct vvdec_op *ops = (struct vvdec_op *)((uint8_t *)gPool->getBytesNoCopy() + off);
++		uint32_t r[5];
++		gPool->performOperation(kIOMemoryIncoherentIOFlush, off, n * sizeof(struct vvdec_op));
++		runProgram(ops, (uint32_t)n, (uint32_t)ms, r);
++		gPool->performOperation(kIOMemoryIncoherentIOFlush, off, n * sizeof(struct vvdec_op));
++		SAY("vdec: run %llu ops status %u op %u irq 0x%08x hw %u us total %u us\n", n, r[0], r[1], r[2], r[3], r[4]);
++	}
++#undef SAY
++	*po = o;
++}
++
+ /* At boot (VivaPwrap::start, with the WiFi area): the tracing pool, only with vivavdecpool=MB. */
+ extern "C" void
+ viva_vdec_reserve(void)
+@@ -341,6 +466,11 @@ viva_vdec_cmd(const char *args, char *out, size_t len)
+ 	}
+ 	IOLockLock(gLock);
+ 	const char *err = NULL;
++	if (strncmp(args, "run ", 4) == 0) {
++		runCmd(args, out, len, &o);
++		IOLockUnlock(gLock);
++		return o;
++	}
+ 	if (strncmp(args, "rd ", 3) == 0 || strncmp(args, "wr ", 3) == 0 || strncmp(args, "zero ", 5) == 0 ||
+ 	    strncmp(args, "sum ", 4) == 0) {
+ 		poolCmd(args, out, len, &o);
+@@ -352,7 +482,7 @@ viva_vdec_cmd(const char *args, char *out, size_t len)
+ 	} else if (strncmp(args, "off", 3) == 0) {
+ 		err = powerOff();
+ 	} else if (*args != 0 && strncmp(args, "status", 6) != 0) {
+-		SAY("usage: vdec [status|on|off|rd OFF N|wr OFF HEX|zero OFF N|sum OFF N CHUNK]\n");
++		SAY("usage: vdec [status|on|off|rd OFF N|wr OFF HEX|zero OFF N|sum OFF N CHUNK|run OFF N [MS]]\n");
+ 		IOLockUnlock(gLock);
+ 		return o;
+ 	}
+@@ -373,9 +503,263 @@ viva_vdec_cmd(const char *args, char *out, size_t len)
+ 		}
+ 		SAY("\n");
+ 	}
+-	SAY("vdec: pool %s0x%llx, %u MiB (boot-arg vivavdecpool=MB)\n", gPool ? "" : "none ", gPoolPA, gPoolSize >> 20);
++	SAY("vdec: pool %s0x%llx, %u MiB (boot-arg vivavdecpool=MB)%s, clients %u (%u powered)\n", gPool ? "" : "none ",
++	    gPoolPA, gPoolSize >> 20, gPoolOwned ? " owned by a client" : "", gClients, gClientsPowered);
+ 	IOLockUnlock(gLock);
+ #undef SAY
+ 	return o;
+ }
++
++/* ---------------------------------------------------------------------------------------------- the service (0213) */
++
++class VivaVDEC : public IOService {
++	OSDeclareDefaultStructors(VivaVDEC);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++class VivaVDECUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(VivaVDECUserClient);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++private:
++	IOReturn power(bool on);
++	IOReturn arena(uint64_t size, uint64_t out[2]);
++	void release_resources(void);
++	IOBufferMemoryDescriptor *fArena, *fProg;
++	uint64_t fArenaPA, fArenaSize;
++	bool fPoolArena, fPowered;
++};
++
++OSDefineMetaClassAndStructors(VivaVDEC, IOService);
++OSDefineMetaClassAndStructors(VivaVDECUserClient, IOUserClient);
++
++bool
++VivaVDEC::start(IOService *provider)
++{
++	if (!maps() || !IOService::start(provider)) {
++		return false;
++	}
++	setProperty("IOUserClientClass", "VivaVDECUserClient");
++	setProperty("VivaVDECUAPIVersion", (unsigned long long)VVDEC_UAPI_VERSION, 32);
++	registerService();
++	IOLog("VIVA VDEC: service published (pool %u MiB)\n", gPoolSize >> 20);
++	return true;
++}
++
++IOReturn
++VivaVDEC::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler)
++{
++	if (type != VVDEC_CLIENT_TYPE) {
++		return kIOReturnUnsupported;
++	}
++	/* larb4 bypasses the M4U: a program can make the VDEC write anywhere in RAM. Root or entitled tasks only. */
++	bool ok = IOUserClient::clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
++	if (!ok) {
++		OSObject *e = IOUserClient::copyClientEntitlement(owningTask, VVDEC_ENTITLEMENT);
++		ok = e == kOSBooleanTrue;
++		OSSafeReleaseNULL(e);
++	}
++	if (!ok) {
++		return kIOReturnNotPrivileged;
++	}
++	VivaVDECUserClient *c = OSTypeAlloc(VivaVDECUserClient);
++	if (c == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (!c->initWithTask(owningTask, securityID, type) || !c->attach(this) || !c->start(this)) {
++		c->detach(this);
++		c->release();
++		return kIOReturnError;
++	}
++	*handler = c;
++	return kIOReturnSuccess;
++}
++
++bool
++VivaVDECUserClient::start(IOService *provider)
++{
++	if (OSDynamicCast(VivaVDEC, provider) == NULL || !IOUserClient::start(provider)) {
++		return false;
++	}
++	fProg = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared,
++	    VVDEC_MAX_OPS * sizeof(struct vvdec_op), PAGE_SIZE);
++	if (fProg == NULL) {
++		return false;
++	}
++	IOLockLock(gLock);
++	gClients++;
++	IOLockUnlock(gLock);
++	return true;
++}
++
++/* Caller holds gLock. */
++IOReturn
++VivaVDECUserClient::power(bool on)
++{
++	if (on == fPowered) {
++		return kIOReturnSuccess;
++	}
++	if (on) {
++		const char *err = powerOn();
++		if (err != NULL) {
++			IOLog("VIVA VDEC: power on: %s\n", err);
++			return kIOReturnNotResponding;
++		}
++		gClientsPowered++;
++	} else if (--gClientsPowered == 0) {
++		const char *err = powerOff();
++		if (err != NULL) {
++			IOLog("VIVA VDEC: power off: %s\n", err);
++		}
++	}
++	fPowered = on;
++	return kIOReturnSuccess;
++}
++
++/* Caller holds gLock. The boot pool when it is free and big enough, else a new contiguous buffer below 4 GiB. */
++IOReturn
++VivaVDECUserClient::arena(uint64_t size, uint64_t out[2])
++{
++	if (fArena != NULL) {
++		return kIOReturnExclusiveAccess;
++	}
++	size = (size + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
++	if (size == 0 || size > (256ull << 20)) {
++		return kIOReturnBadArgument;
++	}
++	if (gPool != NULL && !gPoolOwned && size <= gPoolSize) {
++		gPool->retain();
++		fArena = gPool;
++		fArenaPA = gPoolPA;
++		fArenaSize = gPoolSize;
++		fPoolArena = gPoolOwned = true;
++	} else {
++		fArena = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryKernelUserShared, size, 0x00000000fffff000ull);
++		if (fArena == NULL) {
++			return kIOReturnNoMemory;
++		}
++		IOByteCount len = 0;
++		fArenaPA = fArena->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
++		fArenaSize = size;
++		if (fArenaPA == 0 || len < size) {
++			OSSafeReleaseNULL(fArena);
++			return kIOReturnNoMemory;
++		}
++		bzero(fArena->getBytesNoCopy(), size);
++		fArena->performOperation(kIOMemoryIncoherentIOFlush, 0, size);
++	}
++	out[0] = fArenaPA;
++	out[1] = fArenaSize;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++VivaVDECUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	IOMemoryDescriptor *md = type == VVDEC_MAP_ARENA ? fArena : type == VVDEC_MAP_PROGRAM ? fProg : NULL;
++	if (md == NULL) {
++		return kIOReturnBadArgument;
++	}
++	md->retain();
++	*memory = md;
++	*options = 0;
++	return kIOReturnSuccess;
++}
++
++void
++VivaVDECUserClient::release_resources(void)
++{
++	IOLockLock(gLock);
++	power(false);
++	if (fArena != NULL && fPoolArena) {
++		gPoolOwned = false;
++	}
++	OSSafeReleaseNULL(fArena);
++	fPoolArena = false;
++	IOLockUnlock(gLock);
++}
++
++IOReturn
++VivaVDECUserClient::clientClose(void)
++{
++	release_resources();
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++VivaVDECUserClient::free(void)
++{
++	if (gLock != NULL && (fArena != NULL || fPowered)) {
++		release_resources();
++	}
++	if (fProg != NULL) {
++		IOLockLock(gLock);
++		gClients--;
++		IOLockUnlock(gLock);
++	}
++	OSSafeReleaseNULL(fProg);
++	IOUserClient::free();
++}
++
++IOReturn
++VivaVDECUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	static const struct { uint32_t in, out; } shape[] = { { 0, 4 }, { 1, 0 }, { 1, 2 }, { 2, 0 }, { 2, 5 } };
++	if (selector >= sizeof(shape) / sizeof(shape[0]) || a->scalarInputCount != shape[selector].in ||
++	    a->scalarOutputCount < shape[selector].out) {
++		return kIOReturnBadArgument;
++	}
++	a->scalarOutputCount = shape[selector].out;
++	IOReturn ret = kIOReturnSuccess;
++	IOLockLock(gLock);
++	switch (selector) {
++	case VVDEC_SEL_INFO:
++		a->scalarOutput[0] = VVDEC_UAPI_VERSION;
++		a->scalarOutput[1] = vdePowered();
++		a->scalarOutput[2] = gPoolPA;
++		a->scalarOutput[3] = gPoolSize;
++		break;
++	case VVDEC_SEL_POWER:
++		ret = power(a->scalarInput[0] != 0);
++		break;
++	case VVDEC_SEL_ARENA:
++		ret = arena(a->scalarInput[0], a->scalarOutput);
++		break;
++	case VVDEC_SEL_SYNC: {
++		uint64_t off = a->scalarInput[0], len = a->scalarInput[1];
++		if (fArena == NULL || off > fArenaSize || len > fArenaSize - off) {
++			ret = kIOReturnBadArgument;
++		} else if (len != 0) {
++			fArena->performOperation(kIOMemoryIncoherentIOFlush, off, len);
++		}
++		break;
++	}
++	case VVDEC_SEL_RUN: {
++		uint64_t n = a->scalarInput[0];
++		uint32_t r[5];
++		if (n == 0 || n > VVDEC_MAX_OPS) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		runProgram((struct vvdec_op *)fProg->getBytesNoCopy(), (uint32_t)n, (uint32_t)a->scalarInput[1], r);
++		for (int i = 0; i < 5; i++) {
++			a->scalarOutput[i] = r[i];
++		}
++		break;
++	}
++	}
++	IOLockUnlock(gLock);
++	return ret;
++}
++
+ #endif /* SWEET */
+diff --git a/iokit/Kernel/arm/viva_vdec_uapi.h b/iokit/Kernel/arm/viva_vdec_uapi.h
+new file mode 100644
+index 0000000..234d2a0
+--- /dev/null
++++ b/iokit/Kernel/arm/viva_vdec_uapi.h
+@@ -0,0 +1,60 @@
++// Viva VDEC: interface between the XNU driver (VivaVDEC, fork/xnu/patches/0213-viva-vdec-*) and userspace (the
++// clean-room decoder library, ~/Developer/ios-viva/vdec lib/). Shared by C (userspace) and C++ (kernel).
++//
++// The kernel knows no codec: userspace parses the bitstream and builds the register program of a picture
++// (vdec lib/vivavdec_h264, tools/refgen.py); the kernel checks every access against the VDEC register window and
++// executes the program on the hardware, waiting for the decode-done interrupt where the program says so.
++//
++// Transport: IOServiceOpen(type VVDEC_CLIENT_TYPE) on the service of class VVDEC_SERVICE_CLASS (root, or a task
++// with the entitlement VVDEC_ENTITLEMENT), then IOConnectCallScalarMethod with the selectors below.
++// Memory: IOConnectMapMemory64(type VVDEC_MAP_ARENA) maps the DMA arena (physically contiguous below 4 GiB, the
++// addresses the program writes are arena physical address + offset); type VVDEC_MAP_PROGRAM maps the program
++// buffer (struct vvdec_op[VVDEC_MAX_OPS]).
++//
++// DMA: the VDEC (larb4 ports 0-11) bypasses the M4U, so the addresses a program writes reach physical memory
++// unchecked; this is why only root or entitled tasks may open the service.
++#pragma once
++#include <stdint.h>
++
++#define VVDEC_SERVICE_CLASS     "VivaVDEC"
++#define VVDEC_CLIENT_TYPE       0x76646563u         // 'vdec'
++#define VVDEC_ENTITLEMENT       "com.viva.vdec"
++#define VVDEC_UAPI_VERSION      1
++
++#define VVDEC_WINDOW_BASE       0x16020000u         // VLD .. GCON; every op's pa must lie in [BASE, BASE + SIZE)
++#define VVDEC_WINDOW_SIZE       0x10000u
++#define VVDEC_MAX_OPS           16384
++#define VVDEC_MAP_ARENA         0
++#define VVDEC_MAP_PROGRAM       1
++
++enum vvdec_op_kind {
++	VVDEC_OP_WR   = 1,      // *pa = value
++	VVDEC_OP_RD   = 2,      // value = *pa (written back into the program: status reads, barrel-shifter reads)
++	VVDEC_OP_POLL = 3,      // read until (*pa & mask) == value, up to the run's timeout; the last read goes to mask
++	VVDEC_OP_IRQ  = 4,      // wait for decode done (VDEC_MISC+0xa4 bit 16), clear it (|0x11 then &~0x10);
++	                        // value = the status word
++};
++
++struct vvdec_op {
++	uint32_t kind;
++	uint32_t pa;
++	uint32_t value;
++	uint32_t mask;
++};
++
++enum vvdec_selector {
++	VVDEC_SEL_INFO  = 0,    // out: version, VDE powered, pool PA (boot-arg vivavdecpool), pool size
++	VVDEC_SEL_POWER = 1,    // in: 1 on / 0 off (off only when no other client keeps it on)
++	VVDEC_SEL_ARENA = 2,    // in: size; out: physical address, size (once per connection; the boot pool if free)
++	VVDEC_SEL_SYNC  = 3,    // in: arena offset, length: write back + invalidate the CPU caches for that range
++	VVDEC_SEL_RUN   = 4,    // in: number of ops, timeout ms; out: status (vvdec_status), index of the failing op,
++	                        //     decode-done status word, microseconds waiting for the hardware, total microseconds
++};
++
++enum vvdec_status {
++	VVDEC_OK          = 0,
++	VVDEC_ERR_ADDRESS = 1,  // op outside the register window or not 4-byte aligned
++	VVDEC_ERR_KIND    = 2,
++	VVDEC_ERR_TIMEOUT = 3,  // POLL or IRQ timed out
++	VVDEC_ERR_POWER   = 4,  // VDE is off
++};
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index c461ac2..617ebb7 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -148,6 +148,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = VivaJPEGEncoder;"
+     "   },"
+     "   {"
++    "     'IOClass'         = VivaVDEC;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = VivaVDEC;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetHIDButtons;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDButtons;"
