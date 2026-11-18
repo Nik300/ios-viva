@@ -1,0 +1,529 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index 2045f24..97b0c2e 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -263,6 +263,7 @@ extern void sweet_ps(const char *arg, char *out, size_t len);                /*
+ extern void sweet_kill(const char *arg, char *out, size_t len);
+ extern void sweet_surface_report(const char *arg, char *out, size_t len);     /* iokit/Kernel/arm/SweetSurface.cpp (0206) */
+ extern void viva_iobmd_report(const char *arg, char *out, size_t len);        /* iokit/Kernel/IOBufferMemoryDescriptor.cpp (0208) */
++extern void viva_haptic_link(const char *args, char *out, size_t len);        /* iokit/Kernel/arm/VivaHaptic.cpp (0220) */
+ 
+ extern void viva_battery_usb_changed(void);                                  /* VivaBattery.cpp: poll now */
+ 
+@@ -1768,6 +1769,10 @@ vl_command(void)
+ 		}
+ 		sweet_surface_report(rest, out, sizeof(out));
+ 		vl_reply("%s", out);
++	} else if (IS("hap")) {
++		char out[240];
++		viva_haptic_link(rest, out, sizeof(out));
++		vl_reply("%s", out);
+ 	} else if (IS("iobmd")) {
+ 		char out[240];
+ 		while (*rest == ' ') {
+@@ -1806,7 +1811,7 @@ vl_command(void)
+ 			delay(5000);
+ 		}
+ 	} else if (IS("help")) {
+-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | vdec [status|on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | surf [all] | iobmd [SECONDS] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | vdec [status|on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | surf [all] | iobmd [SECONDS] | hap [MS|stop|rd REG [N]|wr REG V] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+ 	} else {
+ 		vl_reply("unknown command: %s (try help)\n", c);
+ 	}
+diff --git a/iokit/Kernel/arm/VivaHaptic.cpp b/iokit/Kernel/arm/VivaHaptic.cpp
+new file mode 100644
+index 0000000..ed0e304
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaHaptic.cpp
+@@ -0,0 +1,463 @@
++/*
++ * viva (Redmi Note 11 Pro 4G): the Z-axis linear vibration motor (LRA, f0 ~205 Hz) behind an Awinic haptic driver
++ * on I2C7 (0x11004000), "awinic,awinic_haptic" in the live DT. Xiaomi viva-r-oss drivers/misc/mediatek/haptic_nv:
++ * aw_haptic.c probes 0x5A then 0x58 after a reset pulse (GPIO23); register 0x00 = 0x24 is an AW8624, 0x00 an AW8622x
++ * (AW86223/4/5, EFRD9 0x64 tells which). The vendor's RAM waveforms (/vendor/firmware/aw862*_haptic.bin) are not
++ * needed: this driver plays in CONT mode, the chip's own f0-tracking drive (aw8622x_haptic_cont_config), started with
++ * GO and stopped by a timer, as Android's FF_CONSTANT. The AW8624 is detected and reported only (not seen yet).
++ *
++ * iOS (MediaExperience FigVibrator_IOKit, used when there is no closed-loop Taptic Engine and no "Actuator" audio
++ * device): IOServiceGetMatchingService(IOServiceNameMatching("vibrator")), then IORegistryEntrySetCFProperties with
++ * {"hertz_millisecs": [state, ms, state, ms...], "repeat": bool} where a state is {"intensity": 16.16 fixed} (on) or
++ * false (off), and a bare number 0 to stop. This service is named "vibrator" and plays such patterns; /product
++ * "haptics" = 1 in the ADT makes MobileGestalt's DeviceSupportsHaptics/VibratorCapability true (UIKit feedback
++ * level 1, system-sound vibes).
++ *
++ * Link: "hap" status, "hap MS" vibrate MS milliseconds (1..5000), "hap stop", "hap rd REG [N]", "hap wr REG VAL".
++ * Boot-arg vivahaptic=0: off.
++ */
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOCommandGate.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <pexpert/pexpert.h>
++#include <sys/param.h>
++
++#include "VivaIO.h"
++
++/* AW8622x (aw8622x_reg.h) */
++#define AW_REG_ID               0x00    /* read: chip ID; write 0xAA: soft reset */
++#define AW_REG_SYSINTM          0x03
++#define AW_REG_PLAYCFG2         0x07    /* gain, 0x80 = full */
++#define AW_REG_PLAYCFG3         0x08    /* [1:0] play mode: 0 RAM, 1 RTP, 2 CONT; bit2 BRK_EN */
++#define AW_REG_PLAYCFG4         0x09    /* 0x01 GO, 0x02 STOP */
++#define AW_REG_CONTCFG5         0x1C    /* [3:0] BRK_GAIN */
++#define AW_REG_CONTCFG6         0x1D    /* bit7 TRACK_EN, [6:0] DRV1_LVL */
++#define AW_REG_CONTCFG7         0x1E    /* DRV2_LVL */
++#define AW_REG_CONTCFG9         0x20    /* DRV2_TIME */
++#define AW_REG_CONTCFG10        0x21    /* BRK_TIME */
++#define AW_REG_CONTCFG13        0x24    /* [7:4] TSET, [3:0] BEMF_SET */
++#define AW_REG_GLBRD5           0x3F    /* [3:0] global state: 0x0 / 0xA = standby */
++#define AW_REG_SYSCTRL1         0x43    /* bit7 VBAT_MODE HW, bit3 RAMINIT */
++#define AW_REG_SYSCTRL2         0x44    /* bit6 STANDBY, [1:0] rate (2 = 12 kHz) */
++#define AW_REG_SYSCTRL3         0x45    /* SIN_H, SIN_L, COS_H, COS_L: 0x45..0x48 */
++#define AW_REG_SYSCTRL7         0x49    /* [2:0] D2S gain */
++#define AW_REG_DETCFG2          0x52    /* bit0 DIAG_GO */
++#define AW_REG_EFRD9            0x64
++#define AW_ID_AW8624            0x24
++#define AW_ID_AW8622X           0x00
++
++#define HAP_MAX_MS              5000
++#define HAP_MAX_STEPS           64      /* pattern steps (on/off segments) */
++
++class VivaHaptic : public IOService {
++	OSDeclareDefaultStructors(VivaHaptic);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOWorkLoop *getWorkLoop(void) const APPLE_KEXT_OVERRIDE { return fWorkLoop; }
++
++	/* Vibrate `ms` milliseconds (0: stop). Any context but interrupt; returns at once. */
++	IOReturn vibrate(uint32_t ms);
++	/* FigVibrator: a pattern dictionary, or a number (0) to stop */
++	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	void link(const char *args, char *out, size_t len);
++
++private:
++	static void timerFired(OSObject *owner, IOTimerEventSource *src);
++	int rd(uint8_t reg, uint8_t *val, uint32_t n = 1);
++	int wr(uint8_t reg, uint8_t val);
++	int bits(uint8_t reg, uint8_t mask, uint8_t val);
++	bool probe(void);
++	void init8622x(void);
++	void stopGated(void);
++	void driveGated(uint8_t gain);
++	void playGated(uint32_t ms);
++	void stepGated(void);
++	uint32_t dt(const char *key, uint32_t dflt);
++
++	VivaI2C            *fBus;
++	IOService          *fNub;
++	IOWorkLoop         *fWorkLoop;
++	IOCommandGate      *fGate;
++	IOTimerEventSource *fTimer;
++	uint8_t             fAddr, fChipId, fVariant;
++	bool                fIs8622x, fPlaying;
++	uint32_t            fPlays, fErrors, fPatterns;
++	/* pattern: fStepMs[i] milliseconds with gain fStepGain[i] (0 = off); fStep = the one playing */
++	uint32_t            fStepMs[HAP_MAX_STEPS];
++	uint8_t             fStepGain[HAP_MAX_STEPS];
++	uint32_t            fSteps, fStep;
++	bool                fRepeat;
++};
++
++OSDefineMetaClassAndStructors(VivaHaptic, IOService);
++
++static VivaHaptic *gVivaHaptic;
++
++uint32_t
++VivaHaptic::dt(const char *key, uint32_t dflt)
++{
++	OSData *d = OSDynamicCast(OSData, fNub->getProperty(key));
++	return (d != NULL && d->getLength() >= 4) ? *(const uint32_t *)d->getBytesNoCopy() : dflt;
++}
++
++int
++VivaHaptic::rd(uint8_t reg, uint8_t *val, uint32_t n)
++{
++	int err = fBus->transfer(fAddr, &reg, 1, val, n) == kIOReturnSuccess ? 0 : -1;
++	fErrors += err != 0;
++	return err;
++}
++
++int
++VivaHaptic::wr(uint8_t reg, uint8_t val)
++{
++	uint8_t b[2] = { reg, val };
++	int err = fBus->transfer(fAddr, b, 2, NULL, 0) == kIOReturnSuccess ? 0 : -1;
++	fErrors += err != 0;
++	return err;
++}
++
++/* aw8622x_i2c_write_bits: keep the bits of `mask` set (Awinic masks are inverted: ~field), or in `val`. */
++int
++VivaHaptic::bits(uint8_t reg, uint8_t mask, uint8_t val)
++{
++	uint8_t v;
++	if (rd(reg, &v) != 0) {
++		return -1;
++	}
++	return wr(reg, (uint8_t)((v & mask) | val));
++}
++
++/* aw_haptic.c: reset pulse, then the chip ID at 0x5A or the alternative address. */
++bool
++VivaHaptic::probe(void)
++{
++	VivaGPIO *gpio = VivaGPIO::wait();
++	uint32_t reset = dt("reset-gpio", 23);
++	if (gpio == NULL || gpio->setOutput(reset, false) != kIOReturnSuccess) {
++		IOLog("VIVA HAPTIC: no reset GPIO %u\n", reset);
++		return false;
++	}
++	IOSleep(2);
++	gpio->setOutput(reset, true);
++	IOSleep(4);
++	uint8_t addrs[2] = { (uint8_t)dt("i2c-address", 0x5a), (uint8_t)dt("alt-address", 0x58) };
++	for (int i = 0; i < 2; i++) {
++		fAddr = addrs[i];
++		if (rd(AW_REG_ID, &fChipId) == 0) {
++			fErrors = 0;
++			return true;
++		}
++	}
++	IOLog("VIVA HAPTIC: no answer at 0x%02x / 0x%02x on I2C%u\n", addrs[0], addrs[1], fBus->busId());
++	return false;
++}
++
++/* aw8622x_haptic_init + misc_para_init with the live DT's aw8622x_vib_* values */
++void
++VivaHaptic::init8622x(void)
++{
++	static const uint8_t sine[4] = { 0x05, 0xb2, 0xff, 0xef };     /* aw8622x_vib_sine_array */
++	wr(AW_REG_ID, 0xaa);                                            /* soft reset */
++	IOSleep(2);
++	bits(AW_REG_SYSCTRL2, (uint8_t)~(1 << 6), 1 << 6);              /* standby */
++	bits(AW_REG_SYSCTRL2, (uint8_t)~3, 2);                          /* 12 kHz */
++	for (int i = 0; i < 4; i++) {
++		wr(AW_REG_SYSCTRL3 + i, sine[i]);
++	}
++	bits(AW_REG_SYSCTRL7, (uint8_t)~7, (uint8_t)dt("d2s-gain", 5));
++	bits(AW_REG_CONTCFG13, (uint8_t)~0xf0, (uint8_t)(dt("cont-tset", 6) << 4));
++	bits(AW_REG_CONTCFG13, (uint8_t)~0x0f, (uint8_t)dt("cont-bemf-set", 2));
++	wr(AW_REG_CONTCFG10, (uint8_t)dt("cont-brk-time", 6));
++	bits(AW_REG_CONTCFG5, (uint8_t)~0x0f, (uint8_t)dt("cont-brk-gain", 8));
++	/* offset calibration (RAMINIT on, DIAG_GO, wait for it to clear) */
++	bits(AW_REG_SYSCTRL1, (uint8_t)~(1 << 3), 1 << 3);
++	bits(AW_REG_DETCFG2, (uint8_t)~1, 1);
++	for (int i = 0; i < 200; i++) {
++		uint8_t v = 1;
++		if (rd(AW_REG_DETCFG2, &v) != 0 || (v & 1) == 0) {
++			break;
++		}
++		IODelay(100);
++	}
++	bits(AW_REG_SYSCTRL1, (uint8_t)~(1 << 3), 0);
++	bits(AW_REG_SYSCTRL1, (uint8_t)~(1 << 7), 1 << 7);              /* VBAT compensation in hardware */
++	wr(AW_REG_PLAYCFG2, 0x80);                                      /* full gain */
++	bits(AW_REG_SYSCTRL2, (uint8_t)~(1 << 6), 0);                   /* out of standby */
++	bits(AW_REG_SYSINTM, (uint8_t)~(1 << 5), 0);                    /* UVLO interrupt unmasked */
++}
++
++/* aw8622x_haptic_stop: STOP, then wait for standby (forced after ~40 polls) */
++void
++VivaHaptic::stopGated(void)
++{
++	fTimer->cancelTimeout();
++	if (!fIs8622x) {
++		return;
++	}
++	wr(AW_REG_PLAYCFG4, 0x02);
++	for (int i = 0; i < 40; i++) {
++		uint8_t s = 0xff;
++		if (rd(AW_REG_GLBRD5, &s) == 0 && ((s & 0x0f) == 0x0 || (s & 0x0f) == 0xa)) {
++			fPlaying = false;
++			return;
++		}
++		IOSleep(2);
++	}
++	bits(AW_REG_SYSCTRL2, (uint8_t)~(1 << 6), 1 << 6);
++	bits(AW_REG_SYSCTRL2, (uint8_t)~(1 << 6), 0);
++	fPlaying = false;
++}
++
++/*
++ * aw8622x_haptic_cont_config: CONT mode with f0 tracking, DRV1/DRV2 levels from the DT, GO. `gain` scales the
++ * drive levels (0x80 = the DT's full levels): CONT mode ignores PLAYCFG2.
++ */
++void
++VivaHaptic::driveGated(uint8_t gain)
++{
++	if (!fIs8622x) {
++		return;
++	}
++	uint32_t drv1 = dt("cont-drv1-lvl", 0x7f) * gain / 0x80, drv2 = dt("cont-drv2-lvl", 0x36) * gain / 0x80;
++	bits(AW_REG_PLAYCFG3, (uint8_t)~3, 2);
++	bits(AW_REG_CONTCFG6, (uint8_t)~(1 << 7), 1 << 7);
++	bits(AW_REG_CONTCFG6, (uint8_t)~0x7f, (uint8_t)MIN(drv1, 0x7fu));
++	wr(AW_REG_CONTCFG7, (uint8_t)MIN(drv2, 0xffu));
++	wr(AW_REG_CONTCFG9, 0xff);
++	wr(AW_REG_PLAYCFG4, 0x01);
++	fPlaying = true;
++	fPlays++;
++}
++
++/* Start the pattern in fStep*: step 0 now, the timer moves on (stepGated). */
++void
++VivaHaptic::playGated(uint32_t ms)
++{
++	stopGated();
++	if (ms == 0) {
++		fSteps = 0;
++		return;
++	}
++	fStepMs[0] = ms;
++	fStepGain[0] = 0x80;
++	fSteps = 1;
++	fRepeat = false;
++	fStep = 0;
++	driveGated(0x80);
++	fTimer->setTimeoutMS(ms);
++}
++
++/* Timer: the step that was playing is over; the next one (or the first again with repeat), or stop. */
++void
++VivaHaptic::stepGated(void)
++{
++	uint32_t next = fStep + 1;
++	if (next >= fSteps) {
++		if (!fRepeat || fSteps == 0) {
++			stopGated();
++			fSteps = 0;
++			return;
++		}
++		next = 0;
++	}
++	uint8_t prev = fStepGain[fStep], gain = fStepGain[next];
++	fStep = next;
++	if (prev != 0 && gain != prev) {
++		stopGated();            /* off, or another intensity: CONT levels are set before GO */
++	}
++	if (gain != 0 && !fPlaying) {
++		driveGated(gain);
++	}
++	fTimer->setTimeoutMS(MAX(fStepMs[next], 1u));
++}
++
++void
++VivaHaptic::timerFired(OSObject *owner, IOTimerEventSource *src)
++{
++	((VivaHaptic *)owner)->stepGated();
++}
++
++/*
++ * FigVibrator_IOKit: {"hertz_millisecs": [ {"intensity": 16.16} | false, ms, ... ], "repeat": bool} plays, a number
++ * stops. Segments longer than HAP_MAX_MS are cut there; a pattern of only off segments plays nothing.
++ */
++IOReturn
++VivaHaptic::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (d == NULL) {
++		if (OSDynamicCast(OSNumber, properties) != NULL) {
++			return vibrate(0);
++		}
++		return kIOReturnBadArgument;
++	}
++	OSArray *a = OSDynamicCast(OSArray, d->getObject("hertz_millisecs"));
++	if (a == NULL) {
++		return kIOReturnBadArgument;
++	}
++	OSBoolean *rep = OSDynamicCast(OSBoolean, d->getObject("repeat"));
++	struct {
++		uint32_t ms[HAP_MAX_STEPS];
++		uint8_t  gain[HAP_MAX_STEPS];
++	} p;                    /* a struct: blocks capture it by value, arrays they cannot */
++	uint32_t n = 0;
++	bool any = false;
++	for (unsigned int i = 0; i + 1 < a->getCount() && n < HAP_MAX_STEPS; i += 2) {
++		OSNumber *dur = OSDynamicCast(OSNumber, a->getObject(i + 1));
++		if (dur == NULL) {
++			return kIOReturnBadArgument;
++		}
++		uint32_t g = 0;
++		OSDictionary *state = OSDynamicCast(OSDictionary, a->getObject(i));
++		if (state != NULL) {
++			OSNumber *in = OSDynamicCast(OSNumber, state->getObject("intensity"));
++			uint64_t fixed = in != NULL ? in->unsigned64BitValue() : 0x10000;     /* 16.16, 1.0 = full */
++			g = (uint32_t)MIN(fixed * 0x80 / 0x10000, 0x80ull);
++			g = g == 0 ? 1 : g;
++		}
++		p.ms[n] = (uint32_t)MIN(dur->unsigned32BitValue(), (uint32_t)HAP_MAX_MS);
++		p.gain[n] = (uint8_t)g;
++		any |= g != 0 && p.ms[n] != 0;
++		n++;
++	}
++	if (!any) {
++		return vibrate(0);
++	}
++	bool repeat = rep != NULL && rep->isTrue();
++	return fGate->runActionBlock(^IOReturn {
++		stopGated();
++		bcopy(p.ms, fStepMs, n * sizeof(p.ms[0]));
++		bcopy(p.gain, fStepGain, n * sizeof(p.gain[0]));
++		fSteps = n;
++		fRepeat = repeat;
++		fStep = 0;
++		fPatterns++;
++		if (fStepGain[0] != 0) {
++			driveGated(fStepGain[0]);
++		}
++		fTimer->setTimeoutMS(MAX(fStepMs[0], 1u));
++		return kIOReturnSuccess;
++	});
++}
++
++IOReturn
++VivaHaptic::vibrate(uint32_t ms)
++{
++	ms = MIN(ms, (uint32_t)HAP_MAX_MS);
++	return fGate->runActionBlock(^IOReturn {
++		playGated(ms);
++		return kIOReturnSuccess;
++	});
++}
++
++void
++VivaHaptic::link(const char *args, char *out, size_t len)
++{
++	while (*args == ' ') {
++		args++;
++	}
++	if (strncmp(args, "rd ", 3) == 0 || strncmp(args, "wr ", 3) == 0) {
++		bool write = args[0] == 'w';
++		char *end;
++		unsigned long reg = strtoul(args + 3, &end, 0);
++		unsigned long v = strtoul(end, NULL, 0);
++		fGate->runActionBlock(^IOReturn {
++			if (write) {
++				int e = wr((uint8_t)reg, (uint8_t)v);
++				snprintf(out, len, "hap 0x%02lx <- 0x%02lx: %s\n", reg, v, e ? "error" : "ok");
++			} else {
++				uint8_t b[8] = { 0 };
++				uint32_t n = (uint32_t)MIN(MAX(v, 1ul), 8ul);
++				int e = rd((uint8_t)reg, b, n);
++				int c = snprintf(out, len, "hap 0x%02lx:", reg);
++				for (uint32_t i = 0; i < n && !e && c < (int)len - 4; i++) {
++					c += snprintf(out + c, len - c, " %02x", b[i]);
++				}
++				snprintf(out + c, len - c, "%s\n", e ? " error" : "");
++			}
++			return kIOReturnSuccess;
++		});
++		return;
++	}
++	if (strncmp(args, "stop", 4) == 0) {
++		vibrate(0);
++	} else if (*args >= '0' && *args <= '9') {
++		vibrate((uint32_t)strtoul(args, NULL, 10));
++	}
++	fGate->runActionBlock(^IOReturn {
++		uint8_t s = 0xff;
++		rd(AW_REG_GLBRD5, &s);
++		snprintf(out, len, "hap: %s (ID 0x%02x%s) at I2C%u 0x%02x, state 0x%02x, %s, %u plays, %u iOS patterns, "
++		"%u I2C errors\n",
++		fIs8622x ? (fVariant == 1 ? "AW86223" : "AW86224/5") : (fChipId == AW_ID_AW8624 ? "AW8624 (not driven yet)" :
++		"unknown chip"), fChipId, fIs8622x ? (fVariant == 1 ? ", EFRD9 0x01" : ", EFRD9 0x00") : "", fBus->busId(),
++		fAddr, s, fPlaying ? "playing" : "idle", fPlays, fPatterns, fErrors);
++		return kIOReturnSuccess;
++	});
++}
++
++bool
++VivaHaptic::start(IOService *provider)
++{
++	int enable = 1;
++	PE_parse_boot_argn("vivahaptic", &enable, sizeof(enable));
++	fNub = provider;
++	fBus = OSDynamicCast(VivaI2C, provider->getProvider());
++	if (!enable || fBus == NULL || !IOService::start(provider)) {
++		return false;
++	}
++	fWorkLoop = IOWorkLoop::workLoop();
++	fGate = fWorkLoop ? IOCommandGate::commandGate(this) : NULL;
++	fTimer = fWorkLoop ? IOTimerEventSource::timerEventSource(this, &VivaHaptic::timerFired) : NULL;
++	if (fGate == NULL || fTimer == NULL || fWorkLoop->addEventSource(fGate) != kIOReturnSuccess ||
++	    fWorkLoop->addEventSource(fTimer) != kIOReturnSuccess) {
++		return false;
++	}
++	__block bool found = false;
++	fGate->runActionBlock(^IOReturn {
++		if (!probe()) {
++			return kIOReturnNoDevice;
++		}
++		found = true;
++		if (fChipId == AW_ID_AW8622X) {
++			uint8_t efrd9 = 0;
++			rd(AW_REG_EFRD9, &efrd9);
++			fVariant = (efrd9 & 0x41) == 0x01;
++			fIs8622x = true;
++			init8622x();
++		}
++		return kIOReturnSuccess;
++	});
++	if (!found) {
++		return false;
++	}
++	IOLog("VIVA HAPTIC: %s (ID 0x%02x) at I2C%u 0x%02x, %u I2C errors after init\n",
++	    fIs8622x ? (fVariant ? "AW86223" : "AW86224/5") : (fChipId == AW_ID_AW8624 ? "AW8624, not driven yet" : "unknown"),
++	    fChipId, fBus->busId(), fAddr, fErrors);
++	setProperty("haptic-chip-id", fChipId, 8);
++	setName("vibrator");    /* FigVibrator looks it up by name (the DT node is named "haptic": one match only) */
++	gVivaHaptic = this;
++	registerService();
++	return true;
++}
++
++/* viva_usb.c: link "hap ..." */
++extern "C" void
++viva_haptic_link(const char *args, char *out, size_t len)
++{
++	if (gVivaHaptic == NULL) {
++		snprintf(out, len, "hap: no haptic driver (no chip answered, or vivahaptic=0)\n");
++		return;
++	}
++	gVivaHaptic->link(args, out, len);
++}
++
++/* For other kernel code (e.g. an iOS-facing service): vibrate ms milliseconds, 0 stops. */
++extern "C" int
++viva_haptic_vibrate(uint32_t ms)
++{
++	return gVivaHaptic != NULL && gVivaHaptic->vibrate(ms) == kIOReturnSuccess ? 0 : -1;
++}
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index c461ac2..ffd23a2 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -123,6 +123,11 @@ const char * gIOKernelConfigTables =
+     "     'IONameMatch'     = 'ti,bq27z561';"
+     "   },"
+     "   {"
++    "     'IOClass'         = VivaHaptic;"
++    "     'IOProviderClass' = VivaDTNub;"
++    "     'IONameMatch'     = 'awinic,aw862xx-haptic';"
++    "   },"
++    "   {"
+     "     'IOClass'         = VivaWLAN;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+     "     'IONameMatch'     = 'mediatek,mt6781-wlan';"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 7b0e9bc..e072ca2 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -25,6 +25,7 @@ iokit/Kernel/arm/VivaGPU.cpp                                     optional iokitc
+ iokit/Kernel/arm/VivaGPUUserClient.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/VivaBattery.cpp                                 optional iokitcpp
++iokit/Kernel/arm/VivaHaptic.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/VivaWiFi.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/VivaWLAN.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/VivaScaler.cpp                                  optional iokitcpp

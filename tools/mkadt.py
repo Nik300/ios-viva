@@ -199,12 +199,13 @@ def viva_devices(ph, phandle, gic_ph, ecid):
             ('keymap', u32(0, HID_CSMR_POWER, 1, HID_CSMR_VOLUME_UP)),
         ])])]),
         # GPIO (gpio@10005000): iokit/Kernel/arm/VivaIO.cpp. Only these pins can be driven:
-        # the GT9896's reset (17), dvdd (73) and avdd (166) switches (live DT goodix,*-gpio).
+        # the GT9896's reset (17), dvdd (73) and avdd (166) switches (live DT goodix,*-gpio); the speaker
+        # amps' resets (19: aw87559 0x58, 25: 0x5B) and the haptic driver's reset (23) (live DT reset-gpio).
         node('gpio', [
             ph(),
             ('compatible', cstr('mediatek,mt6781-gpio')),
             ('reg', io(0x10005000, 0x1000)),
-            ('output-pins', u32(17, 73, 166)),
+            ('output-pins', u32(17, 19, 23, 25, 73, 166)),
         ]),
         # I2C0 (i2c0@11007000, SPI 105 level): VivaIO.cpp, MediaTek I2C v2 in FIFO mode.
         # Source clock: CK_CFG_6 i2c_sel = 3 = univpll_d5_d2 = 2496 MHz / 2 / 5 / 2 (univ2pll
@@ -237,6 +238,55 @@ def viva_devices(ph, phandle, gic_ph, ecid):
                 ('reg-coor', u32(0x4180)),
                 ('reg-pid', u32(0x4022)),
                 ('reg-fw-request', u32(0x4180)),
+            ]),
+        ]),
+        # I2C5 (i2c5@11016000, SPI 0x162 level, 400 kHz, IMP_IIC_WRAP bit 5, SCL5/SDA5 = GPIO154/155 mode 1 as LK
+        # left them): the two Awinic AW87559 speaker amps, 0x58 (receiver/top, reset GPIO19) and 0x5B (speaker,
+        # reset GPIO25). No driver yet (audio, 0220+): the bus is there for the link's i2c8 commands.
+        node('i2c5', [
+            ph(),
+            ('compatible', cstr('mediatek,mt6781-i2c')),
+            ('reg', io(0x11016000, 0x1000) + io(0x11017000, 0x1000)),
+            ('interrupt-parent', u32(gic_ph)),
+            ('interrupts', spi(0x162, IRQ_LEVEL_HIGH)),
+            ('bus-id', u32(5)),
+            ('imp-cg-bit', u32(5)),
+            ('clock-frequency', u32(400000)),
+            ('source-clock', u32(124800000)),
+            ('clock-div', u32(5)),
+            ('ext-time-config', u32(0x1801)),
+        ]),
+        # I2C7 (i2c7@11004000, SPI 0x6e level, 400 kHz, IMP_IIC_WRAP bit 7, SCL7/SDA7 = GPIO158/159 mode 1):
+        # the Awinic haptic driver of the Z-axis LRA (live DT awinic_haptic@5A, aw862xx_i2c_addr 0x58).
+        node('i2c7', [
+            ph(),
+            ('compatible', cstr('mediatek,mt6781-i2c')),
+            ('reg', io(0x11004000, 0x1000) + io(0x11017000, 0x1000)),
+            ('interrupt-parent', u32(gic_ph)),
+            ('interrupts', spi(0x6e, IRQ_LEVEL_HIGH)),
+            ('bus-id', u32(7)),
+            ('imp-cg-bit', u32(7)),
+            ('clock-frequency', u32(400000)),
+            ('source-clock', u32(124800000)),
+            ('clock-div', u32(5)),
+            ('ext-time-config', u32(0x1801)),
+        ], [
+            # iokit/Kernel/arm/VivaHaptic.cpp (0220). Named "haptic", not "vibrator": the driver names itself
+            # "vibrator" for iOS's FigVibrator (IOServiceNameMatching), and only one service may match.
+            # CONT-mode values from the live DT's aw8622x_vib_*.
+            node('haptic', [
+                ph(),
+                ('compatible', cstr('awinic,aw862xx-haptic')),
+                ('i2c-address', u32(0x5a)),
+                ('alt-address', u32(0x58)),
+                ('reset-gpio', u32(23)),
+                ('cont-drv1-lvl', u32(0x7f)),
+                ('cont-drv2-lvl', u32(0x36)),
+                ('cont-brk-time', u32(6)),
+                ('cont-tset', u32(6)),
+                ('cont-bemf-set', u32(2)),
+                ('cont-brk-gain', u32(8)),
+                ('d2s-gain', u32(5)),
             ]),
         ]),
         # I2C3 (i2c3@1100f000, SPI 108 level, 400 kHz, same source clock as I2C0): the battery bus. LK
@@ -467,6 +517,10 @@ def build(seed=None, qemu=False, highmem=False, viva=False, viva_ufs=False):
         # The iPhone X is a P3 display: CoreAnimation would then compose in extended-range 10-bit formats
         # (w30r/w40a). viva's panel is shown as 8-bit BGRA, so say sRGB (AppleCLCD also converts XR10).
         product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
+        # MobileGestalt DeviceSupportsHaptics (and VibratorCapability) = /product "haptics": UIKit feedback level 1,
+        # system-sound vibes through the "vibrator" service (VivaHaptic). No /product/haptics "closed-loop": that
+        # would select CoreHaptics' audio actuator path, which viva does not have.
+        product_props = [(k, v) for k, v in product_props if k != 'haptics'] + [('haptics', u32(1))]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the
