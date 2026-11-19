@@ -1152,3 +1152,35 @@ a thin kernel driver (AFE DL1 memif -> ADDA -> MT6366 LOL/HS -> AW87559 amps); I
 - 0221 logs every iOS pattern. At boot mediaserverd starts "2 steps repeat: on 400 g108 off 100" and never stops it
   (probably an alert sound with vibration whose audio never finishes: there is no audio device yet); the 60 s cap
   stopped it.
+
+### 0222-0226: audio and closed-loop haptics through iOS's own stack (2026-11-19)
+Kernel (iokit/Kernel/arm/VivaAudio.cpp, VivaHaptic.cpp, SweetGIC.cpp; tools/mkadt.py /arm-io/afe, gpio mode-pins,
+/product/haptics closed-loop = 1) + HAL plug-in tools/vivaaudio (VivaAudio.driver in /System/Library/Audio/Plug-Ins/HAL,
+built by xnu.yml or locally with tools/vivaaudio/build.sh). Research notes: session scratchpad audio-hw/RECIPE.md,
+audio-research/REPORT.md, haptics-research/REPORT.md.
+- Hardware: AFE DL1 from AFE SRAM 0x11212000 -> ADDA DL -> MTKAIF -> MT6366 (pwrap, VivaPwrap::writeAudio) DAC L -> HS ->
+  AW87559 0x58 (receiver), DAC R -> LOL -> AW87559 0x5B (speaker), vendor music/rcv scenes. 48 kHz, IRQ0 every 480 frames
+  (SPI 169). DL1 HD_MODE 2 reads 16-bit stereo on the MT6781 (not 32-bit): 0224 uses S16 explicitly, 9600-frame ring.
+  Link: aud [tone|play spk|rcv|both [HZ]|off|rd|wr|peek].
+- iOS side: VirtualAudio.plugin must be enabled (/Library/Audio/Plug-Ins/HAL). It classifies HAL devices by UID: our
+  "Codec" (mute controls on output elements 3 = receiver 'prec', 4 = speaker 'pspk'; an input data-source selector
+  imi1/imi2 is mandatory or Device_Codec_Aspen throws 'who?'), "Actuator" (haptics, 'pact') and "Hawking" (silent input
+  'phki': the mandatory vhaw alternate VAD, without it every speaker route falls back to Null_Device).
+- D22 speaker routes always build a closed-loop speaker-protection chain ('clsp', needs Apple's amp telemetry): the
+  plug-in rebinds VirtualAudio's MGCopyAnswer("InternalBuild") to true and the pref com.apple.audio.virtualaudio
+  RawModeDisablesSpeakerProcessing = YES (user mobile) selects the default chain; patch-tunings.py drops
+  AUSpeakerProtectionV3 from /Library/Audio/Tunings/D22/VAD/d22_speaker_*.austrip (originals in backup/).
+- Plug-in fixes found live: one zero timestamp per ring period (re-deriving it from each IRQ made the HAL re-anchor and
+  skip frames = noise); only real routing changes reach the kernel (each volume step re-sent the unmute); speaker
+  route gets a 350 Hz high-pass and -3 dB (D22 tuning rattled viva's speaker).
+- Haptics: closed-loop on, every vibration arrives as PCM on "Actuator"; the plug-in's envelope follower (instant
+  attack, 20 ms release, hysteresis) -> gain 10 + 50 * peak^1.6 (user tuned) -> VivaHaptic. 0225: AW8622x RAM loop mode
+  with a generated 205 Hz sine uploaded to the chip SRAM (CONT mode was too weak to feel), PLAYCFG2 follows live.
+- Debug tools (viva-tests, scratchpad mgq/): vlog PID|-1 SECONDS [FILTER] (os_log stream reader, LoggingSupport
+  activity-stream SPI), vhal (HAL device list), vtone (AudioQueue tone, optional AVAudioSession category), vmgq, vpt,
+  vnstate/vnset (notify state). VirtualAudio verbose logs: com.apple.coreaudio trace* keys (traceroutingmanager ... = 7).
+- 0226: GPU "freezes" (every job 'timed out', 'ignored its hard stop') were the Mali JOB interrupt INTID 308 left masked
+  in the GIC with an interrupt pending: SweetGIC::handleInterrupt set interruptDisabledHard and masked the line without
+  ordering it before interruptActive = 0, so XNU's enableInterrupt on another core could miss the re-enable. 0226 adds
+  the barrier and re-enables soft-enabled lines unconditionally ("SWEET GIC: INTID n was masked although enabled" when
+  it happens). Recovery by hand on an older kernel: poke GICD_ISENABLER9 (0x0c000124) bit 20.
