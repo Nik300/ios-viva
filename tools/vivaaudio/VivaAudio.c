@@ -1209,6 +1209,17 @@ codecWrite(const Float32 *src, UInt32 frames, Float64 sampleTime)
 static Float32 gEnv;
 static Boolean gEnvActive;
 
+/*
+ * Crisp taps (0227): when the envelope switches on from silence, a "tap" step (kernel wave 2: two full-scale cycles
+ * then an anti-phase brake cycle, ~15 ms) fires at once with a punchier gain; only if the waveform is still on after
+ * kTapWindowFrames does the continuous drive (wave 1 loop, the user-tuned curve) take over. iPhone taps are short
+ * and decisive; driving them with the looped sine made every tap a soft, long buzz.
+ */
+#define kTapWindowFrames        (48 * 30)       /* 30 ms */
+enum { kHapIdle, kHapTap, kHapContinuous };
+static int gHapMode = kHapIdle;
+static UInt32 gHapSinceOnset;
+
 static void
 actuatorWrite(const Float32 *src, UInt32 frames)
 {
@@ -1221,32 +1232,48 @@ actuatorWrite(const Float32 *src, UInt32 frames)
 			gEnv = v > gEnv ? v : gEnv * kEnvReleasePerFrame;
 			peak = gEnv > peak ? gEnv : peak;
 		}
+		Boolean wasActive = gEnvActive;
 		gEnvActive = gEnvActive ? peak > kEnvOff : peak > kEnvOn;
-		if (gCapture == NULL && access("/private/var/mobile/Library/Logs/va_hapticpeaks", F_OK) == 0) {
-			static FILE *pf;
-			if (pf == NULL) {
-				pf = fopen("/private/var/mobile/Library/Logs/va_hapticpeaks", "a");
+		uint8_t gain = 0, kind = 0;
+		if (gEnvActive && !wasActive && gHapMode == kHapIdle) {
+			/* onset: the tap's strength from the peak of the next 4 ms of the waveform */
+			Float32 ahead = peak;
+			for (UInt32 j = i; j < MIN(frames, i + 2 * kEnvelopeStepFrames); j++) {
+				ahead = fabsf(src[j]) > ahead ? fabsf(src[j]) : ahead;
 			}
-			if (pf != NULL) {
-				fprintf(pf, "%.4f\n", peak);
+			gain = (uint8_t)MIN(0x80, (UInt32)(40.0f + 88.0f * powf(MIN(ahead, 1.0f), 0.8f)));
+			kind = 1;
+			gHapMode = kHapTap;
+			gHapSinceOnset = 0;
+		} else if (gHapMode == kHapTap) {
+			gHapSinceOnset += kEnvelopeStepFrames;
+			if (!gEnvActive) {
+				gHapMode = kHapIdle;
+			} else if (gHapSinceOnset >= kTapWindowFrames) {
+				gHapMode = kHapContinuous;
 			}
+		} else if (gHapMode == kHapContinuous && !gEnvActive) {
+			gHapMode = kHapIdle;
 		}
-		/* gain curve: 10 + 50 * peak^1.6 (Apple's synced vibes hold ~0.54 with accents up to ~1.0, measured on
-		 * "Apertura"): base ~29, accents ~60, tails down to ~11. Lower than the chip's full scale so it reads as
-		 * a haptic texture following the melody rather than a buzz (user tuning 2026-11-19). */
-		uint8_t gain = !gEnvActive ? 0 : (uint8_t)(10.0f + 50.0f * powf(MIN(peak, 1.0f), 1.6f));
+		if (gHapMode == kHapContinuous) {
+			/* gain curve: 10 + 50 * peak^1.6 (Apple's synced vibes hold ~0.54 with accents up to ~1.0, measured on
+			 * "Apertura"): base ~29, accents ~60. A haptic texture following the melody, not a buzz (user tuning
+			 * 2026-11-19). */
+			gain = (uint8_t)(10.0f + 50.0f * powf(MIN(peak, 1.0f), 1.6f));
+		}
 		any |= gain != 0;
 		struct va_haptic_step *last = h.count ? &h.steps[h.count - 1] : NULL;
-		if (last != NULL && (last->gain == gain || (last->gain && gain && abs((int)last->gain - (int)gain) < 8))) {
+		if (last != NULL && kind == 0 && last->reserved == 0 &&
+		    (last->gain == gain || (last->gain && gain && abs((int)last->gain - (int)gain) < 8))) {
 			last->ms += 2;
 		} else {
-			h.steps[h.count++] = (struct va_haptic_step){ .ms = 2, .gain = gain };
+			h.steps[h.count++] = (struct va_haptic_step){ .ms = 2, .gain = gain, .reserved = kind };
 		}
 	}
 	if (!any && !gHapticOn) {
 		return;                 /* silence, and the motor is already off */
 	}
-	if (h.count > 0 && h.steps[h.count - 1].gain != 0) {
+	if (h.count > 0 && h.steps[h.count - 1].gain != 0 && h.steps[h.count - 1].reserved == 0) {
 		h.steps[h.count - 1].ms += 8;   /* hold until the next cycle replaces it */
 	}
 	gHapticOn = any;

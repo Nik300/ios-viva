@@ -1,0 +1,268 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index 53c8dd2..e527447 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -1816,7 +1816,7 @@ vl_command(void)
+ 			delay(5000);
+ 		}
+ 	} else if (IS("help")) {
+-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | vdec [status|on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | surf [all] | iobmd [SECONDS] | hap [MS|stop|rd REG [N]|wr REG V] | aud [tone|play [spk|rcv|both] [HZ]|off|rd|wr PMICADDR|peek OFF] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
++		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | vdec [status|on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | ps [NAME|PID] | kill PID [SIG] | surf [all] | iobmd [SECONDS] | hap [MS|tap [GAIN]|stop|rd REG [N]|wr REG V] | aud [tone|play [spk|rcv|both] [HZ]|off|rd|wr PMICADDR|peek OFF] | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+ 	} else {
+ 		vl_reply("unknown command: %s (try help)\n", c);
+ 	}
+diff --git a/iokit/Kernel/arm/VivaHaptic.cpp b/iokit/Kernel/arm/VivaHaptic.cpp
+index dae6676..479603d 100644
+--- a/iokit/Kernel/arm/VivaHaptic.cpp
++++ b/iokit/Kernel/arm/VivaHaptic.cpp
+@@ -69,6 +69,25 @@ extern "C" void proc_selfname(char *buf, int size);
+  * 2050). Layout as the vendor file: base 0x600 (below it the RTP FIFO), a version byte, one {start, end} entry.
+  */
+ #define HAP_RAM_BASE            0x600
++/*
++ * 0227: wave 2, the crisp tap (iOS transients, UIKit taps): 2 full-scale cycles at f0 (fast attack), 1 cycle in
++ * anti-phase at 75% (active brake: the LRA stops within ~5 ms instead of ringing on), 6 samples of silence.
++ * 182 samples at 12 kHz = 15 ms. Played once, not looped.
++ */
++static const uint8_t gHapTap[] = {
++	0x00, 0x0e, 0x1b, 0x28, 0x35, 0x41, 0x4c, 0x57, 0x60, 0x68, 0x70, 0x75, 0x7a, 0x7d, 0x7f, 0x7f,
++	0x7e, 0x7b, 0x77, 0x71, 0x6b, 0x62, 0x59, 0x4f, 0x44, 0x38, 0x2c, 0x1f, 0x11, 0x04, 0xf6, 0xe9,
++	0xdb, 0xce, 0xc2, 0xb7, 0xac, 0xa2, 0x9a, 0x92, 0x8c, 0x87, 0x84, 0x82, 0x81, 0x82, 0x84, 0x88,
++	0x8d, 0x94, 0x9b, 0xa4, 0xae, 0xb9, 0xc5, 0xd1, 0xde, 0xeb, 0xf9, 0x06, 0x14, 0x21, 0x2e, 0x3b,
++	0x46, 0x51, 0x5b, 0x64, 0x6c, 0x72, 0x78, 0x7c, 0x7e, 0x7f, 0x7e, 0x7d, 0x79, 0x74, 0x6e, 0x67,
++	0x5e, 0x55, 0x4a, 0x3f, 0x32, 0x26, 0x18, 0x0b, 0xfd, 0xf0, 0xe2, 0xd5, 0xc9, 0xbd, 0xb2, 0xa7,
++	0x9e, 0x96, 0x8f, 0x8a, 0x85, 0x83, 0x81, 0x81, 0x83, 0x86, 0x8a, 0x90, 0x97, 0x9f, 0xa9, 0xb3,
++	0xbe, 0xca, 0xd7, 0xe4, 0xf1, 0x01, 0xf7, 0xec, 0xe3, 0xd9, 0xd0, 0xc8, 0xc0, 0xb9, 0xb2, 0xad,
++	0xa8, 0xa5, 0xa3, 0xa1, 0xa1, 0xa2, 0xa4, 0xa7, 0xab, 0xb0, 0xb6, 0xbd, 0xc4, 0xcc, 0xd5, 0xdf,
++	0xe8, 0xf2, 0xfd, 0x07, 0x11, 0x1b, 0x24, 0x2e, 0x36, 0x3e, 0x46, 0x4c, 0x52, 0x56, 0x5a, 0x5d,
++	0x5e, 0x5f, 0x5e, 0x5d, 0x5a, 0x56, 0x52, 0x4c, 0x45, 0x3e, 0x36, 0x2d, 0x24, 0x1a, 0x10, 0x06,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
+ static const uint8_t gHapSine[] = {
+ 	0x00, 0x0d, 0x1b, 0x28, 0x34, 0x40, 0x4b, 0x55, 0x5f, 0x67, 0x6e, 0x74, 0x78, 0x7b, 0x7d, 0x7d,
+ 	0x7c, 0x79, 0x75, 0x6f, 0x69, 0x61, 0x58, 0x4e, 0x43, 0x37, 0x2b, 0x1e, 0x11, 0x03, 0xf6, 0xe9,
+@@ -113,7 +132,7 @@ public:
+ 	 * Closed-loop haptics (0223, VivaAudio.driver's "Actuator"): `n` steps of ms[i] at gain[i] replace what is
+ 	 * playing. Unlike a pattern, the motor is not stopped between two non-zero steps (the CONT drive keeps its level).
+ 	 */
+-	IOReturn envelope(const uint16_t *ms, const uint8_t *gain, uint32_t n);
++	IOReturn envelope(const uint16_t *ms, const uint8_t *gain, const uint8_t *kind, uint32_t n);
+ 
+ private:
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *src);
+@@ -125,6 +144,7 @@ private:
+ 	void ramUpload(void);
+ 	void stopGated(void);
+ 	void driveGated(uint8_t gain);
++	void tapGated(uint8_t gain);
+ 	void playGated(uint32_t ms);
+ 	void stepGated(void);
+ 	uint32_t dt(const char *key, uint32_t dflt);
+@@ -144,7 +164,8 @@ private:
+ 	bool                fRepeat;
+ 	uint64_t            fRepeatUntil;   /* mach_absolute_time */
+ 	bool                fEnvelope;      /* the steps are an iOS actuator envelope */
+-	uint32_t            fEnvelopes;
++	uint32_t            fEnvelopes, fTaps;
++	uint8_t             fStepKind[HAP_MAX_STEPS];   /* 0227: 1 = tap (wave 2 once) */
+ };
+ 
+ OSDefineMetaClassAndStructors(VivaHaptic, IOService);
+@@ -250,7 +271,8 @@ VivaHaptic::init8622x(void)
+ void
+ VivaHaptic::ramUpload(void)
+ {
+-	const uint32_t base = HAP_RAM_BASE, start = base + 5, end = start + sizeof(gHapSine) - 1;
++	const uint32_t base = HAP_RAM_BASE, start = base + 9, end = start + sizeof(gHapSine) - 1;
++	const uint32_t start2 = end + 1, end2 = start2 + sizeof(gHapTap) - 1;
+ 	bits(AW_REG_RTPCFG1, (uint8_t)~(3 << 4), 3 << 4);               /* 3K SRAM */
+ 	bits(AW_REG_RTPCFG1, (uint8_t)~0x0f, (uint8_t)(base >> 8));
+ 	wr(AW_REG_RTPCFG2, (uint8_t)base);
+@@ -258,7 +280,8 @@ VivaHaptic::ramUpload(void)
+ 	wr(AW_REG_RTPCFG4, (uint8_t)((base >> 1) & 0xff));
+ 	bits(AW_REG_RTPCFG3, (uint8_t)~0x0f, (uint8_t)(((base - (base >> 2)) >> 8) & 0x0f));
+ 	wr(AW_REG_RTPCFG5, (uint8_t)((base - (base >> 2)) & 0xff));
+-	const uint8_t head[5] = { 0x55, (uint8_t)(start >> 8), (uint8_t)start, (uint8_t)(end >> 8), (uint8_t)end };
++	const uint8_t head[9] = { 0x55, (uint8_t)(start >> 8), (uint8_t)start, (uint8_t)(end >> 8), (uint8_t)end,
++		(uint8_t)(start2 >> 8), (uint8_t)start2, (uint8_t)(end2 >> 8), (uint8_t)end2 };
+ 	wr(AW_REG_RAMADDRH, (uint8_t)(base >> 8));
+ 	wr(AW_REG_RAMADDRL, (uint8_t)base);
+ 	for (unsigned i = 0; i < sizeof(head); i++) {
+@@ -267,17 +290,23 @@ VivaHaptic::ramUpload(void)
+ 	for (unsigned i = 0; i < sizeof(gHapSine); i++) {
+ 		wr(AW_REG_RAMDATA, gHapSine[i]);
+ 	}
++	for (unsigned i = 0; i < sizeof(gHapTap); i++) {
++		wr(AW_REG_RAMDATA, gHapTap[i]);
++	}
+ 	/* read back */
+ 	wr(AW_REG_RAMADDRH, (uint8_t)(base >> 8));
+ 	wr(AW_REG_RAMADDRL, (uint8_t)base);
+ 	unsigned bad = 0;
+-	for (unsigned i = 0; i < sizeof(head) + sizeof(gHapSine); i++) {
++	for (unsigned i = 0; i < sizeof(head) + sizeof(gHapSine) + sizeof(gHapTap); i++) {
+ 		uint8_t v = 0;
+ 		rd(AW_REG_RAMDATA, &v);
+-		bad += v != (i < sizeof(head) ? head[i] : gHapSine[i - sizeof(head)]);
++		uint8_t want = i < sizeof(head) ? head[i] : (i < sizeof(head) + sizeof(gHapSine) ? gHapSine[i - sizeof(head)] :
++		    gHapTap[i - sizeof(head) - sizeof(gHapSine)]);
++		bad += v != want;
+ 	}
+ 	fRamOk = bad == 0;
+-	IOLog("VIVA HAPTIC: RAM waveform %lu samples at 0x%x: %s (%u bad)\n", sizeof(gHapSine), start,
++	IOLog("VIVA HAPTIC: RAM waveforms (sine %lu, tap %lu samples) at 0x%x: %s (%u bad)\n", sizeof(gHapSine),
++	    sizeof(gHapTap), start,
+ 	    fRamOk ? "ok" : "FAILED, CONT mode", bad);
+ }
+ 
+@@ -286,8 +315,8 @@ void
+ VivaHaptic::stopGated(void)
+ {
+ 	fTimer->cancelTimeout();
+-	if (!fIs8622x) {
+-		return;
++	if (!fIs8622x || (fRamOk && !fPlaying)) {
++		return;         /* 0227: a tap (wave 2 once) ends and brakes by itself */
+ 	}
+ 	wr(AW_REG_PLAYCFG4, 0x02);
+ 	for (int i = 0; i < 40; i++) {
+@@ -315,7 +344,7 @@ VivaHaptic::driveGated(uint8_t gain)
+ 	}
+ 	if (fRamOk) {
+ 		/* RAM loop: wave 1 in slot 1, forever, scaled by PLAYCFG2 */
+-		bits(AW_REG_PLAYCFG3, (uint8_t)~3, 0);
++		bits(AW_REG_PLAYCFG3, (uint8_t)~7, 1 << 2);     /* RAM mode, BRK_EN: the stop brakes the LRA */
+ 		wr(AW_REG_WAVCFG1, 1);
+ 		wr(AW_REG_WAVCFG2, 0);
+ 		bits(AW_REG_WAVCFG9, (uint8_t)~0xf0, 0xf0);
+@@ -336,6 +365,28 @@ VivaHaptic::driveGated(uint8_t gain)
+ 	fPlays++;
+ }
+ 
++/* 0227: wave 2 once (it ends and brakes by itself): a crisp tap. */
++void
++VivaHaptic::tapGated(uint8_t gain)
++{
++	if (!fRamOk) {
++		driveGated(gain);
++		return;
++	}
++	if (fPlaying) {
++		wr(AW_REG_PLAYCFG4, 0x02);
++		fPlaying = false;
++	}
++	bits(AW_REG_PLAYCFG3, (uint8_t)~7, 1 << 2);
++	wr(AW_REG_WAVCFG1, 2);
++	wr(AW_REG_WAVCFG2, 0);
++	bits(AW_REG_WAVCFG9, (uint8_t)~0xf0, 0);       /* slot 1 plays once */
++	wr(AW_REG_PLAYCFG2, gain);
++	wr(AW_REG_PLAYCFG4, 0x01);
++	fPlays++;
++	fTaps++;
++}
++
+ /* Start the pattern in fStep*: step 0 now, the timer moves on (stepGated). */
+ void
+ VivaHaptic::playGated(uint32_t ms)
+@@ -375,7 +426,13 @@ VivaHaptic::stepGated(void)
+ 		next = 0;
+ 	}
+ 	uint8_t prev = fStepGain[fStep], gain = fStepGain[next];
++	bool tap = fEnvelope && fStepKind[next] == 1;
+ 	fStep = next;
++	if (tap && gain != 0) {
++		tapGated(gain);
++		fTimer->setTimeoutMS(MAX(fStepMs[next], 1u));
++		return;
++	}
+ 	if (prev != 0 && gain != prev && !(fEnvelope && gain != 0)) {
+ 		stopGated();            /* off, or another intensity: CONT levels are set before GO */
+ 	}
+@@ -484,16 +541,18 @@ VivaHaptic::setProperties(OSObject *properties)
+ }
+ 
+ IOReturn
+-VivaHaptic::envelope(const uint16_t *ms, const uint8_t *gain, uint32_t n)
++VivaHaptic::envelope(const uint16_t *ms, const uint8_t *gain, const uint8_t *kind, uint32_t n)
+ {
+ 	struct {
+ 		uint32_t ms[HAP_MAX_STEPS];
+ 		uint8_t  gain[HAP_MAX_STEPS];
++		uint8_t  kind[HAP_MAX_STEPS];
+ 	} p;
+ 	n = MIN(n, (uint32_t)HAP_MAX_STEPS);
+ 	for (uint32_t i = 0; i < n; i++) {
+ 		p.ms[i] = MIN((uint32_t)ms[i], 1000u);
+ 		p.gain[i] = MIN(gain[i], (uint8_t)0x80);
++		p.kind[i] = kind != NULL ? kind[i] : 0;
+ 	}
+ 	return fGate->runActionBlock(^IOReturn {
+ 		fTimer->cancelTimeout();
+@@ -506,12 +565,15 @@ VivaHaptic::envelope(const uint16_t *ms, const uint8_t *gain, uint32_t n)
+ 		}
+ 		bcopy(p.ms, fStepMs, n * sizeof(p.ms[0]));
+ 		bcopy(p.gain, fStepGain, n * sizeof(p.gain[0]));
++		bcopy(p.kind, fStepKind, n * sizeof(p.kind[0]));
+ 		fSteps = n;
+ 		fRepeat = false;
+ 		fEnvelope = true;
+ 		fStep = 0;
+ 		fEnvelopes++;
+-		if (fStepGain[0] == 0 && fPlaying) {
++		if (fStepKind[0] == 1 && fStepGain[0] != 0) {
++			tapGated(fStepGain[0]);
++		} else if (fStepGain[0] == 0 && fPlaying) {
+ 			stopGated();
+ 		} else if (fStepGain[0] != 0 && !fPlaying) {
+ 			driveGated(fStepGain[0]);
+@@ -562,7 +624,14 @@ VivaHaptic::link(const char *args, char *out, size_t len)
+ 		});
+ 		return;
+ 	}
+-	if (strncmp(args, "stop", 4) == 0) {
++	if (strncmp(args, "tap", 3) == 0) {
++		uint32_t g = (uint32_t)strtoul(args + 3, NULL, 0);
++		g = g ? MIN(g, 0x80u) : 0x80;
++		fGate->runActionBlock(^IOReturn {
++			tapGated((uint8_t)g);
++			return kIOReturnSuccess;
++		});
++	} else if (strncmp(args, "stop", 4) == 0) {
+ 		vibrate(0);
+ 	} else if (*args >= '0' && *args <= '9') {
+ 		vibrate((uint32_t)strtoul(args, NULL, 10));
+@@ -571,10 +640,10 @@ VivaHaptic::link(const char *args, char *out, size_t len)
+ 		uint8_t s = 0xff;
+ 		rd(AW_REG_GLBRD5, &s);
+ 		snprintf(out, len, "hap: %s (ID 0x%02x%s) at I2C%u 0x%02x, state 0x%02x, %s, %u plays, %u iOS patterns, "
+-		"%u I2C errors, %u envelopes, %s\n",
++		"%u I2C errors, %u envelopes, %u taps, %s\n",
+ 		fIs8622x ? (fVariant == 1 ? "AW86223" : "AW86224/5") : (fChipId == AW_ID_AW8624 ? "AW8624 (not driven yet)" :
+ 		"unknown chip"), fChipId, fIs8622x ? (fVariant == 1 ? ", EFRD9 0x01" : ", EFRD9 0x00") : "", fBus->busId(),
+-		fAddr, s, fPlaying ? "playing" : "idle", fPlays, fPatterns, fErrors, fEnvelopes,
++		fAddr, s, fPlaying ? "playing" : "idle", fPlays, fPatterns, fErrors, fEnvelopes, fTaps,
+ 		fRamOk ? "RAM mode" : "CONT mode");
+ 		return kIOReturnSuccess;
+ 	});
+@@ -643,17 +712,18 @@ viva_haptic_vibrate(uint32_t ms)
+ 	return gVivaHaptic != NULL && gVivaHaptic->vibrate(ms) == kIOReturnSuccess ? 0 : -1;
+ }
+ 
+-/* VivaAudio.cpp (0223): the iOS actuator envelope, {ms, gain, reserved} x n */
++/* VivaAudio.cpp (0223): the iOS actuator envelope, {ms, gain, kind} x n; 0227: kind 1 = tap */
+ extern "C" int
+ viva_haptic_envelope(const void *steps, uint32_t n)
+ {
+ 	const uint8_t *b = (const uint8_t *)steps;
+ 	uint16_t ms[HAP_MAX_STEPS];
+-	uint8_t gain[HAP_MAX_STEPS];
++	uint8_t gain[HAP_MAX_STEPS], kind[HAP_MAX_STEPS];
+ 	n = MIN(n, (uint32_t)HAP_MAX_STEPS);
+ 	for (uint32_t i = 0; i < n; i++) {
+ 		ms[i] = (uint16_t)(b[4 * i] | (b[4 * i + 1] << 8));
+ 		gain[i] = b[4 * i + 2];
++		kind[i] = b[4 * i + 3];
+ 	}
+-	return gVivaHaptic != NULL && gVivaHaptic->envelope(ms, gain, n) == kIOReturnSuccess ? 0 : -1;
++	return gVivaHaptic != NULL && gVivaHaptic->envelope(ms, gain, kind, n) == kIOReturnSuccess ? 0 : -1;
+ }
