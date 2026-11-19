@@ -125,6 +125,9 @@ static Float32 gVolume = 1.0f;          /* scalar */
 static Float32 gGain = 1.0f;            /* linear, from gVolume */
 static UInt64 gActuatorAnchor, gActuatorSeed = 1;
 static Boolean gHapticOn;
+#define kCaptureFrames          (48000 * 4)
+static FILE *gCapture;
+static UInt32 gCaptured;
 static UInt32 gStreamActive[4] = { 1, 1, 1, 1 };   /* kAudioStreamPropertyIsActive of Codec out, Codec in, Actuator */
 
 static UInt32 *
@@ -996,6 +999,10 @@ VA_StartIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client)
 				return kAudioHardwareNotRunningError;
 			}
 			kernelRoute();
+			if (gCapture == NULL && access("/private/var/mobile/Library/Logs/va_capture.raw", W_OK) == 0) {
+				gCapture = fopen("/private/var/mobile/Library/Logs/va_capture.raw", "w");
+				gCaptured = 0;
+			}
 		}
 	} else if (dev == kObjHawking) {
 		gHawkingIO++;
@@ -1044,10 +1051,28 @@ VA_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 clie
 			sd = gStatus->startSeed;
 			s2 = atomic_load_explicit((_Atomic uint64_t *)&gStatus->seq, memory_order_acquire);
 		} while ((s1 & 1) || s1 != s2);
+		/*
+		 * One timestamp per ring period, computed once and then returned unchanged: re-deriving it from each period
+		 * interrupt gives the same sample time slightly different host times (interrupt latency), which the HAL
+		 * reads as a broken timeline ("Re-anchoring IO timeline. Sample time is not consecutive") and its IO
+		 * cycles then skip a few frames each (stale ring data = noise). Later periods follow the previous anchor
+		 * at the measured rate, nudged a little towards the interrupts so long-term drift is still followed.
+		 */
+		static uint64_t lastZero = ~0ull, lastHost, lastSeed;
 		uint64_t zero = frames - frames % gRingFrames;
+		uint64_t measured = host - (UInt64)((Float64)(frames - zero) * gTicksPerFrame);
+		if (sd != lastSeed || lastZero == ~0ull || zero < lastZero || zero > lastZero + gRingFrames) {
+			lastHost = measured;
+		} else if (zero == lastZero + gRingFrames) {
+			Float64 predicted = (Float64)lastHost + gTicksPerFrame * gRingFrames;
+			lastHost = (UInt64)(predicted + ((Float64)measured - predicted) / 16.0);
+		}
+		lastZero = zero;
+		lastSeed = sd;
 		*sampleTime = (Float64)zero;
-		*hostTime = host - (UInt64)((Float64)(frames - zero) * gTicksPerFrame);
+		*hostTime = lastHost;
 		*seed = sd;
+
 		return 0;
 	}
 	/* Actuator (or no kernel): host-time clock, one period = kActuatorRingFrames */
@@ -1076,10 +1101,22 @@ toS32(Float32 v)
 	return (int32_t)(v * 2147483392.0f);
 }
 
+/* Debug capture: the first kCaptureFrames frames after each codec StartIO, as iOS hands them over (float stereo),
+ * plus each cycle's sample time, when /private/var/mobile/Library/Logs/va_capture.raw exists. */
+
 /* WriteMix of the Codec: interleaved stereo float -> the kernel ring at the cycle's output sample time. */
 static void
 codecWrite(const Float32 *src, UInt32 frames, Float64 sampleTime)
 {
+	if (gCapture != NULL && gCaptured < kCaptureFrames) {
+		fwrite(src, sizeof(Float32) * 2, frames, gCapture);
+		gCaptured += frames;
+		dlog("cycle %.0f frames %u", sampleTime, frames);
+		if (gCaptured >= kCaptureFrames) {
+			fclose(gCapture);
+			gCapture = NULL;
+		}
+	}
 	if (gRing == NULL) {
 		return;
 	}
