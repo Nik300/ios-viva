@@ -115,6 +115,7 @@ static UInt32 gRefCount;
 static io_connect_t gConn;
 static volatile struct va_status *gStatus;
 static volatile int32_t *gRing;
+static Boolean gRing16;
 static UInt32 gRingFrames = 4800;
 static Float64 gTicksPerFrame;
 
@@ -172,7 +173,13 @@ kernelOpen(void)
 		return false;
 	}
 	gRing = (volatile int32_t *)a;
-	gRingFrames = gStatus->ringFrames ? gStatus->ringFrames : 4800;
+	/*
+	 * The kernel (0222/0223) programs DL1 with HD_MODE 2, which on the MT6781 reads 16-bit stereo, not 32-bit
+	 * (measured 2026-11-19: 192000 bytes/s at 48 kHz; HD_MODE 1 = 24-in-32 reads 384000). Until the kernel uses
+	 * HD_MODE 1 the ring holds 2 x int16 frames: twice as many frames in the same bytes.
+	 */
+	gRing16 = gStatus->frameBytes == 8 && gStatus->ringFrames == 4800;
+	gRingFrames = gStatus->ringFrames ? gStatus->ringFrames * (gRing16 ? 2 : 1) : 4800;
 	os_log(gLog, "VivaAudio: kernel open, ring %u frames", gRingFrames);
 	return true;
 }
@@ -1134,8 +1141,12 @@ codecWrite(const Float32 *src, UInt32 frames, Float64 sampleTime)
 			L = toS32(l);
 			R = toS32(r);
 		}
-		gRing[2 * pos] = L;
-		gRing[2 * pos + 1] = R;
+		if (gRing16) {
+			((volatile uint32_t *)gRing)[pos] = ((uint32_t)(uint16_t)(L >> 16)) | ((uint32_t)(uint16_t)(R >> 16) << 16);
+		} else {
+			gRing[2 * pos] = L;
+			gRing[2 * pos + 1] = R;
+		}
 		if (++pos == gRingFrames) {
 			pos = 0;
 		}
