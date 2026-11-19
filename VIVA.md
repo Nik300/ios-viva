@@ -1184,3 +1184,8 @@ audio-research/REPORT.md, haptics-research/REPORT.md.
   ordering it before interruptActive = 0, so XNU's enableInterrupt on another core could miss the re-enable. 0226 adds
   the barrier and re-enables soft-enabled lines unconditionally ("SWEET GIC: INTID n was masked although enabled" when
   it happens). Recovery by hand on an older kernel: poke GICD_ISENABLER9 (0x0c000124) bit 20.
+- 0227 (2026-11-19): crisp taps. RAM wave 2 = 2 full-scale f0 cycles + 1 anti-phase brake cycle (15 ms, once); the
+  plug-in sends a tap at each envelope onset (gain 40 + 88 * peak^0.8) and switches to the continuous drive (wave 1 loop,
+  14 + 62 * peak^1.6) only after 30 ms; RAM loop stops brake (BRK_EN). User verdict: right as it is. Link: hap tap [GAIN].
+- 0230 (ios-viva-9b): IOSurface plane bytesPerRow at +0x10 of the plane record (0046 wrote +0x08): NV12 surfaces work,
+  VideoToolbox decodes; mediaserverd now carries libvivavt (restore: /var/jb/usr/libexec/vt-msd.sh restore).
