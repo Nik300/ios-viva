@@ -22,6 +22,16 @@
 #include <string.h>
 #include <math.h>
 #include <os/log.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <unistd.h>
+#include <stdlib.h>
+
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <sys/mman.h>
+#include <dlfcn.h>
 
 #include "vivaaudio.h"
 
@@ -40,14 +50,63 @@ enum {
 	kObjCodecVolume,
 	kObjMuteReceiver,
 	kObjMuteSpeaker,
+	kObjInDataSource,       /* input data source selector: the built-in microphones ('ssc#' / 'ssrc' on 'inpt') */
 	kObjActuator = 10,
 	kObjActuatorOut,
+	/* "Hawking": the always-on listening input ('phki'). VirtualAudio's routes for the default device require the
+	 * mandatory Hawking VAD to have its port; without it every speaker route fails and vdef falls back to
+	 * Null_Device. Silence, its own host-time clock. */
+	kObjHawking = 20,
+	kObjHawkingIn,
 };
 #define kElementReceiver        3
+/* VirtualAudio's Device_Codec_Aspen reads the input data sources and makes the Built-In Microphone port from them
+ * (mic IDs 'imi1'...); without the property it throws and drops the whole Codec. viva: bottom and top mics. */
+static const UInt32 gMics[] = { 'imi1', 'imi2' };
+static UInt32 gMicCurrent = 'imi1';
 #define kElementSpeaker         4
 #define kVolumeMinDB            (-40.0f)
 
 static os_log_t gLog;
+
+/* Debug log file (the phone has no `log` tool): VivaAudio.log in mediaserverd's home, the first kTraceMax property
+ * calls in detail, then only sets, IO and errors. */
+#define kLogPath                "/private/var/mobile/Library/Logs/VivaAudio.log"
+#define kTraceMax               4000
+static FILE *gFile;
+static unsigned gTraced;
+
+static void __printflike(1, 2)
+dlog(const char *fmt, ...)
+{
+	if (gFile == NULL) {
+		gFile = fopen(kLogPath, "a");
+		if (gFile == NULL) {
+			gFile = fopen("/private/var/tmp/VivaAudio.log", "a");
+		}
+		if (gFile == NULL) {
+			return;
+		}
+		setvbuf(gFile, NULL, _IOLBF, 0);
+	}
+	va_list ap;
+	va_start(ap, fmt);
+	fprintf(gFile, "%llu ", (unsigned long long)(mach_absolute_time() / 24000));     /* ms at 24 MHz */
+	vfprintf(gFile, fmt, ap);
+	fputc('\n', gFile);
+	va_end(ap);
+}
+
+static const char *
+fcc(UInt32 v, char *b)
+{
+	for (int i = 0; i < 4; i++) {
+		char c = (char)(v >> (24 - 8 * i));
+		b[i] = c >= 32 && c < 127 ? c : '.';
+	}
+	b[4] = 0;
+	return b;
+}
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
 static AudioServerPlugInHostRef gHost;
 static UInt32 gRefCount;
@@ -60,12 +119,19 @@ static UInt32 gRingFrames = 4800;
 static Float64 gTicksPerFrame;
 
 /* state */
-static UInt32 gCodecIO, gActuatorIO;
+static UInt32 gCodecIO, gActuatorIO, gHawkingIO;
 static Boolean gMuteReceiver = true, gMuteSpeaker = false;
 static Float32 gVolume = 1.0f;          /* scalar */
 static Float32 gGain = 1.0f;            /* linear, from gVolume */
 static UInt64 gActuatorAnchor, gActuatorSeed = 1;
 static Boolean gHapticOn;
+static UInt32 gStreamActive[4] = { 1, 1, 1, 1 };   /* kAudioStreamPropertyIsActive of Codec out, Codec in, Actuator */
+
+static UInt32 *
+streamActive(AudioObjectID o)
+{
+	return &gStreamActive[o == kObjCodecOut ? 0 : (o == kObjCodecIn ? 1 : (o == kObjHawkingIn ? 3 : 2))];
+}
 
 /* ------------------------------------------------------------------------------------------------ kernel */
 
@@ -134,6 +200,7 @@ kernelRoute(void)
 	kern_return_t kr = o ? IOConnectCallScalarMethod(gConn, VA_UC_START, in, 2, NULL, NULL) :
 	    IOConnectCallScalarMethod(gConn, VA_UC_STOP, NULL, 0, NULL, NULL);
 	os_log(gLog, "VivaAudio: route outputs %u%s: 0x%x", o, rcv ? " (receiver)" : "", kr);
+	dlog("route outputs %u%s: 0x%x", o, rcv ? " (receiver)" : "", kr);
 }
 
 static void
@@ -216,6 +283,8 @@ static OSStatus VA_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID o
     void *outData);
 static OSStatus VA_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid,
     const AudioObjectPropertyAddress *a, UInt32 qsize, const void *q, UInt32 size, const void *data);
+static OSStatus getData(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 qsize, const void *q,
+    UInt32 inDataSize, UInt32 *outDataSize, void *outData);
 static OSStatus VA_StartIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client);
 static OSStatus VA_StopIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client);
 static OSStatus VA_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client,
@@ -238,6 +307,94 @@ static AudioServerPlugInDriverInterface gInterface = {
 static AudioServerPlugInDriverInterface *gInterfacePtr = &gInterface;
 static AudioServerPlugInDriverRef gDriver = &gInterfacePtr;
 
+/*
+ * VirtualAudio builds a closed-loop speaker-protection DSP chain for every D22 speaker route ('clsp'), which needs
+ * Apple's amp telemetry ("Speaker" device, SpCl calibration); without it the route fails. Its own escape hatch
+ * (RunTimeDefaults, func_d7920) builds the default chain when MGCopyAnswer("InternalBuild") is true AND the
+ * preference com.apple.audio.virtualaudio RawModeDisablesSpeakerProcessing is set. Only VirtualAudio's import of
+ * MGCopyAnswer is rebound here (its indirect symbol pointers), so nothing else in mediaserverd sees InternalBuild.
+ */
+static CFTypeRef (*gRealMGCopyAnswer)(CFStringRef, CFDictionaryRef);
+
+static CFTypeRef
+vaMGCopyAnswer(CFStringRef key, CFDictionaryRef opts)
+{
+	if (key != NULL && CFEqual(key, CFSTR("InternalBuild"))) {
+		return kCFBooleanTrue;
+	}
+	return gRealMGCopyAnswer ? gRealMGCopyAnswer(key, opts) : NULL;
+}
+
+static void
+rebindImage(const struct mach_header *mh, intptr_t slide, const char *symbol, void *replacement)
+{
+	const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
+	const struct load_command *lc = (const struct load_command *)(h + 1);
+	const struct segment_command_64 *linkedit = NULL;
+	const struct symtab_command *symtab = NULL;
+	const struct dysymtab_command *dysymtab = NULL;
+	for (uint32_t i = 0; i < h->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize)) {
+		if (lc->cmd == LC_SEGMENT_64 && strcmp(((const struct segment_command_64 *)lc)->segname, "__LINKEDIT") == 0) {
+			linkedit = (const struct segment_command_64 *)lc;
+		} else if (lc->cmd == LC_SYMTAB) {
+			symtab = (const struct symtab_command *)lc;
+		} else if (lc->cmd == LC_DYSYMTAB) {
+			dysymtab = (const struct dysymtab_command *)lc;
+		}
+	}
+	if (linkedit == NULL || symtab == NULL || dysymtab == NULL) {
+		return;
+	}
+	uintptr_t base = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
+	const struct nlist_64 *syms = (const struct nlist_64 *)(base + symtab->symoff);
+	const char *strs = (const char *)(base + symtab->stroff);
+	const uint32_t *indirect = (const uint32_t *)(base + dysymtab->indirectsymoff);
+	lc = (const struct load_command *)(h + 1);
+	for (uint32_t i = 0; i < h->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize)) {
+		if (lc->cmd != LC_SEGMENT_64) {
+			continue;
+		}
+		const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+		const struct section_64 *sect = (const struct section_64 *)(seg + 1);
+		for (uint32_t j = 0; j < seg->nsects; j++, sect++) {
+			uint32_t type = sect->flags & SECTION_TYPE;
+			if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) {
+				continue;
+			}
+			void **ptrs = (void **)((uintptr_t)slide + sect->addr);
+			for (uint32_t k = 0; k < sect->size / sizeof(void *); k++) {
+				uint32_t si = indirect[sect->reserved1 + k];
+				if (si == INDIRECT_SYMBOL_ABS || si == INDIRECT_SYMBOL_LOCAL || si == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) {
+					continue;
+				}
+				if (strcmp(strs + syms[si].n_un.n_strx, symbol) != 0) {
+					continue;
+				}
+				uintptr_t page = (uintptr_t)&ptrs[k] & ~(uintptr_t)(getpagesize() - 1);
+				if (mprotect((void *)page, getpagesize(), PROT_READ | PROT_WRITE) != 0) {
+					dlog("rebind %s: mprotect failed", symbol);
+					continue;
+				}
+				ptrs[k] = replacement;
+				mprotect((void *)page, getpagesize(), PROT_READ);
+				dlog("rebound %s in %s", symbol, sect->sectname);
+			}
+		}
+	}
+}
+
+static void
+imageAdded(const struct mach_header *mh, intptr_t slide)
+{
+	Dl_info info;
+	if (dladdr(mh, &info) && info.dli_fname && strstr(info.dli_fname, "VirtualAudio.plugin/VirtualAudio")) {
+		if (gRealMGCopyAnswer == NULL) {
+			gRealMGCopyAnswer = dlsym(RTLD_DEFAULT, "MGCopyAnswer");
+		}
+		rebindImage(mh, slide, "_MGCopyAnswer", (void *)vaMGCopyAnswer);
+	}
+}
+
 void *VA_Create(CFAllocatorRef alloc, CFUUIDRef type);
 
 void *
@@ -248,6 +405,18 @@ VA_Create(CFAllocatorRef alloc, CFUUIDRef type)
 	}
 	gLog = os_log_create(kPlugInBundleID, "hal");
 	os_log(gLog, "VivaAudio: plug-in created");
+	dlog("--- plug-in created in pid %d (uid %d)", getpid(), getuid());
+	_dyld_register_func_for_add_image(imageAdded);   /* also called now for the images already loaded */
+	/* debugging aid: with OS_ACTIVITY_DT_MODE in launchd's environment os_log also goes to stderr, which launchd
+	 * points at /dev/null; send it to a file instead when that file exists */
+	if (access("/private/var/mobile/Library/Logs/mediaserverd.stderr", W_OK) == 0) {
+		FILE *f = fopen("/private/var/mobile/Library/Logs/mediaserverd.stderr", "a");
+		int r = f ? dup2(fileno(f), 2) : -1;
+		dlog("stderr -> mediaserverd.stderr: dup2 %d, OS_ACTIVITY_DT_MODE=%s", r,
+		    getenv("OS_ACTIVITY_DT_MODE") ?: "(unset)");
+		fprintf(stderr, "VivaAudio: stderr of pid %d\n", getpid());
+		os_log(gLog, "VivaAudio: os_log test line");
+	}
 	return gDriver;
 }
 
@@ -294,8 +463,10 @@ VA_Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRef host)
 	mach_timebase_info(&tb);
 	gTicksPerFrame = (1e9 / kRate) * tb.denom / tb.numer;
 	setVolumeScalar(1.0f);
-	kernelOpen();
+	gActuatorAnchor = mach_absolute_time();     /* the Hawking clock runs from here even if the Actuator never starts */
+	Boolean k = kernelOpen();
 	os_log(gLog, "VivaAudio: initialized, %.3f host ticks per frame", gTicksPerFrame);
+	dlog("initialized: kernel %s, ring %u frames, %.3f ticks/frame", k ? "open" : "NOT open", gRingFrames, gTicksPerFrame);
 	return 0;
 }
 
@@ -305,7 +476,14 @@ static Boolean
 VA_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a)
 {
 	UInt32 size;
-	return VA_GetPropertyDataSize(d, o, pid, a, 0, NULL, &size) == 0;
+	Boolean has = VA_GetPropertyDataSize(d, o, pid, a, 0, NULL, &size) == 0;
+	if (gTraced < kTraceMax) {
+		char s1[5], s2[5];
+		gTraced++;
+		dlog("has pid %d obj %u '%s' '%s' %u -> %d", pid, o, fcc(a->mSelector, s1), fcc(a->mScope, s2), a->mElement,
+		    has);
+	}
+	return has;
 }
 
 static OSStatus
@@ -330,6 +508,12 @@ VA_IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, 
 	case kAudioStreamPropertyPhysicalFormat:
 		*out = true;            /* only to the one format we have */
 		break;
+	case kAudioStreamPropertyIsActive:
+		*out = o == kObjCodecOut || o == kObjCodecIn || o == kObjActuatorOut || o == kObjHawkingIn;
+		break;
+	case kAudioSelectorControlPropertyCurrentItem:
+		*out = o == kObjInDataSource;
+		break;
 	default:
 		*out = false;
 	}
@@ -346,7 +530,7 @@ VA_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid,
 		CFStringRef s;
 	} scratch;
 	UInt32 size = 0;
-	OSStatus e = VA_GetPropertyData(d, o, pid, a, qsize, q, sizeof(scratch), &size, &scratch);
+	OSStatus e = getData(o, a, qsize, q, sizeof(scratch), &size, &scratch);
 	if (e == 0) {
 		*out = size;
 		if (size == sizeof(CFStringRef) && (a->mSelector == kAudioObjectPropertyName ||
@@ -371,7 +555,7 @@ static OSStatus
 plugInProperty(const AudioObjectPropertyAddress *a, UInt32 qsize, const void *q, UInt32 inDataSize,
     UInt32 *outDataSize, void *outData)
 {
-	static const AudioObjectID devices[] = { kObjCodec, kObjActuator };
+	static const AudioObjectID devices[] = { kObjCodec, kObjActuator, kObjHawking };
 	switch (a->mSelector) {
 	case kAudioObjectPropertyBaseClass:
 		RET(AudioClassID, kAudioObjectClassID);
@@ -383,7 +567,7 @@ plugInProperty(const AudioObjectPropertyAddress *a, UInt32 qsize, const void *q,
 		RETSTR("viva");
 	case kAudioObjectPropertyOwnedObjects:
 	case kAudioPlugInPropertyDeviceList:
-		return objectIDs(devices, 2, inDataSize, outDataSize, outData);
+		return objectIDs(devices, 3, inDataSize, outDataSize, outData);
 	case kAudioPlugInPropertyTranslateUIDToDevice: {
 		if (qsize < sizeof(CFStringRef) || q == NULL) {
 			return kAudioHardwareBadPropertySizeError;
@@ -394,6 +578,8 @@ plugInProperty(const AudioObjectPropertyAddress *a, UInt32 qsize, const void *q,
 			dev = kObjCodec;
 		} else if (uid != NULL && CFEqual(uid, CFSTR("Actuator"))) {
 			dev = kObjActuator;
+		} else if (uid != NULL && CFEqual(uid, CFSTR("Hawking"))) {
+			dev = kObjHawking;
 		}
 		RET(AudioObjectID, dev);
 	}
@@ -408,7 +594,7 @@ static OSStatus
 deviceProperty(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 inDataSize, UInt32 *outDataSize,
     void *outData)
 {
-	Boolean codec = o == kObjCodec;
+	Boolean codec = o == kObjCodec, hawk = o == kObjHawking;
 	Boolean out = a->mScope == kAudioObjectPropertyScopeOutput, in = a->mScope == kAudioObjectPropertyScopeInput,
 	    glob = a->mScope == kAudioObjectPropertyScopeGlobal;
 	switch (a->mSelector) {
@@ -422,34 +608,46 @@ deviceProperty(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 inDa
 		if (codec) {
 			RETSTR("Codec");
 		}
+		if (hawk) {
+			RETSTR("Hawking");
+		}
 		RETSTR("Actuator");
 	case kAudioObjectPropertyManufacturer:
 		RETSTR("viva");
 	case kAudioObjectPropertyOwnedObjects: {
 		static const AudioObjectID c[] = { kObjCodecOut, kObjCodecIn, kObjCodecVolume, kObjMuteReceiver,
-			kObjMuteSpeaker };
+			kObjMuteSpeaker, kObjInDataSource };
 		static const AudioObjectID co[] = { kObjCodecOut, kObjCodecVolume, kObjMuteReceiver, kObjMuteSpeaker };
-		static const AudioObjectID ci[] = { kObjCodecIn };
-		static const AudioObjectID ac[] = { kObjActuatorOut };
+		static const AudioObjectID ci[] = { kObjCodecIn, kObjInDataSource };
+		static const AudioObjectID ac[] = { kObjActuatorOut }, hk[] = { kObjHawkingIn };
+		if (hawk) {
+			return objectIDs(hk, out ? 0 : 1, inDataSize, outDataSize, outData);
+		}
 		if (!codec) {
 			return objectIDs(ac, in ? 0 : 1, inDataSize, outDataSize, outData);
 		}
-		return glob ? objectIDs(c, 5, inDataSize, outDataSize, outData) :
+		return glob ? objectIDs(c, 6, inDataSize, outDataSize, outData) :
 		       (out ? objectIDs(co, 4, inDataSize, outDataSize, outData) :
-		       objectIDs(ci, 1, inDataSize, outDataSize, outData));
+		       objectIDs(ci, 2, inDataSize, outDataSize, outData));
 	}
 	case kAudioObjectPropertyControlList: {
-		static const AudioObjectID c[] = { kObjCodecVolume, kObjMuteReceiver, kObjMuteSpeaker };
-		return objectIDs(c, codec ? 3 : 0, inDataSize, outDataSize, outData);
+		static const AudioObjectID c[] = { kObjCodecVolume, kObjMuteReceiver, kObjMuteSpeaker, kObjInDataSource };
+		return objectIDs(c, codec ? 4 : 0, inDataSize, outDataSize, outData);
 	}
 	case kAudioDevicePropertyDeviceUID:
 		if (codec) {
 			RETSTR("Codec");
 		}
+		if (hawk) {
+			RETSTR("Hawking");
+		}
 		RETSTR("Actuator");
 	case kAudioDevicePropertyModelUID:
 		if (codec) {
 			RETSTR("it.viva.audio.codec");
+		}
+		if (hawk) {
+			RETSTR("it.viva.audio.hawking");
 		}
 		RETSTR("it.viva.audio.actuator");
 	case kAudioDevicePropertyTransportType:
@@ -459,11 +657,11 @@ deviceProperty(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 inDa
 		return objectIDs(&me, 1, inDataSize, outDataSize, outData);
 	}
 	case kAudioDevicePropertyClockDomain:
-		RET(UInt32, codec ? 1 : 2);
+		RET(UInt32, codec ? 1 : (hawk ? 3 : 2));
 	case kAudioDevicePropertyDeviceIsAlive:
 		RET(UInt32, 1);
 	case kAudioDevicePropertyDeviceIsRunning:
-		RET(UInt32, codec ? gCodecIO > 0 : gActuatorIO > 0);
+		RET(UInt32, codec ? gCodecIO > 0 : (hawk ? gHawkingIO > 0 : gActuatorIO > 0));
 	case kAudioDevicePropertyDeviceCanBeDefaultDevice:
 	case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
 		RET(UInt32, codec);
@@ -473,7 +671,10 @@ deviceProperty(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 inDa
 		RET(UInt32, codec ? kSafetyOffset : 0);
 	case kAudioDevicePropertyStreams: {
 		static const AudioObjectID both[] = { kObjCodecOut, kObjCodecIn };
-		static const AudioObjectID ao[] = { kObjActuatorOut };
+		static const AudioObjectID ao[] = { kObjActuatorOut }, hi[] = { kObjHawkingIn };
+		if (hawk) {
+			return objectIDs(hi, out ? 0 : 1, inDataSize, outDataSize, outData);
+		}
 		if (!codec) {
 			return objectIDs(ao, in ? 0 : 1, inDataSize, outDataSize, outData);
 		}
@@ -500,7 +701,7 @@ deviceProperty(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 inDa
 			return kAudioHardwareBadPropertySizeError;
 		}
 		((UInt32 *)outData)[0] = 1;
-		((UInt32 *)outData)[1] = codec ? 2 : 1;
+		((UInt32 *)outData)[1] = codec ? 2 : 1;     /* Hawking and Actuator: mono */
 		*outDataSize = 2 * sizeof(UInt32);
 		return 0;
 	}
@@ -513,16 +714,19 @@ static OSStatus
 streamProperty(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 inDataSize, UInt32 *outDataSize,
     void *outData)
 {
-	Boolean input = o == kObjCodecIn;
-	UInt32 ch = o == kObjActuatorOut ? 1 : 2;
+	Boolean input = o == kObjCodecIn || o == kObjHawkingIn;
+	UInt32 ch = o == kObjActuatorOut || o == kObjHawkingIn ? 1 : 2;
 	switch (a->mSelector) {
 	case kAudioObjectPropertyBaseClass:
 		RET(AudioClassID, kAudioObjectClassID);
 	case kAudioObjectPropertyClass:
 		RET(AudioClassID, kAudioStreamClassID);
 	case kAudioObjectPropertyOwner:
-		RET(AudioObjectID, o == kObjActuatorOut ? kObjActuator : kObjCodec);
+		RET(AudioObjectID, o == kObjActuatorOut ? kObjActuator : (o == kObjHawkingIn ? kObjHawking : kObjCodec));
 	case kAudioObjectPropertyName:
+		if (o == kObjHawkingIn) {
+			RETSTR("Hawking Input");
+		}
 		if (o == kObjActuatorOut) {
 			RETSTR("Actuator");
 		}
@@ -534,7 +738,7 @@ streamProperty(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 inDa
 		*outDataSize = 0;
 		return 0;
 	case kAudioStreamPropertyIsActive:
-		RET(UInt32, 1);
+		RET(UInt32, *streamActive(o));
 	case kAudioStreamPropertyDirection:
 		RET(UInt32, input ? 1 : 0);
 	case kAudioStreamPropertyTerminalType:
@@ -557,9 +761,49 @@ streamProperty(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 inDa
 }
 
 static OSStatus
+dataSourceProperty(const AudioObjectPropertyAddress *a, UInt32 qsize, const void *q, UInt32 inDataSize,
+    UInt32 *outDataSize, void *outData)
+{
+	switch (a->mSelector) {
+	case kAudioObjectPropertyBaseClass:
+		RET(AudioClassID, kAudioSelectorControlClassID);
+	case kAudioObjectPropertyClass:
+		RET(AudioClassID, kAudioDataSourceControlClassID);
+	case kAudioObjectPropertyOwner:
+		RET(AudioObjectID, kObjCodec);
+	case kAudioObjectPropertyOwnedObjects:
+		*outDataSize = 0;
+		return 0;
+	case kAudioControlPropertyScope:
+		RET(AudioObjectPropertyScope, kAudioObjectPropertyScopeInput);
+	case kAudioControlPropertyElement:
+		RET(AudioObjectPropertyElement, kAudioObjectPropertyElementMain);
+	case kAudioSelectorControlPropertyCurrentItem:
+		RET(UInt32, gMicCurrent);
+	case kAudioSelectorControlPropertyAvailableItems:
+		return objectIDs(gMics, 2, inDataSize, outDataSize, outData);
+	case kAudioSelectorControlPropertyItemName:
+		if (qsize < sizeof(UInt32) || q == NULL) {
+			return kAudioHardwareBadPropertySizeError;
+		}
+		if (*(const UInt32 *)q == 'imi2') {
+			RETSTR("Top Microphone");
+		}
+		RETSTR("Bottom Microphone");
+	case kAudioSelectorControlPropertyItemKind:
+		RET(UInt32, 0);
+	default:
+		return kAudioHardwareUnknownPropertyError;
+	}
+}
+
+static OSStatus
 controlProperty(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 qsize, const void *q,
     UInt32 inDataSize, UInt32 *outDataSize, void *outData)
 {
+	if (o == kObjInDataSource) {
+		return dataSourceProperty(a, qsize, q, inDataSize, outDataSize, outData);
+	}
 	Boolean volume = o == kObjCodecVolume;
 	switch (a->mSelector) {
 	case kAudioObjectPropertyBaseClass:
@@ -615,26 +859,56 @@ controlProperty(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 qsi
 }
 
 static OSStatus
-VA_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a,
-    UInt32 qsize, const void *q, UInt32 inDataSize, UInt32 *outDataSize, void *outData)
+getData(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 qsize, const void *q, UInt32 inDataSize,
+    UInt32 *outDataSize, void *outData)
 {
 	switch (o) {
 	case kObjPlugIn:
 		return plugInProperty(a, qsize, q, inDataSize, outDataSize, outData);
 	case kObjCodec:
 	case kObjActuator:
+	case kObjHawking:
 		return deviceProperty(o, a, inDataSize, outDataSize, outData);
 	case kObjCodecOut:
 	case kObjCodecIn:
 	case kObjActuatorOut:
+	case kObjHawkingIn:
 		return streamProperty(o, a, inDataSize, outDataSize, outData);
 	case kObjCodecVolume:
 	case kObjMuteReceiver:
 	case kObjMuteSpeaker:
+	case kObjInDataSource:
 		return controlProperty(o, a, qsize, q, inDataSize, outDataSize, outData);
 	default:
 		return kAudioHardwareBadObjectError;
 	}
+}
+
+static OSStatus
+VA_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a,
+    UInt32 qsize, const void *q, UInt32 inDataSize, UInt32 *outDataSize, void *outData)
+{
+	OSStatus e = getData(o, a, qsize, q, inDataSize, outDataSize, outData);
+	if (gTraced < kTraceMax || e != 0) {
+		char s1[5], s2[5], s3[5];
+		gTraced += gTraced < kTraceMax;
+		Boolean str = a->mSelector == kAudioObjectPropertyName || a->mSelector == kAudioObjectPropertyManufacturer ||
+		    a->mSelector == kAudioDevicePropertyDeviceUID || a->mSelector == kAudioDevicePropertyModelUID ||
+		    a->mSelector == kAudioPlugInPropertyResourceBundle;
+		if (e == 0 && str && *outDataSize == sizeof(CFStringRef)) {
+			char str[64] = "";
+			CFStringGetCString(*(CFStringRef *)outData, str, sizeof(str), kCFStringEncodingUTF8);
+			dlog("get pid %d obj %u '%s' '%s' %u -> \"%s\"", pid, o, fcc(a->mSelector, s1), fcc(a->mScope, s2),
+			    a->mElement, str);
+		} else if (e == 0 && *outDataSize == 4) {
+			dlog("get pid %d obj %u '%s' '%s' %u -> %u ('%s')", pid, o, fcc(a->mSelector, s1), fcc(a->mScope, s2),
+			    a->mElement, *(UInt32 *)outData, fcc(*(UInt32 *)outData, s3));
+		} else {
+			dlog("get pid %d obj %u '%s' '%s' %u -> %s%d (%u bytes)", pid, o, fcc(a->mSelector, s1),
+			    fcc(a->mScope, s2), a->mElement, e ? "ERR '" : "", e ? (int)e : 0, e ? 0 : *outDataSize);
+		}
+	}
+	return e;
 }
 
 static void
@@ -650,6 +924,9 @@ static OSStatus
 VA_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, const AudioObjectPropertyAddress *a,
     UInt32 qsize, const void *q, UInt32 size, const void *data)
 {
+	char s1[5], s2[5];
+	dlog("set pid %d obj %u '%s' '%s' %u size %u value %u", pid, o, fcc(a->mSelector, s1), fcc(a->mScope, s2),
+	    a->mElement, size, size >= 4 ? *(const UInt32 *)data : 0);
 	switch (a->mSelector) {
 	case kAudioBooleanControlPropertyValue:
 		if ((o != kObjMuteReceiver && o != kObjMuteSpeaker) || size < sizeof(UInt32)) {
@@ -679,6 +956,21 @@ VA_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, con
 		return 0;
 	case kAudioDevicePropertyNominalSampleRate:
 		return size >= sizeof(Float64) && *(const Float64 *)data == kRate ? 0 : kAudioHardwareIllegalOperationError;
+	case kAudioSelectorControlPropertyCurrentItem:
+		if (o != kObjInDataSource || size < sizeof(UInt32)) {
+			return kAudioHardwareIllegalOperationError;
+		}
+		gMicCurrent = *(const UInt32 *)data == 'imi2' ? 'imi2' : 'imi1';
+		changed(o, kAudioSelectorControlPropertyCurrentItem);
+		return 0;
+	case kAudioStreamPropertyIsActive:
+		if ((o != kObjCodecOut && o != kObjCodecIn && o != kObjActuatorOut && o != kObjHawkingIn) ||
+		    size < sizeof(UInt32)) {
+			return kAudioHardwareIllegalOperationError;
+		}
+		*streamActive(o) = *(const UInt32 *)data != 0;
+		changed(o, kAudioStreamPropertyIsActive);
+		return 0;
 	case kAudioStreamPropertyVirtualFormat:
 	case kAudioStreamPropertyPhysicalFormat:
 		return size >= sizeof(AudioStreamBasicDescription) &&
@@ -694,6 +986,7 @@ VA_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID o, pid_t pid, con
 static OSStatus
 VA_StartIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client)
 {
+	dlog("StartIO dev %u client %u (codec %u actuator %u)", dev, client, gCodecIO, gActuatorIO);
 	pthread_mutex_lock(&gLock);
 	if (dev == kObjCodec) {
 		if (gCodecIO++ == 0) {
@@ -704,6 +997,8 @@ VA_StartIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client)
 			}
 			kernelRoute();
 		}
+	} else if (dev == kObjHawking) {
+		gHawkingIO++;
 	} else if (gActuatorIO++ == 0) {
 		kernelOpen();
 		gActuatorAnchor = mach_absolute_time();
@@ -717,12 +1012,15 @@ VA_StartIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client)
 static OSStatus
 VA_StopIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client)
 {
+	dlog("StopIO dev %u client %u", dev, client);
 	pthread_mutex_lock(&gLock);
 	if (dev == kObjCodec) {
 		if (gCodecIO > 0 && --gCodecIO == 0 && gConn != IO_OBJECT_NULL) {
 			IOConnectCallScalarMethod(gConn, VA_UC_STOP, NULL, 0, NULL, NULL);
 			os_log(gLog, "VivaAudio: codec IO off");
 		}
+	} else if (dev == kObjHawking) {
+		gHawkingIO -= gHawkingIO > 0;
 	} else if (gActuatorIO > 0 && --gActuatorIO == 0) {
 		struct va_haptic h = { .count = 1, .steps = { { .ms = 1, .gain = 0 } } };
 		kernelHaptic(&h);
@@ -765,8 +1063,8 @@ static OSStatus
 VA_WillDoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client, UInt32 op, Boolean *will,
     Boolean *inPlace)
 {
-	*will = op == kAudioServerPlugInIOOperationWriteMix ||
-	    (op == kAudioServerPlugInIOOperationReadInput && dev == kObjCodec);
+	*will = (op == kAudioServerPlugInIOOperationWriteMix && dev != kObjHawking) ||
+	    (op == kAudioServerPlugInIOOperationReadInput && (dev == kObjCodec || dev == kObjHawking));
 	*inPlace = true;
 	return 0;
 }
@@ -843,7 +1141,7 @@ VA_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID dev, AudioObjectID 
     UInt32 frames, const AudioServerPlugInIOCycleInfo *cycle, void *main, void *secondary)
 {
 	if (op == kAudioServerPlugInIOOperationReadInput) {
-		memset(main, 0, (size_t)frames * 2 * sizeof(Float32));
+		memset(main, 0, (size_t)frames * (dev == kObjHawking ? 1 : 2) * sizeof(Float32));
 	} else if (op == kAudioServerPlugInIOOperationWriteMix) {
 		if (dev == kObjCodec) {
 			codecWrite((const Float32 *)main, frames, cycle->mOutputTime.mSampleTime);
