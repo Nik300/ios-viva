@@ -1256,10 +1256,10 @@ actuatorWrite(const Float32 *src, UInt32 frames)
 			gHapMode = kHapIdle;
 		}
 		if (gHapMode == kHapContinuous) {
-			/* gain curve: 10 + 50 * peak^1.6 (Apple's synced vibes hold ~0.54 with accents up to ~1.0, measured on
-			 * "Apertura"): base ~29, accents ~60. A haptic texture following the melody, not a buzz (user tuning
+			/* gain curve: 14 + 62 * peak^1.6 (Apple's synced vibes hold ~0.54 with accents up to ~1.0, measured on
+			 * "Apertura"): base ~37, accents ~76. A haptic texture following the melody, not a buzz (user tuning
 			 * 2026-11-19). */
-			gain = (uint8_t)(10.0f + 50.0f * powf(MIN(peak, 1.0f), 1.6f));
+			gain = (uint8_t)(14.0f + 62.0f * powf(MIN(peak, 1.0f), 1.6f));
 		}
 		any |= gain != 0;
 		struct va_haptic_step *last = h.count ? &h.steps[h.count - 1] : NULL;
