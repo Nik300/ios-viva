@@ -1,0 +1,26 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 845a017..2e9203a 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -808,13 +808,20 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 	put32(out, 0x44, s->cacheMode);
+ 	put32(out, 0x50, s->parentID);
+ 	put32(out, 0x54, 1);
++	/*
++	 * Plane records, as IOSurface.framework (iOS 16) reads them through IOSurfaceClient + 0xd0 + i * 0x80:
++	 * +0x00 width, +0x04 height, +0x0c offset, +0x10 bytes per row, +0x14 size, +0x18 u16 bytes per
++	 * element, +0x1a element width, +0x1b element height, +0x54 compression type (0 = none).
++	 * Nothing reads +0x08; until 0230 the pitch went there and every multi-planar surface ('420v',
++	 * '420f', 'x420') had GetBytesPerRowOfPlane = 0.
++	 */
+ 	for (uint32_t i = 0; i < s->planeCount; i++) {
+ 		uint8_t *p = out + 0x68 + i * 0x80;
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;
