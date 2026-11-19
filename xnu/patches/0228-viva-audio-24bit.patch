@@ -1,0 +1,78 @@
+diff --git a/iokit/Kernel/arm/VivaAudio.cpp b/iokit/Kernel/arm/VivaAudio.cpp
+index a38a754..a54c71a 100644
+--- a/iokit/Kernel/arm/VivaAudio.cpp
++++ b/iokit/Kernel/arm/VivaAudio.cpp
+@@ -8,7 +8,7 @@
+  * LK leaves the audio infra clocks open, audio_sel on 26 MHz, VAUD28 on, GPIO183 in mode 1 and AFE_IRQ_MCU_EN at
+  * ~0 (read 2026-11-19); 184-186 are switched to mode 1 here.
+  *
+- * Playback: DL1 reads a ring in AFE SRAM (0x11212000), 48 kHz, stereo, S16_LE (left = receiver, right =
++ * Playback: DL1 reads a ring in AFE SRAM (0x11212000), 48 kHz, stereo, 24 bits in S32_LE (left = receiver, right =
+  * loudspeaker), 10 ms periods; the period interrupt (IRQ0, SPI 169) advances a frame counter with its host time.
+  * Outputs are a mask (VA_OUT_RCV, VA_OUT_SPK) chosen per stream; the amps load the vendor "music" or "rcv" scene.
+  *
+@@ -71,10 +71,13 @@
+ 
+ #define VA_RATE                 48000
+ #define VA_RATE_MEMIF           10      /* memif/IRQ rate index of 48 kHz */
+-#define VA_FRAME_BYTES          4       /* stereo S16_LE: HD_MODE 0 (HD_MODE 2 also reads 16-bit on the MT6781:
+-                                         * measured 192000 B/s at 48 kHz; HD_MODE 1 = 24 bits in 32) */
++#define VA_FRAME_BYTES          8       /* 0228: stereo 24 bits MSB-aligned in 32 = S32_LE (HD_MODE 1 + HALIGN).
++                                         * Measured on the MT6781: HD_MODE 0 and 2 both read 16-bit (192000 B/s
++                                         * at 48 kHz), HD_MODE 1 reads 8 bytes/frame; HALIGN 0 = 24 bits LSB-aligned
++                                         * (S32 data crackles), HALIGN 1 = MSB-aligned (S32 data plays clean). */
++#define VA_FORMAT_S32           1       /* va_status.sampleFormat */
+ #define VA_PERIOD_FRAMES        480     /* 10 ms */
+-#define VA_PERIODS              20      /* 9600 frames, 200 ms, in the 0x9c00 bytes of SRAM */
++#define VA_PERIODS              10      /* 4800 frames, 100 ms, in the 0x9c00 bytes of SRAM */
+ 
+ #define VA_OUT_RCV              1       /* HS, DAC L, AW87559 0x58 */
+ #define VA_OUT_SPK              2       /* LOL, DAC R, AW87559 0x5B */
+@@ -107,6 +110,7 @@ struct va_status {
+ 	uint64_t hostTime;      /* mach_absolute_time of that interrupt */
+ 	uint64_t startSeed;     /* +1 at each start */
+ 	uint32_t rate, channels, frameBytes, periodFrames, ringFrames, running, outputs, irqs;
++	uint32_t sampleFormat;  /* 0228: 1 = 24 bits MSB-aligned in S32_LE; 0 = older kernels (16-bit) */
+ };
+ #define VA_UC_START             0
+ #define VA_UC_STOP              1
+@@ -480,9 +484,9 @@ VivaAudio::memifGated(bool on)
+ 	wr(AFE_DL1_BASE, (uint32_t)fSRAMPhys);
+ 	wr(AFE_DL1_END_MSB, (uint32_t)((fSRAMPhys + fRingBytes - 1) >> 32));
+ 	wr(AFE_DL1_END, (uint32_t)(fSRAMPhys + fRingBytes - 1));
+-	/* 48 kHz, stereo, normal (SRAM) mode, S16_LE (HD_MODE 0), PBUF/MINLEN 0 for 10 ms periods */
+-	bits(AFE_DL1_CON0, (0xfu << 24) | (0xfu << 20) | (3u << 12) | (1u << 8) | (1u << 5) | 3u,
+-	    ((uint32_t)VA_RATE_MEMIF << 24) | (1u << 5));
++	/* 48 kHz, stereo, normal (SRAM) mode, 24 bits MSB-aligned (HD_MODE 1, HALIGN), PBUF/MINLEN 0 for 10 ms periods */
++	bits(AFE_DL1_CON0, (0xfu << 24) | (0xfu << 20) | (3u << 12) | (1u << 8) | (1u << 5) | (1u << 4) | 3u,
++	    ((uint32_t)VA_RATE_MEMIF << 24) | (1u << 5) | (1u << 4) | 1u);
+ 	fFrames = 0;
+ 	fHostTime = mach_absolute_time();
+ 	__atomic_store_n(&fStatus->seq, fStatus->seq + 1, __ATOMIC_RELEASE);
+@@ -685,13 +689,14 @@ VivaAudio::link(const char *args, char *out, size_t len)
+ 		hz = hz ? MIN(MAX(hz, 50u), 8000u) : 1000;
+ 		if (!tone) {
+ 			/* one period-aligned ring of a sine, -12 dB: Bhaskara's approximation, no FP in the kernel */
+-			volatile uint32_t *s = (volatile uint32_t *)fSRAM;
++			volatile int32_t *s = (volatile int32_t *)fSRAM;
+ 			uint32_t frames = fRingBytes / VA_FRAME_BYTES;
+ 			for (uint32_t i = 0; i < frames; i++) {
+ 				uint32_t ph = (uint32_t)(((uint64_t)i * hz * 360 / VA_RATE) % 360);
+-				int64_t x = ph % 180, y = 4 * x * (180 - x) * 0x2000ll / (40500 - x * (180 - x));
+-				uint16_t v = (uint16_t)(int16_t)(ph < 180 ? y : -y);
+-				s[i] = (uint32_t)v | ((uint32_t)v << 16);
++				int64_t x = ph % 180, y = 4 * x * (180 - x) * 0x20000000ll / (40500 - x * (180 - x));
++				int32_t v = (int32_t)(ph < 180 ? y : -y);
++				s[2 * i] = v;
++				s[2 * i + 1] = v;
+ 			}
+ 		}
+ 		fGate->runActionBlock(^IOReturn {
+@@ -752,6 +757,7 @@ VivaAudio::start(IOService *provider)
+ 	fStatus->frameBytes = VA_FRAME_BYTES;
+ 	fStatus->periodFrames = VA_PERIOD_FRAMES;
+ 	fStatus->ringFrames = fRingBytes / VA_FRAME_BYTES;
++	fStatus->sampleFormat = VA_FORMAT_S32;
+ 
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	fGate = fWorkLoop ? IOCommandGate::commandGate(this) : NULL;

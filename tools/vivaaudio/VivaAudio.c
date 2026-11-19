@@ -211,10 +211,11 @@ kernelOpen(void)
 	 * (measured 2026-11-19: 192000 bytes/s at 48 kHz; HD_MODE 1 = 24-in-32 reads 384000). Until the kernel uses
 	 * HD_MODE 1 the ring holds 2 x int16 frames: twice as many frames in the same bytes.
 	 */
-	Boolean legacy = gStatus->frameBytes == 8 && gStatus->ringFrames == 4800;   /* 0222/0223 kernels */
+	Boolean legacy = gStatus->frameBytes == 8 && gStatus->ringFrames == 4800 &&
+	    gStatus->sampleFormat != VA_FORMAT_S32;                                 /* 0222/0223 kernels */
 	gRing16 = legacy || gStatus->frameBytes == 4;                               /* 0224: S16_LE, says so */
 	gRingFrames = legacy ? 9600 : (gStatus->ringFrames ? gStatus->ringFrames : 9600);
-	os_log(gLog, "VivaAudio: kernel open, ring %u frames", gRingFrames);
+	os_log(gLog, "VivaAudio: kernel open, ring %u frames, %s", gRingFrames, gRing16 ? "16-bit" : "24-bit in S32");
 	return true;
 }
 
@@ -520,7 +521,8 @@ VA_Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRef host)
 	gActuatorAnchor = mach_absolute_time();     /* the Hawking clock runs from here even if the Actuator never starts */
 	Boolean k = kernelOpen();
 	os_log(gLog, "VivaAudio: initialized, %.3f host ticks per frame", gTicksPerFrame);
-	dlog("initialized: kernel %s, ring %u frames, %.3f ticks/frame", k ? "open" : "NOT open", gRingFrames, gTicksPerFrame);
+	dlog("initialized: kernel %s, ring %u frames %s, %.3f ticks/frame", k ? "open" : "NOT open", gRingFrames,
+	    gRing16 ? "16-bit" : "24-bit in S32", gTicksPerFrame);
 	return 0;
 }
 
