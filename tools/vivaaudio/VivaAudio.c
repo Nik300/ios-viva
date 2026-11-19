@@ -198,6 +198,10 @@ codecOutputs(Boolean *receiverScene)
 	return 0;
 }
 
+static UInt32 gKernelOutputs = ~0u;     /* what the kernel was last told (~0: nothing yet) */
+
+/* Only real changes go to the kernel: VirtualAudio re-sends the same mute at every volume step, and a start
+ * re-zeroes the ring (an audible gap). */
 static void
 kernelRoute(void)
 {
@@ -206,6 +210,11 @@ kernelRoute(void)
 	}
 	Boolean rcv;
 	UInt32 o = codecOutputs(&rcv);
+	UInt32 key = o | (rcv ? 0x100 : 0);
+	if (key == gKernelOutputs) {
+		return;
+	}
+	gKernelOutputs = key;
 	uint64_t in[2] = { o, rcv };
 	kern_return_t kr = o ? IOConnectCallScalarMethod(gConn, VA_UC_START, in, 2, NULL, NULL) :
 	    IOConnectCallScalarMethod(gConn, VA_UC_STOP, NULL, 0, NULL, NULL);
@@ -1031,6 +1040,7 @@ VA_StopIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client)
 	if (dev == kObjCodec) {
 		if (gCodecIO > 0 && --gCodecIO == 0 && gConn != IO_OBJECT_NULL) {
 			IOConnectCallScalarMethod(gConn, VA_UC_STOP, NULL, 0, NULL, NULL);
+			gKernelOutputs = ~0u;
 			os_log(gLog, "VivaAudio: codec IO off");
 		}
 	} else if (dev == kObjHawking) {
