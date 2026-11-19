@@ -1225,6 +1225,17 @@ actuatorWrite(const Float32 *src, UInt32 frames)
 		h.steps[h.count - 1].ms += 8;   /* hold until the next cycle replaces it */
 	}
 	gHapticOn = any;
+	if (any) {
+		static unsigned logged;
+		if (logged++ < 300) {
+			char line[200];
+			int c = snprintf(line, sizeof(line), "haptic %u frames:", frames);
+			for (uint32_t i = 0; i < h.count && c < (int)sizeof(line) - 12; i++) {
+				c += snprintf(line + c, sizeof(line) - c, " %ums g%u", h.steps[i].ms, h.steps[i].gain);
+			}
+			dlog("%s", line);
+		}
+	}
 	kernelHaptic(&h);
 }
 
