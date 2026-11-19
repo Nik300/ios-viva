@@ -4,7 +4,8 @@
  *
  * IOServiceOpen(IOServiceMatching("VivaAudio"), type 0):
  *   IOConnectMapMemory64 type VA_MAP_STATUS: struct va_status (read-only); VA_MAP_RING: the playback ring,
- *   ringFrames frames of 2 x int32 (left = receiver / top speaker, right = loudspeaker), write-combined.
+ *   ringFrames frames of frameBytes (0224: 4 = 2 x int16; the 0222/0223 kernels said 8 but read 16-bit too),
+ *   left = receiver / top speaker, right = loudspeaker, write-combined.
  *   VA_UC_START (2 scalars: outputs VA_OUT_*, receiver scene 0/1), VA_UC_STOP, VA_UC_HAPTIC (struct va_haptic).
  */
 #ifndef VIVAAUDIO_H

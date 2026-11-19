@@ -1,0 +1,83 @@
+diff --git a/iokit/Kernel/arm/VivaAudio.cpp b/iokit/Kernel/arm/VivaAudio.cpp
+index 0709d3e..a38a754 100644
+--- a/iokit/Kernel/arm/VivaAudio.cpp
++++ b/iokit/Kernel/arm/VivaAudio.cpp
+@@ -8,7 +8,7 @@
+  * LK leaves the audio infra clocks open, audio_sel on 26 MHz, VAUD28 on, GPIO183 in mode 1 and AFE_IRQ_MCU_EN at
+  * ~0 (read 2026-11-19); 184-186 are switched to mode 1 here.
+  *
+- * Playback: DL1 reads a ring in AFE SRAM (0x11212000), 48 kHz, stereo, S32_LE (left = receiver, right =
++ * Playback: DL1 reads a ring in AFE SRAM (0x11212000), 48 kHz, stereo, S16_LE (left = receiver, right =
+  * loudspeaker), 10 ms periods; the period interrupt (IRQ0, SPI 169) advances a frame counter with its host time.
+  * Outputs are a mask (VA_OUT_RCV, VA_OUT_SPK) chosen per stream; the amps load the vendor "music" or "rcv" scene.
+  *
+@@ -71,9 +71,10 @@
+ 
+ #define VA_RATE                 48000
+ #define VA_RATE_MEMIF           10      /* memif/IRQ rate index of 48 kHz */
+-#define VA_FRAME_BYTES          8       /* stereo S32_LE */
++#define VA_FRAME_BYTES          4       /* stereo S16_LE: HD_MODE 0 (HD_MODE 2 also reads 16-bit on the MT6781:
++                                         * measured 192000 B/s at 48 kHz; HD_MODE 1 = 24 bits in 32) */
+ #define VA_PERIOD_FRAMES        480     /* 10 ms */
+-#define VA_PERIODS              10
++#define VA_PERIODS              20      /* 9600 frames, 200 ms, in the 0x9c00 bytes of SRAM */
+ 
+ #define VA_OUT_RCV              1       /* HS, DAC L, AW87559 0x58 */
+ #define VA_OUT_SPK              2       /* LOL, DAC R, AW87559 0x5B */
+@@ -132,6 +133,7 @@ public:
+ 	virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
+ 	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+ 	IOMemoryDescriptor *statusMemory(void) { return fStatusMD; }
++	bool running(void) const { return fMemifOn; }
+ 	IOMemoryDescriptor *ringMemory(void) { return getProvider()->getDeviceMemoryWithIndex(1); }
+ 
+ private:
+@@ -478,9 +480,9 @@ VivaAudio::memifGated(bool on)
+ 	wr(AFE_DL1_BASE, (uint32_t)fSRAMPhys);
+ 	wr(AFE_DL1_END_MSB, (uint32_t)((fSRAMPhys + fRingBytes - 1) >> 32));
+ 	wr(AFE_DL1_END, (uint32_t)(fSRAMPhys + fRingBytes - 1));
+-	/* 48 kHz, stereo, normal (SRAM) mode, S32_LE, PBUF/MINLEN 0 for 10 ms periods */
++	/* 48 kHz, stereo, normal (SRAM) mode, S16_LE (HD_MODE 0), PBUF/MINLEN 0 for 10 ms periods */
+ 	bits(AFE_DL1_CON0, (0xfu << 24) | (0xfu << 20) | (3u << 12) | (1u << 8) | (1u << 5) | 3u,
+-	    ((uint32_t)VA_RATE_MEMIF << 24) | (1u << 5) | 2u);
++	    ((uint32_t)VA_RATE_MEMIF << 24) | (1u << 5));
+ 	fFrames = 0;
+ 	fHostTime = mach_absolute_time();
+ 	__atomic_store_n(&fStatus->seq, fStatus->seq + 1, __ATOMIC_RELEASE);
+@@ -683,14 +685,13 @@ VivaAudio::link(const char *args, char *out, size_t len)
+ 		hz = hz ? MIN(MAX(hz, 50u), 8000u) : 1000;
+ 		if (!tone) {
+ 			/* one period-aligned ring of a sine, -12 dB: Bhaskara's approximation, no FP in the kernel */
+-			volatile int32_t *s = (volatile int32_t *)fSRAM;
++			volatile uint32_t *s = (volatile uint32_t *)fSRAM;
+ 			uint32_t frames = fRingBytes / VA_FRAME_BYTES;
+ 			for (uint32_t i = 0; i < frames; i++) {
+ 				uint32_t ph = (uint32_t)(((uint64_t)i * hz * 360 / VA_RATE) % 360);
+-				int64_t x = ph % 180, y = 4 * x * (180 - x) * 0x20000000ll / (40500 - x * (180 - x));
+-				int32_t v = (int32_t)(ph < 180 ? y : -y);
+-				s[2 * i] = v;
+-				s[2 * i + 1] = v;
++				int64_t x = ph % 180, y = 4 * x * (180 - x) * 0x2000ll / (40500 - x * (180 - x));
++				uint16_t v = (uint16_t)(int16_t)(ph < 180 ? y : -y);
++				s[i] = (uint32_t)v | ((uint32_t)v << 16);
+ 			}
+ 		}
+ 		fGate->runActionBlock(^IOReturn {
+@@ -818,10 +819,13 @@ VivaAudioUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 		if (args->scalarInputCount != 2) {
+ 			return kIOReturnBadArgument;
+ 		}
+-		uint32_t bytes;
+-		volatile uint8_t *r = fAudio->ring(&bytes);
+-		for (uint32_t i = 0; i < bytes; i += 4) {
+-			*(volatile uint32_t *)(r + i) = 0;
++		/* a fresh ring only when nothing plays: a route change while running must not cut the sound */
++		if (!fAudio->running()) {
++			uint32_t bytes;
++			volatile uint8_t *r = fAudio->ring(&bytes);
++			for (uint32_t i = 0; i < bytes; i += 4) {
++				*(volatile uint32_t *)(r + i) = 0;
++			}
+ 		}
+ 		IOReturn ret = fAudio->startOutput((uint32_t)args->scalarInput[0], args->scalarInput[1] != 0);
+ 		fStarted = ret == kIOReturnSuccess;

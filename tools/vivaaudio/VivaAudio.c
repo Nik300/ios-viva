@@ -210,8 +210,9 @@ kernelOpen(void)
 	 * (measured 2026-11-19: 192000 bytes/s at 48 kHz; HD_MODE 1 = 24-in-32 reads 384000). Until the kernel uses
 	 * HD_MODE 1 the ring holds 2 x int16 frames: twice as many frames in the same bytes.
 	 */
-	gRing16 = gStatus->frameBytes == 8 && gStatus->ringFrames == 4800;
-	gRingFrames = gStatus->ringFrames ? gStatus->ringFrames * (gRing16 ? 2 : 1) : 4800;
+	Boolean legacy = gStatus->frameBytes == 8 && gStatus->ringFrames == 4800;   /* 0222/0223 kernels */
+	gRing16 = legacy || gStatus->frameBytes == 4;                               /* 0224: S16_LE, says so */
+	gRingFrames = legacy ? 9600 : (gStatus->ringFrames ? gStatus->ringFrames : 9600);
 	os_log(gLog, "VivaAudio: kernel open, ring %u frames", gRingFrames);
 	return true;
 }

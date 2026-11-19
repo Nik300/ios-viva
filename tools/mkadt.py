@@ -542,7 +542,11 @@ def build(seed=None, qemu=False, highmem=False, viva=False, viva_ufs=False):
     # phone). libMobileGestalt reads the child node IODeviceTree:/product/haptics, which the real D22AP has as
     # { closed-loop = 1, supports-3rd-party-haptics = 1 }; VibratorCapability is DeviceSupportsHaptics or a
     # "vibrator" / "audio-actuator*" / "maggie-arc" device tree node. viva keeps closed-loop out (see above).
-    product_children = [node('haptics', [ph(), ('supports-3rd-party-haptics', u32(1))])] if product_props and viva else []
+    # 0224: closed-loop haptics on. Every iOS vibration then goes through the HAL device "Actuator" (VivaAudio.driver,
+    # tools/vivaaudio), whose envelope drives VivaHaptic; Settings shows "Sounds & Haptics" and UIKit uses full
+    # feedback. The legacy IOKit "vibrator" path is not used any more (it stays for the link's hap command).
+    product_children = [node('haptics', [ph(), ('closed-loop', u32(1)), ('supports-3rd-party-haptics', u32(1))])] \
+        if product_props and viva else []
     product = [node('product', [ph()] + product_props, product_children)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the
