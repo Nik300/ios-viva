@@ -21,6 +21,7 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 #include <os/log.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -1197,7 +1198,17 @@ codecWrite(const Float32 *src, UInt32 frames, Float64 sampleTime)
 	}
 }
 
-/* WriteMix of the Actuator: the peak per 2 ms becomes a CONT-mode drive level for the next cycle. */
+/*
+ * WriteMix of the Actuator: an envelope follower over iOS's haptic waveform (Apple's ~145 Hz drive signal, period
+ * ~7 ms) becomes a drive level per 2 ms step. Instant attack, ~20 ms release, on/off thresholds with hysteresis:
+ * a plain per-2-ms peak fell to zero near every zero crossing and chopped long buzzes into many short ones.
+ */
+#define kEnvReleasePerFrame     0.99896f        /* exp(-1 / (0.020 s * 48000)): 20 ms */
+#define kEnvOn                  0.04f
+#define kEnvOff                 0.02f
+static Float32 gEnv;
+static Boolean gEnvActive;
+
 static void
 actuatorWrite(const Float32 *src, UInt32 frames)
 {
@@ -1207,12 +1218,26 @@ actuatorWrite(const Float32 *src, UInt32 frames)
 		Float32 peak = 0.0f;
 		for (UInt32 j = i; j < MIN(frames, i + kEnvelopeStepFrames); j++) {
 			Float32 v = fabsf(src[j]);
-			peak = v > peak ? v : peak;
+			gEnv = v > gEnv ? v : gEnv * kEnvReleasePerFrame;
+			peak = gEnv > peak ? gEnv : peak;
 		}
-		uint8_t gain = peak < kEnvelopeFloor ? 0 : (uint8_t)MIN(0x80, (UInt32)(peak * 0x80) + 0x20);
+		gEnvActive = gEnvActive ? peak > kEnvOff : peak > kEnvOn;
+		if (gCapture == NULL && access("/private/var/mobile/Library/Logs/va_hapticpeaks", F_OK) == 0) {
+			static FILE *pf;
+			if (pf == NULL) {
+				pf = fopen("/private/var/mobile/Library/Logs/va_hapticpeaks", "a");
+			}
+			if (pf != NULL) {
+				fprintf(pf, "%.4f\n", peak);
+			}
+		}
+		/* gain curve: 10 + 50 * peak^1.6 (Apple's synced vibes hold ~0.54 with accents up to ~1.0, measured on
+		 * "Apertura"): base ~29, accents ~60, tails down to ~11. Lower than the chip's full scale so it reads as
+		 * a haptic texture following the melody rather than a buzz (user tuning 2026-11-19). */
+		uint8_t gain = !gEnvActive ? 0 : (uint8_t)(10.0f + 50.0f * powf(MIN(peak, 1.0f), 1.6f));
 		any |= gain != 0;
 		struct va_haptic_step *last = h.count ? &h.steps[h.count - 1] : NULL;
-		if (last != NULL && last->gain == gain) {
+		if (last != NULL && (last->gain == gain || (last->gain && gain && abs((int)last->gain - (int)gain) < 8))) {
 			last->ms += 2;
 		} else {
 			h.steps[h.count++] = (struct va_haptic_step){ .ms = 2, .gain = gain };
@@ -1225,17 +1250,6 @@ actuatorWrite(const Float32 *src, UInt32 frames)
 		h.steps[h.count - 1].ms += 8;   /* hold until the next cycle replaces it */
 	}
 	gHapticOn = any;
-	if (any) {
-		static unsigned logged;
-		if (logged++ < 300) {
-			char line[200];
-			int c = snprintf(line, sizeof(line), "haptic %u frames:", frames);
-			for (uint32_t i = 0; i < h.count && c < (int)sizeof(line) - 12; i++) {
-				c += snprintf(line + c, sizeof(line) - c, " %ums g%u", h.steps[i].ms, h.steps[i].gain);
-			}
-			dlog("%s", line);
-		}
-	}
 	kernelHaptic(&h);
 }
 
