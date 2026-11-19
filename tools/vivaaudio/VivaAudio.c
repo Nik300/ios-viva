@@ -39,6 +39,10 @@
 #define kRate                   48000.0
 #define kActuatorRingFrames     4800
 #define kSafetyOffset           96      /* frames: the DL1 prefetch */
+#define kSpeakerHighPassHz      350.0   /* 2nd-order Butterworth high-pass on the loudspeaker route: below this the
+                                         * small speaker only rattles (iOS's D22 tuning boosts the lows) */
+#define kSpeakerHeadroom        0.708f  /* -3 dB on the loudspeaker route: iOS's D22 speaker tuning (virtual bass,
+                                         * compressor) drives viva's speaker into audible distortion at full volume */
 #define kEnvelopeStepFrames     96      /* 2 ms */
 #define kEnvelopeFloor          0.02f   /* below this the motor is off */
 
@@ -116,6 +120,34 @@ static io_connect_t gConn;
 static volatile struct va_status *gStatus;
 static volatile int32_t *gRing;
 static Boolean gRing16;
+
+/* loudspeaker high-pass: biquad (RBJ cookbook), direct form I state per channel */
+static Float32 gHP[5];                  /* b0 b1 b2 a1 a2 (a0 = 1) */
+static Float32 gHPState[2][4];          /* x1 x2 y1 y2 */
+
+static void
+highPassInit(void)
+{
+	Float64 w = 2.0 * M_PI * kSpeakerHighPassHz / kRate, c = cos(w), al = sin(w) / (2.0 * M_SQRT1_2);
+	Float64 a0 = 1.0 + al;
+	gHP[0] = (Float32)((1.0 + c) / 2.0 / a0);
+	gHP[1] = (Float32)(-(1.0 + c) / a0);
+	gHP[2] = gHP[0];
+	gHP[3] = (Float32)(-2.0 * c / a0);
+	gHP[4] = (Float32)((1.0 - al) / a0);
+}
+
+static inline Float32
+highPass(int ch, Float32 x)
+{
+	Float32 *z = gHPState[ch];
+	Float32 y = gHP[0] * x + gHP[1] * z[0] + gHP[2] * z[1] - gHP[3] * z[2] - gHP[4] * z[3];
+	z[1] = z[0];
+	z[0] = x;
+	z[3] = z[2];
+	z[2] = y;
+	return y;
+}
 static UInt32 gRingFrames = 4800;
 static Float64 gTicksPerFrame;
 
@@ -482,6 +514,7 @@ VA_Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRef host)
 	mach_timebase_info(&tb);
 	gTicksPerFrame = (1e9 / kRate) * tb.denom / tb.numer;
 	setVolumeScalar(1.0f);
+	highPassInit();
 	gActuatorAnchor = mach_absolute_time();     /* the Hawking clock runs from here even if the Actuator never starts */
 	Boolean k = kernelOpen();
 	os_log(gLog, "VivaAudio: initialized, %.3f host ticks per frame", gTicksPerFrame);
@@ -1139,7 +1172,7 @@ codecWrite(const Float32 *src, UInt32 frames, Float64 sampleTime)
 	}
 	Boolean rcv;
 	UInt32 o = codecOutputs(&rcv);
-	Float32 g = gGain;
+	Float32 g = gGain * ((o & VA_OUT_SPK) && !rcv ? kSpeakerHeadroom : 1.0f);
 	UInt64 pos = (UInt64)sampleTime % gRingFrames;
 	for (UInt32 i = 0; i < frames; i++) {
 		Float32 l = src[2 * i] * g, r = src[2 * i + 1] * g;
@@ -1148,8 +1181,8 @@ codecWrite(const Float32 *src, UInt32 frames, Float64 sampleTime)
 			L = toS32((l + r) * 0.5f);      /* receiver: mono on the left (HS) */
 			R = 0;
 		} else {
-			L = toS32(l);
-			R = toS32(r);
+			L = toS32(highPass(0, l));
+			R = toS32(highPass(1, r));
 		}
 		if (gRing16) {
 			((volatile uint32_t *)gRing)[pos] = ((uint32_t)(uint16_t)(L >> 16)) | ((uint32_t)(uint16_t)(R >> 16) << 16);
