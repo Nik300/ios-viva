@@ -1,0 +1,237 @@
+diff --git a/iokit/Kernel/arm/VivaBattery.cpp b/iokit/Kernel/arm/VivaBattery.cpp
+index 0fdc292..ba4f69a 100644
+--- a/iokit/Kernel/arm/VivaBattery.cpp
++++ b/iokit/Kernel/arm/VivaBattery.cpp
+@@ -44,6 +44,10 @@
+  * most vivalpmduty % of a CPU (default 10). The battery service carries
+  * "LowPowerMode". Boot-arg vivabattery=0 leaves the old static SweetBattery.
+  *
++ * The class is named AppleSmartBattery (0234), as the iPhone's gas-gauge battery service: PowerLog's PLBatteryAgent
++ * logs BatteryData's current accumulator only when IOObjectCopyClass of the power source says "AppleSmartBattery"
++ * (-[PLBatteryAgent hasAppleSmartBattery]). File, log prefix and boot-args keep the VivaBattery name.
++ *
+  * PowerLog (0233): BatteryData {PackCurrentAccumulator, PackCurrentAccumulatorCount}. PowerLog corrects its energy
+  * estimates with the energy measured by the battery (PLBatteryAgent accountGaugePowerFromCurrentAccumulatorEntry:
+  * P = (prev acc - acc) / (count - prev count) * AppleRawBatteryVoltage); without a measurement no estimate is ever
+@@ -137,8 +141,8 @@ struct VivaBatterySample {
+ 	uint8_t  r[0x15];       /* charger registers 0x00..0x14 */
+ };
+ 
+-class VivaBattery : public IOPMPowerSource {
+-	OSDeclareDefaultStructors(VivaBattery);
++class AppleSmartBattery : public IOPMPowerSource {
++	OSDeclareDefaultStructors(AppleSmartBattery);
+ public:
+ 	virtual bool init(OSDictionary *dictionary = NULL) APPLE_KEXT_OVERRIDE;
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -181,9 +185,9 @@ private:
+ 	char                  fLastWrite[96];
+ };
+ 
+-OSDefineMetaClassAndStructors(VivaBattery, IOPMPowerSource);
++OSDefineMetaClassAndStructors(AppleSmartBattery, IOPMPowerSource);
+ 
+-static VivaBattery *gVivaBattery;
++static AppleSmartBattery *gVivaBattery;
+ static int gVivaLowPower;               /* kern.viva_lowpower */
+ static int gVivaChargeLimit = 100;      /* kern.viva_chargelimit */
+ static uint32_t gVivaLPMGpuMHz = 550, gVivaLPMDuty = 10;
+@@ -263,7 +267,7 @@ SYSCTL_PROC(_kern, OID_AUTO, viva_chargelimit, CTLTYPE_INT | CTLFLAG_RW | CTLFLA
+ /* ---- the power source ---- */
+ 
+ bool
+-VivaBattery::init(OSDictionary *dictionary)
++AppleSmartBattery::init(OSDictionary *dictionary)
+ {
+ 	/* As SweetBattery: IOPMPowerSource only overrides init(void) (its PS dictionary). */
+ 	if (!IOPMPowerSource::init()) {
+@@ -284,7 +288,7 @@ VivaBattery::init(OSDictionary *dictionary)
+ }
+ 
+ IOReturn
+-VivaBattery::fgWord(uint8_t reg, uint16_t *v)
++AppleSmartBattery::fgWord(uint8_t reg, uint16_t *v)
+ {
+ 	uint8_t b[2];
+ 	IOReturn ret = fBus->transfer(fFgAddr, &reg, 1, b, 2);
+@@ -295,7 +299,7 @@ VivaBattery::fgWord(uint8_t reg, uint16_t *v)
+ }
+ 
+ IOReturn
+-VivaBattery::chgRead(uint8_t reg, uint8_t *v, uint32_t n)
++AppleSmartBattery::chgRead(uint8_t reg, uint8_t *v, uint32_t n)
+ {
+ 	while (n > 0) {
+ 		uint32_t k = n < (uint32_t)VivaI2C::kFIFOSize ? n : (uint32_t)VivaI2C::kFIFOSize;
+@@ -312,7 +316,7 @@ VivaBattery::chgRead(uint8_t reg, uint8_t *v, uint32_t n)
+ 
+ /* Read-modify-write of `mask` in one of the writable charger registers, read back. */
+ IOReturn
+-VivaBattery::chgUpdate(uint8_t reg, uint8_t mask, uint8_t value)
++AppleSmartBattery::chgUpdate(uint8_t reg, uint8_t mask, uint8_t value)
+ {
+ 	if (reg != CHG_REG00 && reg != CHG_REG03 && reg != CHG_REG04 && reg != CHG_REG06 && reg != CHG_REG07) {
+ 		return kIOReturnNotPermitted;
+@@ -348,7 +352,7 @@ VivaBattery::chgUpdate(uint8_t reg, uint8_t mask, uint8_t value)
+ }
+ 
+ bool
+-VivaBattery::readSample(VivaBatterySample *s)
++AppleSmartBattery::readSample(VivaBatterySample *s)
+ {
+ 	uint16_t v[15];
+ 	static const uint8_t regs[15] = { FG_STATUS, FG_TEMP, FG_VOLT, FG_CURRENT, FG_AVG_CURRENT, FG_RM, FG_FCC,
+@@ -390,7 +394,7 @@ VivaBattery::readSample(VivaBatterySample *s)
+ }
+ 
+ void
+-VivaBattery::maintainCharger(VivaBatterySample *s)
++AppleSmartBattery::maintainCharger(VivaBatterySample *s)
+ {
+ 	if (fChargeMode == 0 || !s->chgOK) {
+ 		return;
+@@ -450,7 +454,7 @@ VivaBattery::maintainCharger(VivaBatterySample *s)
+ }
+ 
+ void
+-VivaBattery::putNumber(const char *key, int64_t value)
++AppleSmartBattery::putNumber(const char *key, int64_t value)
+ {
+ 	const OSSymbol *sym = OSSymbol::withCString(key);
+ 	OSNumber *num = OSNumber::withNumber((unsigned long long)value, 64);
+@@ -462,7 +466,7 @@ VivaBattery::putNumber(const char *key, int64_t value)
+ }
+ 
+ void
+-VivaBattery::putBool(const char *key, bool value)
++AppleSmartBattery::putBool(const char *key, bool value)
+ {
+ 	const OSSymbol *sym = OSSymbol::withCString(key);
+ 	if (sym != NULL) {
+@@ -472,7 +476,7 @@ VivaBattery::putBool(const char *key, bool value)
+ }
+ 
+ void
+-VivaBattery::putString(const char *key, const char *value)
++AppleSmartBattery::putString(const char *key, const char *value)
+ {
+ 	const OSSymbol *sym = OSSymbol::withCString(key);
+ 	OSString *str = OSString::withCString(value);
+@@ -484,7 +488,7 @@ VivaBattery::putString(const char *key, const char *value)
+ }
+ 
+ void
+-VivaBattery::publish(const VivaBatterySample *s)
++AppleSmartBattery::publish(const VivaBatterySample *s)
+ {
+ 	uint32_t vbus = s->chgOK ? s->r[CHG_REG0B] >> 5 : VBUS_NONE;
+ 	uint32_t chrg = s->chgOK ? (s->r[CHG_REG0B] >> 3) & 3 : CHRG_NOT;
+@@ -637,7 +641,7 @@ VivaBattery::publish(const VivaBatterySample *s)
+ }
+ 
+ void
+-VivaBattery::poll(void)
++AppleSmartBattery::poll(void)
+ {
+ 	VivaBatterySample s;
+ 	fPolls++;
+@@ -651,9 +655,9 @@ VivaBattery::poll(void)
+ }
+ 
+ void
+-VivaBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
++AppleSmartBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+-	VivaBattery *self = OSDynamicCast(VivaBattery, owner);
++	AppleSmartBattery *self = OSDynamicCast(AppleSmartBattery, owner);
+ 	if (self != NULL) {
+ 		self->poll();
+ 		sender->setTimeoutMS(POLL_MS);
+@@ -662,9 +666,9 @@ VivaBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 
+ /* Charger INT (EINT 11): plug, unplug, charge state change. Poll shortly after (VBUS detection settles). */
+ void
+-VivaBattery::interruptOccurred(OSObject *owner, IOInterruptEventSource *src __unused, int count __unused)
++AppleSmartBattery::interruptOccurred(OSObject *owner, IOInterruptEventSource *src __unused, int count __unused)
+ {
+-	VivaBattery *self = OSDynamicCast(VivaBattery, owner);
++	AppleSmartBattery *self = OSDynamicCast(AppleSmartBattery, owner);
+ 	if (self != NULL) {
+ 		self->fIrqs++;
+ 		self->fTimer->setTimeoutMS(IRQ_DELAY_MS);
+@@ -672,7 +676,7 @@ VivaBattery::interruptOccurred(OSObject *owner, IOInterruptEventSource *src __un
+ }
+ 
+ void
+-VivaBattery::pollNow(void)
++AppleSmartBattery::pollNow(void)
+ {
+ 	if (fTimer != NULL) {
+ 		fTimer->setTimeoutMS(1);
+@@ -680,7 +684,7 @@ VivaBattery::pollNow(void)
+ }
+ 
+ void
+-VivaBattery::lowPowerChanged(void)
++AppleSmartBattery::lowPowerChanged(void)
+ {
+ 	pollNow();
+ }
+@@ -695,7 +699,7 @@ viva_battery_usb_changed(void)
+ }
+ 
+ bool
+-VivaBattery::start(IOService *provider)
++AppleSmartBattery::start(IOService *provider)
+ {
+ 	int enable = 1;
+ 	PE_parse_boot_argn("vivabattery", &enable, sizeof(enable));
+@@ -724,7 +728,7 @@ VivaBattery::start(IOService *provider)
+ 		return false;
+ 	}
+ 	fGate = IOCommandGate::commandGate(this);
+-	fTimer = IOTimerEventSource::timerEventSource(this, &VivaBattery::timerFired);
++	fTimer = IOTimerEventSource::timerEventSource(this, &AppleSmartBattery::timerFired);
+ 	if (fGate == NULL || fTimer == NULL || fWorkLoop->addEventSource(fGate) != kIOReturnSuccess ||
+ 	    fWorkLoop->addEventSource(fTimer) != kIOReturnSuccess) {
+ 		IOLog("VIVA BATTERY: no timer\n");
+@@ -739,7 +743,7 @@ VivaBattery::start(IOService *provider)
+ 	    "(PN %u rev %u), writes %s, limits %u mV %u mA\n", fFgAddr, fLast.fgOK ? "ok" : "NOT ANSWERING",
+ 	    fLast.design, fLast.fcc, fLast.soh, fLast.cycles, fChgAddr, fLast.chgOK ? "ok" : "NOT ANSWERING",
+ 	    (fLast.r[CHG_REG14] >> 3) & 7, fLast.r[CHG_REG14] & 3, fChargeMode ? "on" : "off", fMaxMv, fMaxMa);
+-	fInterrupt = IOInterruptEventSource::interruptEventSource(this, &VivaBattery::interruptOccurred, provider, 0);
++	fInterrupt = IOInterruptEventSource::interruptEventSource(this, &AppleSmartBattery::interruptOccurred, provider, 0);
+ 	if (fInterrupt != NULL && fWorkLoop->addEventSource(fInterrupt) == kIOReturnSuccess) {
+ 		fInterrupt->enable();
+ 	} else {
+@@ -753,7 +757,7 @@ VivaBattery::start(IOService *provider)
+ }
+ 
+ void
+-VivaBattery::free(void)
++AppleSmartBattery::free(void)
+ {
+ 	if (fWorkLoop != NULL) {
+ 		if (fInterrupt != NULL) {
+@@ -778,7 +782,7 @@ VivaBattery::free(void)
+ #define say(...) do { if (o < len) o += (size_t)snprintf(out + o, len - o, __VA_ARGS__); } while (0)
+ 
+ void
+-VivaBattery::link(const char *args, char *out, size_t len)
++AppleSmartBattery::link(const char *args, char *out, size_t len)
+ {
+ 	size_t o = 0;
+ 	while (*args == ' ') {
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 0afe63b..4791a6e 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -118,7 +118,7 @@ const char * gIOKernelConfigTables =
+     "     'IONameMatch'     = 'goodix,gt9896';"
+     "   },"
+     "   {"
+-    "     'IOClass'         = VivaBattery;"
++    "     'IOClass'         = AppleSmartBattery;"
+     "     'IOProviderClass' = VivaDTNub;"
+     "     'IONameMatch'     = 'ti,bq27z561';"
+     "   },"
