@@ -1,3 +1,385 @@
+diff --git a/iokit/Kernel/arm/IOReportHub.cpp b/iokit/Kernel/arm/IOReportHub.cpp
+new file mode 100644
+index 0000000..216ba60
+--- /dev/null
++++ b/iokit/Kernel/arm/IOReportHub.cpp
+@@ -0,0 +1,376 @@
++/*
++ * viva (0232): IOReportHub + IOReportUserClient, the user-space side of IOReporting. On iOS they come from the closed
++ * IOReportFamily kext, which this kernel does not have: libIOReport logged "Could not open IOReportHub" and every
++ * IOReportCreateSubscription returned NULL, so PowerLog (aggregated) got no IOReport sample at all -- not the Energy
++ * Model of VivaEnergy.cpp (0231), nor anything else. Protocol (libIOReport 20H392, checked against Apple's own
++ * IOReportFamily of macOS 27):
++ *
++ *   open      IOServiceMatching("IOReportHub"), IOServiceOpen type 0, then selector 0 (no arguments).
++ *   sel 2     configureInterests: struct in = IOReportInterestList {u32 n; pad; IOReportInterest[n] (24 bytes:
++ *             provider registry entry ID, channel ID, IOReportChannelType)}, exactly 8 + 24 n bytes (bigger than
++ *             4 KiB: structureInputDescriptor); scalar out = subscription ID. The interests are grouped by provider,
++ *             each provider gets configureReport(kIOReportEnable) and (kIOReportGetDimensions) with its
++ *             IOReportChannelList; the elements counted size a buffer of 64-byte IOReportElements.
++ *   map       IOConnectMapMemory type = subscription ID: that buffer, read-only.
++ *   sel 3     getValues(subscription ID): buffer length 0, then every provider's updateReport(kIOReportCopyChannelData)
++ *             appends its elements (IOReporter::updateReport). Failing providers are skipped, the call succeeds.
++ *   sel 1     close; sel 5 snapshot deltas (not used by iOS 16's library): unsupported.
++ *   close     every subscription gets configureReport(kIOReportDisable).
++ * vivareporthub=0: no hub (as before).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOReportTypes.h>
++#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++
++#define HUB_MAX_SUBS            64
++#define HUB_MAX_INTERESTS       65536
++
++class IOReportHub : public IOService {
++	OSDeclareDefaultStructors(IOReportHub);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IOReportHub, IOService);
++
++class IOReportUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(IOReportUserClient);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++private:
++	IOLock *fLock;
++	OSArray *fSubs;         /* per subscription: OSArray of OSData {u64 provider ID; IOReportChannelList} */
++	OSArray *fBufs;         /* per subscription: IOBufferMemoryDescriptor */
++	bool fClosed;
++	IOReturn configureInterests(IOExternalMethodArguments *args);
++	IOReturn getValues(uint64_t sub);
++	static IOReturn configureAll(OSArray *drivers, IOReportConfigureAction action, int *result);
++	static IOService *lookup(uint64_t id);
++};
++OSDefineMetaClassAndStructors(IOReportUserClient, IOUserClient);
++
++bool
++IOReportHub::start(IOService *provider)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("vivareporthub", &on, sizeof(on));
++	if (on == 0 || !IOService::start(provider)) {
++		return false;
++	}
++	setProperty("IOUserClientClass", "IOReportUserClient");
++	registerService();
++	IOLog("IOReportHub: published (viva 0232)\n");
++	return true;
++}
++
++IOReturn
++IOReportHub::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler)
++{
++	IOReportUserClient *c = OSTypeAlloc(IOReportUserClient);
++	if (c == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (!c->initWithTask(owningTask, securityID, type) || !c->attach(this)) {
++		c->release();
++		return kIOReturnError;
++	}
++	if (!c->start(this)) {
++		c->detach(this);
++		c->release();
++		return kIOReturnError;
++	}
++	*handler = c;
++	return kIOReturnSuccess;
++}
++
++bool
++IOReportUserClient::start(IOService *provider)
++{
++	if (!IOUserClient::start(provider)) {
++		return false;
++	}
++	fLock = IOLockAlloc();
++	fSubs = OSArray::withCapacity(2);
++	fBufs = OSArray::withCapacity(2);
++	return fLock != NULL && fSubs != NULL && fBufs != NULL;
++}
++
++void
++IOReportUserClient::free(void)
++{
++	OSSafeReleaseNULL(fSubs);
++	OSSafeReleaseNULL(fBufs);
++	if (fLock != NULL) {
++		IOLockFree(fLock);
++		fLock = NULL;
++	}
++	IOUserClient::free();
++}
++
++/* The registered service with this registry entry ID (retained), or NULL. */
++IOService *
++IOReportUserClient::lookup(uint64_t id)
++{
++	OSDictionary *match = IOService::registryEntryIDMatching(id);
++	if (match == NULL) {
++		return NULL;
++	}
++	IOService *s = IOService::copyMatchingService(match);
++	match->release();
++	return s;
++}
++
++/* configureReport(action) on every provider of a subscription; *result accumulates (Enable: channels, dimensions). */
++IOReturn
++IOReportUserClient::configureAll(OSArray *drivers, IOReportConfigureAction action, int *result)
++{
++	for (unsigned i = 0; i < drivers->getCount(); i++) {
++		OSData *d = OSDynamicCast(OSData, drivers->getObject(i));
++		if (d == NULL || d->getLength() < 16) {
++			continue;
++		}
++		uint64_t id;
++		memcpy(&id, d->getBytesNoCopy(), 8);
++		IOService *s = lookup(id);
++		if (s == NULL) {
++			continue;               /* gone: skipped, as Apple's hub */
++		}
++		IOReportChannelList *list = (IOReportChannelList *)((uint8_t *)d->getBytesNoCopy() + 8);
++		IOReturn r = s->configureReport(list, action, result, NULL);
++		if (r != kIOReturnSuccess) {
++			IOLog("IOReportHub: configureReport(%u) of 0x%llx (%s) failed 0x%x\n", action, id, s->getName(), r);
++		}
++		s->release();
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOReportUserClient::configureInterests(IOExternalMethodArguments *args)
++{
++	uint8_t *in = NULL;
++	uint32_t len = 0;
++	bool owned = false;
++	if (args->structureInputDescriptor != NULL) {
++		IOByteCount n = args->structureInputDescriptor->getLength();
++		if (n < 9 || n > 8 + 24ull * HUB_MAX_INTERESTS) {
++			return kIOReturnBadArgument;
++		}
++		len = (uint32_t)n;
++		in = (uint8_t *)IOMallocData(len);
++		if (in == NULL) {
++			return kIOReturnNoMemory;
++		}
++		owned = true;
++		if (args->structureInputDescriptor->readBytes(0, in, len) != len) {
++			IOFreeData(in, len);
++			return kIOReturnBadArgument;
++		}
++	} else {
++		in = (uint8_t *)args->structureInput;
++		len = args->structureInputSize;
++	}
++	IOReturn ret = kIOReturnBadArgument;
++	OSArray *drivers = NULL;
++	IOBufferMemoryDescriptor *bmd = NULL;
++	uint32_t n = 0;
++	if (in == NULL || len < 9) {
++		goto out;
++	}
++	memcpy(&n, in, 4);
++	if (n == 0 || n > HUB_MAX_INTERESTS || len != 8 + 24ull * n) {
++		goto out;
++	}
++	drivers = OSArray::withCapacity(4);
++	if (drivers == NULL) {
++		ret = kIOReturnNoMemory;
++		goto out;
++	}
++	/* group by provider: one OSData {provider ID; IOReportChannelList} each, channels in the order given */
++	for (uint32_t i = 0; i < n; i++) {
++		uint64_t id;
++		memcpy(&id, in + 8 + 24 * i, 8);
++		bool seen = false;
++		for (unsigned k = 0; k < drivers->getCount() && !seen; k++) {
++			uint64_t other;
++			memcpy(&other, ((OSData *)drivers->getObject(k))->getBytesNoCopy(), 8);
++			seen = other == id;
++		}
++		if (seen) {
++			continue;
++		}
++		uint32_t count = 0;
++		for (uint32_t j = i; j < n; j++) {
++			uint64_t pj;
++			memcpy(&pj, in + 8 + 24 * j, 8);
++			count += pj == id;
++		}
++		uint32_t size = 8 + 8 + 16 * count;
++		uint8_t *tmp = (uint8_t *)IOMallocZeroData(size);
++		if (tmp == NULL) {
++			ret = kIOReturnNoMemory;
++			goto out;
++		}
++		memcpy(tmp, &id, 8);
++		memcpy(tmp + 8, &count, 4);
++		uint32_t c = 0;
++		for (uint32_t j = i; j < n; j++) {
++			uint64_t pj;
++			memcpy(&pj, in + 8 + 24 * j, 8);
++			if (pj == id) {
++				memcpy(tmp + 16 + 16 * c++, in + 8 + 24 * j + 8, 16);
++			}
++		}
++		OSData *d = OSData::withBytes(tmp, size);
++		IOFreeData(tmp, size);
++		if (d == NULL) {
++			ret = kIOReturnNoMemory;
++			goto out;
++		}
++		drivers->setObject(d);
++		d->release();
++	}
++	IOLockLock(fLock);
++	{
++		int enabled = 0, elements = 0;
++		configureAll(drivers, kIOReportEnable, &enabled);
++		configureAll(drivers, kIOReportGetDimensions, &elements);
++		if (elements <= 0 || elements > INT_MAX / (int)sizeof(IOReportElement) || fSubs->getCount() >= HUB_MAX_SUBS) {
++			int tmp = 0;
++			configureAll(drivers, kIOReportDisable, &tmp);
++			IOLockUnlock(fLock);
++			IOLog("IOReportHub: %u interests, %u providers -> %d elements: refused\n", n, drivers->getCount(),
++			    elements);
++			ret = elements <= 0 ? kIOReturnNotFound : kIOReturnNoResources;
++			goto out;
++		}
++		size_t bytes = (size_t)elements * sizeof(IOReportElement);
++		bmd = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, bytes, PAGE_SIZE);
++		if (bmd == NULL) {
++			int tmp = 0;
++			configureAll(drivers, kIOReportDisable, &tmp);
++			IOLockUnlock(fLock);
++			ret = kIOReturnNoMemory;
++			goto out;
++		}
++		bzero(bmd->getBytesNoCopy(), bytes);
++		bmd->setLength(bytes);
++		args->scalarOutput[0] = fBufs->getCount();
++		fBufs->setObject(bmd);
++		fSubs->setObject(drivers);
++	}
++	IOLockUnlock(fLock);
++	ret = kIOReturnSuccess;
++out:
++	OSSafeReleaseNULL(bmd);
++	OSSafeReleaseNULL(drivers);
++	if (owned) {
++		IOFreeData(in, len);
++	}
++	return ret;
++}
++
++IOReturn
++IOReportUserClient::getValues(uint64_t sub)
++{
++	IOLockLock(fLock);
++	if (sub >= fBufs->getCount()) {
++		IOLockUnlock(fLock);
++		return kIOReturnBadArgument;
++	}
++	IOBufferMemoryDescriptor *bmd = (IOBufferMemoryDescriptor *)fBufs->getObject((unsigned)sub);
++	OSArray *drivers = (OSArray *)fSubs->getObject((unsigned)sub);
++	IOByteCount capacity = bmd->getCapacity();
++	bmd->setLength(0);
++	for (unsigned i = 0; i < drivers->getCount(); i++) {
++		OSData *d = (OSData *)drivers->getObject(i);
++		uint64_t id;
++		memcpy(&id, d->getBytesNoCopy(), 8);
++		IOService *s = lookup(id);
++		if (s == NULL) {
++			continue;
++		}
++		IOByteCount before = bmd->getLength();
++		int count = 0;
++		IOReturn r = s->updateReport((IOReportChannelList *)((uint8_t *)d->getBytesNoCopy() + 8),
++		    kIOReportCopyChannelData, &count, bmd);
++		s->release();
++		if (r != kIOReturnSuccess || count < 0 || bmd->getLength() < before) {
++			IOLog("IOReportHub: updateReport of 0x%llx failed 0x%x (count %d)\n", id, r, count);
++			break;
++		}
++	}
++	/* the mapping keeps the whole buffer: elements not written this time read as zeros (skipped by libIOReport) */
++	IOByteCount used = bmd->getLength();
++	if (used < capacity) {
++		bzero((uint8_t *)bmd->getBytesNoCopy() + used, capacity - used);
++	}
++	IOLockUnlock(fLock);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOReportUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	switch (selector) {
++	case 0:         /* open */
++	case 1:         /* close */
++		return kIOReturnSuccess;
++	case 2:
++		if (args->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		args->scalarOutputCount = 1;
++		return configureInterests(args);
++	case 3:
++		if (args->scalarInputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		return getValues(args->scalarInput[0]);
++	default:
++		return kIOReturnUnsupported;
++	}
++}
++
++IOReturn
++IOReportUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	IOLockLock(fLock);
++	IOBufferMemoryDescriptor *bmd = type < fBufs->getCount() ? (IOBufferMemoryDescriptor *)fBufs->getObject(type) : NULL;
++	if (bmd == NULL) {
++		IOLockUnlock(fLock);
++		return kIOReturnNoMemory;
++	}
++	bmd->retain();
++	IOLockUnlock(fLock);
++	*memory = bmd;
++	*options = kIOMapReadOnly;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOReportUserClient::clientClose(void)
++{
++	IOLockLock(fLock);
++	if (!fClosed) {
++		fClosed = true;
++		for (unsigned i = 0; i < fSubs->getCount(); i++) {
++			int tmp = 0;
++			configureAll((OSArray *)fSubs->getObject(i), kIOReportDisable, &tmp);
++		}
++	}
++	IOLockUnlock(fLock);
++	terminate();
++	return kIOReturnSuccess;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
 index 93b72de..0afe63b 100644
 --- a/iokit/KernelConfigTables.cpp
