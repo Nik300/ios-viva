@@ -1,0 +1,29 @@
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 93b72de..0afe63b 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -182,6 +182,12 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = VivaEnergy;"
+     "   },"
++    "   {"
++    "     'IOClass'         = IOReportHub;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOResourceMatch' = IOKit;"
++    "     'IOMatchCategory' = IOReportHub;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index d446652..86c140a 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -35,6 +35,7 @@ iokit/Kernel/arm/VivaJPEGHW.cpp                                  optional iokitc
+ iokit/Kernel/arm/VivaVDEC.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/VivaJPEG.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/VivaEnergy.cpp                                  optional iokitcpp
++iokit/Kernel/arm/IOReportHub.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/VivaKeypad.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/VivaPMICKeys.cpp                            optional iokitcpp
