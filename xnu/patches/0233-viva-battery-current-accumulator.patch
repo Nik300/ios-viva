@@ -1,0 +1,62 @@
+diff --git a/iokit/Kernel/arm/VivaBattery.cpp b/iokit/Kernel/arm/VivaBattery.cpp
+index 27255ae..0fdc292 100644
+--- a/iokit/Kernel/arm/VivaBattery.cpp
++++ b/iokit/Kernel/arm/VivaBattery.cpp
+@@ -44,6 +44,13 @@
+  * most vivalpmduty % of a CPU (default 10). The battery service carries
+  * "LowPowerMode". Boot-arg vivabattery=0 leaves the old static SweetBattery.
+  *
++ * PowerLog (0233): BatteryData {PackCurrentAccumulator, PackCurrentAccumulatorCount}. PowerLog corrects its energy
++ * estimates with the energy measured by the battery (PLBatteryAgent accountGaugePowerFromCurrentAccumulatorEntry:
++ * P = (prev acc - acc) / (count - prev count) * AppleRawBatteryVoltage); without a measurement no estimate is ever
++ * corrected, PLAccountingOperator_Aggregate_RootNodeEnergy stays empty and Settings > Battery has no per-app energy
++ * and no hourly screen on/off time. Here: the gauge's average current (signed, < 0 discharging) times the ms since
++ * the previous sample is added to the accumulator, the ms to the count (their ratio = the average mA).
++ *
+  * USB link: "bat" (state, both chips' registers), "bat poll", "bat lpm on|off".
+  */
+ #include <pexpert/arm64/board_config.h>
+@@ -168,6 +175,8 @@ private:
+ 	uint32_t              fPolls, fFgErrors, fChgErrors, fIrqs, fWrites, fWriteFails;
+ 	uint32_t              fLastSoc, fLastVbus, fLastChrg;
+ 	bool                  fLastExternal, fLastLPM, fHaveSample;
++	int64_t               fAccMaMs;       /* 0233: current accumulator (mA x ms) and its count (ms) */
++	uint64_t              fAccMs, fAccAt;
+ 	VivaBatterySample     fLast;
+ 	char                  fLastWrite[96];
+ };
+@@ -527,6 +536,34 @@ VivaBattery::publish(const VivaBatterySample *s)
+ 	putBool("LowPowerMode", gVivaLowPower != 0);
+ 	putBool("VivaGaugeValid", s->fgOK);
+ 	putBool("VivaChargerValid", s->chgOK);
++
++	/* 0233: PowerLog's measured energy (see the top) */
++	uint64_t nowAbs = mach_absolute_time();
++	if (s->fgOK) {
++		if (fAccAt != 0 && nowAbs > fAccAt) {
++			uint64_t ns;
++			absolutetime_to_nanoseconds(nowAbs - fAccAt, &ns);
++			uint64_t ms = ns / 1000000;
++			if (ms > 0 && ms < 600000) {    /* a gap longer than 10 min (sleep, stuck I2C) is not integrated */
++				fAccMaMs += (int64_t)s->avgMa * (int64_t)ms;
++				fAccMs += ms;
++			}
++		}
++		fAccAt = nowAbs;
++		OSDictionary *bd = OSDictionary::withCapacity(2);
++		OSNumber *acc = OSNumber::withNumber((unsigned long long)fAccMaMs, 64);
++		OSNumber *cnt = OSNumber::withNumber((unsigned long long)fAccMs, 64);
++		const OSSymbol *key = OSSymbol::withCString("BatteryData");
++		if (bd != NULL && acc != NULL && cnt != NULL && key != NULL) {
++			bd->setObject("PackCurrentAccumulator", acc);
++			bd->setObject("PackCurrentAccumulatorCount", cnt);
++			setPSProperty(key, bd);
++		}
++		OSSafeReleaseNULL(key);
++		OSSafeReleaseNULL(acc);
++		OSSafeReleaseNULL(cnt);
++		OSSafeReleaseNULL(bd);
++	}
+ 	putBool("VivaChargeLimitHold", fLimitHold);
+ 
+ 	/* the adapter: from the charger's input detection and its live input limit */
