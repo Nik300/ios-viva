@@ -1,0 +1,427 @@
+diff --git a/bsd/dev/viva_usb.c b/bsd/dev/viva_usb.c
+index e527447..0a22fef 100644
+--- a/bsd/dev/viva_usb.c
++++ b/bsd/dev/viva_usb.c
+@@ -257,6 +257,7 @@ extern void viva_wifi_link(const char *args, char *out, size_t outLen);      /*
+ extern void viva_gpu_link(const char *args, char *out, size_t outLen);       /* iokit/Kernel/arm/VivaGPU.cpp */
+ extern size_t viva_vdec_cmd(const char *args, char *out, size_t len);                      /* VivaVDEC.cpp (0210) */
+ extern void viva_cpufreq_link(const char *args, char *out, size_t outLen);   /* osfmk/arm64/viva_cpufreq.c */
++extern void viva_energy_status(char *out, size_t len);                         /* iokit/Kernel/arm/VivaEnergy.cpp (0231) */
+ extern void viva_disp_link(const char *args, char *out, size_t outLen);      /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+ extern int sweet_console_muted;                                             /* osfmk/console/serial_console.c */
+ extern void sweet_ps(const char *arg, char *out, size_t len);                /* bsd/dev/sweet_sample.c (0201) */
+@@ -1734,6 +1735,10 @@ vl_command(void)
+ 		static char cpu_reply[4000];
+ 		viva_cpufreq_link(rest, cpu_reply, sizeof(cpu_reply));
+ 		vl_reply("%s", cpu_reply);
++	} else if (IS("energy")) {
++		static char energy_reply[400];
++		viva_energy_status(energy_reply, sizeof(energy_reply));
++		vl_reply("%s", energy_reply);
+ 	} else if (IS("gpu")) {
+ 		static char gpu_reply[4000];  /* vl.reply holds 4096 */
+ 		viva_gpu_link(rest, gpu_reply, sizeof(gpu_reply));
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0938e69..7e0e47c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -95,6 +95,13 @@
+  * display pipe's CCORR (0x1400b000, Xiaomi mtk_disp_ccorr.c: 3x3, 1.0 = 0x800 on MT6781, 13-bit signed, two per
+  * register; CFG bit 0 relay / bit 1 engine). Identity = relay (bypass).
+  *
++ * PowerLog (0231). Its PLDisplayAgent (non-DCP devices, iOS 16.7) logs Backlight Active=1/0 from messages
++ * 0xE0014100 / 0xE0014101 that the main IOMFB service sends to its interested clients, polls the AppleARMBacklight
++ * nub's IOPowerManagement.CurrentPowerState, and models the Display root node from IODisplayParameters
++ * BrightnessMicroAmps (also BrightnessMilliNits, rawBrightness), re-read on kIOMessageServicePropertyChange. Without
++ * them Settings > Battery had no screen on/off time and no display energy. The current is an estimate:
++ * vivapanelua (20000) uA at level 1023, linear, 0 with the panel off.
++ *
+  * Panel power (0192, boot-arg vivapaneloff=1 default, 0 = the fade above; link "disp panel off|on"). The vendor's
+  * display-off path (Xiaomi viva-r-oss mtk_dsi.c mtk_output_dsi_disable -> dsi_k6t_38_0c_0a_dsc_vdo.c lcm_disable /
+  * lcm_unprepare) sends, still in video mode through VM_CMD (mtk_dsi_host_transfer picks VM_CMD while DSI_MODE_CTRL is
+@@ -406,8 +413,11 @@ class AppleARMBacklight : public IOService {
+ 	OSDeclareDefaultStructors(AppleARMBacklight);
+ public:
+ 	AppleCLCD *fFB;
++	uint32_t fLevel;
++	bool fOff;              /* 0231: panel off (RequestPowerChange 0) */
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	void publishLevel(uint32_t level);
++	void setPanelOn(bool on);
+ };
+ OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+ volatile uint32_t sweet_fb_gpu_waits;
+@@ -1993,6 +2003,10 @@ AppleCLCD::requestPower(bool off, bool force)
+ {
+ 	viva_cpufreq_display_power(!off);       /* never blocks */
+ 	viva_touch_display_power(!off);         /* 0195: a thread call, never waits for I2C */
++	if (fBacklight != NULL && fBacklight->fOff != off) {   /* 0231: PowerLog's Backlight state (see the top) */
++		fBacklight->setPanelOn(!off);
++		messageClients(off ? 0xE0014101 : 0xE0014100);
++	}
+ 	if ((!fPanelMode && !force && !fPanelOff) || fWorkLoop == NULL) {
+ 		IOLockLock(fLock);
+ 		if (off != fPowerOff) {
+@@ -2265,24 +2279,63 @@ AppleCLCD::backlightStart(void)
+ 	fBacklight = b;
+ }
+ 
++/* 0231: {value = v} as PowerLog reads BrightnessMilliNits / BrightnessMicroAmps / rawBrightness. */
++static void
++sweet_fb_value_dict(OSDictionary *params, const char *key, uint64_t v)
++{
++	OSDictionary *d = OSDictionary::withCapacity(1);
++	OSNumber *n = OSNumber::withNumber((unsigned long long)v, 32);
++	if (d != NULL && n != NULL) {
++		d->setObject("value", n);
++		params->setObject(key, d);
++	}
++	OSSafeReleaseNULL(n);
++	OSSafeReleaseNULL(d);
++}
++
+ void
+ AppleARMBacklight::publishLevel(uint32_t level)
+ {
+-	OSDictionary *params = OSDictionary::withCapacity(1), *bright = OSDictionary::withCapacity(3);
++	static uint32_t ua = 0;
++	if (ua == 0 && !PE_parse_boot_argn("vivapanelua", &ua, sizeof(ua))) {
++		ua = 20000;
++	}
++	fLevel = level;
++	uint32_t nits = fFB != NULL && fFB->fMaxNits != 0 ? fFB->fMaxNits : 500;
++	OSDictionary *params = OSDictionary::withCapacity(4), *bright = OSDictionary::withCapacity(3);
++	OSDictionary *pm = OSDictionary::withCapacity(1);
+ 	OSNumber *mn = OSNumber::withNumber(0ull, 32), *mx = OSNumber::withNumber((unsigned long long)PANEL_LEVEL_MAX, 32);
+ 	OSNumber *v = OSNumber::withNumber((unsigned long long)level, 32);
+-	if (params != NULL && bright != NULL && mn != NULL && mx != NULL && v != NULL) {
++	OSNumber *ps = OSNumber::withNumber(fOff ? 0ull : 2ull, 32);
++	if (params != NULL && bright != NULL && mn != NULL && mx != NULL && v != NULL && pm != NULL && ps != NULL) {
+ 		bright->setObject("min", mn);
+ 		bright->setObject("max", mx);
+ 		bright->setObject("value", v);
+ 		params->setObject("brightness", bright);
++		/* 0231: PowerLog (see the top of the file) */
++		sweet_fb_value_dict(params, "rawBrightness", level);
++		sweet_fb_value_dict(params, "BrightnessMilliNits", fOff ? 0 : (uint64_t)level * nits * 1000 / PANEL_LEVEL_MAX);
++		sweet_fb_value_dict(params, "BrightnessMicroAmps", fOff ? 0 : (uint64_t)level * ua / PANEL_LEVEL_MAX);
+ 		setProperty("IODisplayParameters", params);
++		pm->setObject("CurrentPowerState", ps);
++		setProperty("IOPowerManagement", pm);
+ 	}
+ 	OSSafeReleaseNULL(mn);
+ 	OSSafeReleaseNULL(mx);
+ 	OSSafeReleaseNULL(v);
++	OSSafeReleaseNULL(ps);
++	OSSafeReleaseNULL(pm);
+ 	OSSafeReleaseNULL(bright);
+ 	OSSafeReleaseNULL(params);
++	messageClients(kIOMessageServicePropertyChange);       /* 0231: PowerLog re-reads IODisplayParameters */
++}
++
++/* 0231: panel on/off for PowerLog: the same level, the current and power state follow. */
++void
++AppleARMBacklight::setPanelOn(bool on)
++{
++	fOff = !on;
++	publishLevel(fLevel);
+ }
+ 
+ /* A brightness number as CoreBrightness may send it: a number, or a dictionary with "value". */
+diff --git a/iokit/Kernel/arm/VivaEnergy.cpp b/iokit/Kernel/arm/VivaEnergy.cpp
+new file mode 100644
+index 0000000..1d600a5
+--- /dev/null
++++ b/iokit/Kernel/arm/VivaEnergy.cpp
+@@ -0,0 +1,198 @@
++/*
++ * viva (0231): IOReport group "Energy Model", the per-subsystem energy that PowerLog (aggregated, PLIOReportAgent /
++ * PLAPEnergyService) turns into the accounting power events behind Settings > Battery. On an iPhone the PMGR driver
++ * publishes it; without any channel every root node (CPU, GPU, DRAM, SoC) had 0 power, powerlogHelperd bailed with
++ * "totalAccountedEnergySum=0" and the per-app list stayed empty (PLBatteryUIErrorCodeKey 1).
++ *
++ * What PowerLog reads (20H392, static analysis of PowerlogLiteOperators): every service with IOReportLegendPublic
++ * is scanned once when aggregated starts; channels of group "Energy Model" WITHOUT a subgroup; simple channels, the
++ * raw delta of each sample taken as mJ (no unit scaling), power = delta / PowerLog's own sample interval (at most one
++ * sample per 300 s, on battery level changes); a power above 10 W is dropped. The names depend on the SoC class of
++ * the device MobileGestalt reports; for the A11 class: ECPU + PCPU -> CPU (node 2, both needed), DRAM + DCS -> DRAM
++ * (node 9, both needed), "GPU Energy" -> GPU (node 8, in nJ: PowerLog multiplies it by 1e-6), SOC_REST -> SoC
++ * (node 7), SOC_AON -> APSOCBase (node 54, PowerLog forces it to 30 mW). "GPU" (mJ) is the GPU for newer classes and
++ * ignored on A11. "CPU Energy" / "DRAM Energy" are NOT published: older classes would count them twice.
++ *
++ * The values are estimates, not measurements (this SoC has no energy counters the port reads):
++ *   ECPU/PCPU  per CPU busy time (recount, viva_cpufreq.c cluster_busy) x C * f * V^2 of the A55 / A76 cluster's OPP
++ *              (vivaenergyll, vivaenergybig, uW/MHz/V^2; LL's rail is max(LL, CCI)).
++ *   GPU        Mali busy time (VivaGPU.cpp completeJob) x C * f * VGPU^2 (vivaenergygpu).
++ *   SOC_REST   CCI at its OPP x the busier cluster's share (vivaenergycci).
++ *   DRAM/DCS   vivaenergydram per mille of CPU + GPU (traffic follows the work), 70 / 30 %.
++ * PowerLog splits each root node among the processes by their CPU time / GPU time, so the shares per app follow the
++ * real usage; the absolute numbers only set how the subsystems compare. The display is not here: PowerLog models it
++ * from AppleARMBacklight's BrightnessMicroAmps (SweetFramebuffer.cpp).
++ *
++ * Link: "energy" prints the totals. vivaenergy=0: no service (PowerLog as before).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOKernelReporters.h>
++#include <IOKit/IOLib.h>
++#include <libkern/OSAtomic.h>
++#include <pexpert/pexpert.h>
++
++/* accumulators, nJ */
++enum { VE_ECPU, VE_PCPU, VE_GPU, VE_DRAM, VE_SOC, VE_COUNT };
++static volatile uint64_t gVivaEnergyNJ[VE_COUNT];
++/* published channels: name, accumulator, share of it (per mille), nJ (else mJ) */
++static const struct { const char *name; int acc; uint32_t permille; bool nj; } kVivaEnergyCh[] = {
++	{ "ECPU", VE_ECPU, 1000, false }, { "PCPU", VE_PCPU, 1000, false }, { "GPU Energy", VE_GPU, 1000, true },
++	{ "GPU", VE_GPU, 1000, false }, { "DRAM", VE_DRAM, 700, false }, { "DCS", VE_DRAM, 300, false },
++	{ "SOC_REST", VE_SOC, 1000, false }, { "SOC_AON", VE_SOC, 0, false },
++};
++#define VE_CHANNELS     (sizeof(kVivaEnergyCh) / sizeof(kVivaEnergyCh[0]))
++#define VE_CHID(i)      (0x5645000000000001ULL + (i))   /* 'VE' + index (this XNU has no IOREPORT_MAKECHID) */
++static uint64_t gVivaEnergyPJ[VE_COUNT];        /* sub-nJ remainders of the adds below (same writer per channel) */
++static int gVivaEnergyCoef[4] = { 120, 420, 1300, 60 };   /* ll, big, gpu, cci: uW per MHz per V^2 */
++static int gVivaEnergyDram = 150;               /* per mille of CPU + GPU */
++static bool gVivaEnergyOn = true;
++
++static void
++viva_energy_add_pj(int ch, uint64_t pj)
++{
++	uint64_t total = gVivaEnergyPJ[ch] + pj;
++	gVivaEnergyPJ[ch] = total % 1000;
++	if (total >= 1000) {
++		OSAddAtomic64((SInt64)(total / 1000), (volatile SInt64 *)&gVivaEnergyNJ[ch]);
++	}
++}
++
++/*
++ * `ns` of activity at `mhz` and `uv` microvolts with coefficient index `k` (0 ll, 1 big, 2 gpu, 3 cci) on channel
++ * `ch`. P (mW) = C (uW/MHz/V^2) * MHz * V^2 / 1000; E (pJ) = P (mW) * t (ns).
++ */
++static void
++viva_energy_add(int ch, int k, uint64_t ns, uint32_t mhz, uint32_t uv)
++{
++	if (!gVivaEnergyOn || ns == 0) {
++		return;
++	}
++	uint64_t mv = uv / 1000;
++	uint64_t uw = (uint64_t)gVivaEnergyCoef[k] * mhz * mv * mv / 1000000;     /* uW */
++	uint64_t pj = uw * ns / 1000;
++	viva_energy_add_pj(ch, pj);
++	if (ch == VE_ECPU || ch == VE_PCPU || ch == VE_GPU) {
++		viva_energy_add_pj(VE_DRAM, pj * (uint64_t)gVivaEnergyDram / 1000);
++	}
++}
++
++/* viva_cpufreq.c, per CPU and governor window: busy `ns` of a CPU of cluster `big` at `mhz` / `uv`. */
++extern "C" void
++viva_energy_cpu(int big, uint64_t ns, uint32_t mhz, uint32_t uv)
++{
++	viva_energy_add(big ? VE_PCPU : VE_ECPU, big ? 1 : 0, ns, mhz, uv);
++}
++
++/* viva_cpufreq.c: the CCI for `ns` at `mhz` / `uv`, `busy` per mille (the busier cluster). */
++extern "C" void
++viva_energy_cci(uint64_t ns, uint32_t mhz, uint32_t uv, unsigned busy)
++{
++	viva_energy_add(VE_SOC, 3, ns * busy / 1000, mhz, uv);
++}
++
++/* VivaGPU.cpp: the GPU was busy `ns` at `mhz` / `uv` (VGPU). */
++extern "C" void
++viva_energy_gpu(uint64_t ns, uint32_t mhz, uint32_t uv)
++{
++	viva_energy_add(VE_GPU, 2, ns, mhz, uv);
++}
++
++/* USB link "energy" */
++extern "C" void
++viva_energy_status(char *out, size_t len)
++{
++	snprintf(out, len, "energy (mJ, estimates): ecpu %llu pcpu %llu gpu %llu dram %llu soc %llu; coef ll %d big %d gpu %d "
++	    "cci %d uW/MHz/V^2, dram %d permille%s\n", gVivaEnergyNJ[VE_ECPU] / 1000000, gVivaEnergyNJ[VE_PCPU] / 1000000,
++	    gVivaEnergyNJ[VE_GPU] / 1000000, gVivaEnergyNJ[VE_DRAM] / 1000000, gVivaEnergyNJ[VE_SOC] / 1000000, gVivaEnergyCoef[0], gVivaEnergyCoef[1], gVivaEnergyCoef[2], gVivaEnergyCoef[3],
++	    gVivaEnergyDram, gVivaEnergyOn ? "" : " (off)");
++}
++
++class VivaEnergy : public IOService {
++	OSDeclareDefaultStructors(VivaEnergy);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn configureReport(IOReportChannelList *channels, IOReportConfigureAction action, void *result,
++	    void *destination) APPLE_KEXT_OVERRIDE;
++	IOReturn updateReport(IOReportChannelList *channels, IOReportConfigureAction action, void *result,
++	    void *destination) APPLE_KEXT_OVERRIDE;
++private:
++	IOSimpleReporter *fReporter;
++};
++OSDefineMetaClassAndStructors(VivaEnergy, IOService);
++
++bool
++VivaEnergy::start(IOService *provider)
++{
++	int on = 1, v;
++	PE_parse_boot_argn("vivaenergy", &on, sizeof(on));
++	if (on == 0) {
++		gVivaEnergyOn = false;
++		return false;
++	}
++	if (PE_parse_boot_argn("vivaenergyll", &v, sizeof(v))) {
++		gVivaEnergyCoef[0] = v;
++	}
++	if (PE_parse_boot_argn("vivaenergybig", &v, sizeof(v))) {
++		gVivaEnergyCoef[1] = v;
++	}
++	if (PE_parse_boot_argn("vivaenergygpu", &v, sizeof(v))) {
++		gVivaEnergyCoef[2] = v;
++	}
++	if (PE_parse_boot_argn("vivaenergycci", &v, sizeof(v))) {
++		gVivaEnergyCoef[3] = v;
++	}
++	if (PE_parse_boot_argn("vivaenergydram", &v, sizeof(v))) {
++		gVivaEnergyDram = v;
++	}
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	/* mJ for the legend; "GPU Energy" carries nJ (PowerLog ignores the unit of simple channels, see the top) */
++	fReporter = IOSimpleReporter::with(this, kIOReportCategoryPower, kIOReportUnit_mJ);
++	if (fReporter == NULL) {
++		return false;
++	}
++	for (unsigned i = 0; i < VE_CHANNELS; i++) {
++		if (fReporter->addChannel(VE_CHID(i), kVivaEnergyCh[i].name) != kIOReturnSuccess) {
++			return false;
++		}
++	}
++	if (IOReportLegend::addReporterLegend(this, fReporter, "Energy Model", NULL) != kIOReturnSuccess) {
++		return false;
++	}
++	setName("VivaEnergy");
++	registerService();
++	IOLog("VivaEnergy: Energy Model channels published (coef ll %d big %d gpu %d cci %d, dram %d)\n",
++	    gVivaEnergyCoef[0], gVivaEnergyCoef[1], gVivaEnergyCoef[2], gVivaEnergyCoef[3], gVivaEnergyDram);
++	return true;
++}
++
++void
++VivaEnergy::free(void)
++{
++	OSSafeReleaseNULL(fReporter);
++	IOService::free();
++}
++
++IOReturn
++VivaEnergy::configureReport(IOReportChannelList *channels, IOReportConfigureAction action, void *result,
++    void *destination)
++{
++	IOReturn ret = fReporter->configureReport(channels, action, result, destination);
++	return ret == kIOReturnSuccess ? IOService::configureReport(channels, action, result, destination) : ret;
++}
++
++IOReturn
++VivaEnergy::updateReport(IOReportChannelList *channels, IOReportConfigureAction action, void *result,
++    void *destination)
++{
++	for (unsigned i = 0; i < VE_CHANNELS; i++) {
++		uint64_t nj = gVivaEnergyNJ[kVivaEnergyCh[i].acc] / 1000 * kVivaEnergyCh[i].permille;
++		fReporter->setValue(VE_CHID(i), (int64_t)(kVivaEnergyCh[i].nj ? nj : nj / 1000000));
++	}
++	IOReturn ret = fReporter->updateReport(channels, action, result, destination);
++	return ret == kIOReturnSuccess ? IOService::updateReport(channels, action, result, destination) : ret;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/VivaGPU.cpp b/iokit/Kernel/arm/VivaGPU.cpp
+index 6c9e96a..6108f97 100644
+--- a/iokit/Kernel/arm/VivaGPU.cpp
++++ b/iokit/Kernel/arm/VivaGPU.cpp
+@@ -46,6 +46,7 @@
+ #include "VivaPMIC.h"
+ #include "SweetSurface.h"
+ 
++extern "C" void viva_energy_gpu(uint64_t ns, uint32_t mhz, uint32_t uv);     /* VivaEnergy.cpp (0231) */
+ extern "C" void viva_cpufreq_boost_stats(int *on, uint64_t *starts, uint64_t *ms, uint64_t *signals);  /* 0183 */
+ 
+ #ifndef MIN
+@@ -2615,6 +2616,11 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status,
+ 	if (fRunning[0] == NULL && fRunning[1] == NULL && fBusyStart != 0) {
+ 		fBusyNs += at > fBusyStart ? at - fBusyStart : 0;       /* absolute-time units */
+ 		fBusyTotal += at > fBusyStart ? at - fBusyStart : 0;
++		if (at > fBusyStart) {  /* 0231: PowerLog's Energy Model (VivaEnergy.cpp) */
++			uint64_t ns;
++			absolutetime_to_nanoseconds(at - fBusyStart, &ns);
++			viva_energy_gpu(ns, gVivaOpp[fClockOpp].khz / 1000, gVivaOpp[fClockOpp].vgpu * 10);
++		}
+ 		fBusyStart = 0;
+ 	}
+ 	if (error == kIOReturnSuccess && at > job->startAt) {
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 29e3025..93b72de 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -177,6 +177,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = VivaEnergy;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = VivaEnergy;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index dad40e5..d446652 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -34,6 +34,7 @@ iokit/Kernel/arm/VivaMDP.cpp                                     optional iokitc
+ iokit/Kernel/arm/VivaJPEGHW.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/VivaVDEC.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/VivaJPEG.cpp                                    optional iokitcpp
++iokit/Kernel/arm/VivaEnergy.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/VivaKeypad.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/VivaPMICKeys.cpp                            optional iokitcpp
+diff --git a/osfmk/arm64/viva_cpufreq.c b/osfmk/arm64/viva_cpufreq.c
+index e411717..54222b0 100644
+--- a/osfmk/arm64/viva_cpufreq.c
++++ b/osfmk/arm64/viva_cpufreq.c
+@@ -106,6 +106,9 @@ extern int viva_pwrap_write_regulator(uint32_t addr, uint32_t mask, uint32_t val
+ extern uint64_t sched_viva_fast_cpus;                                                /* kern/sched_prim.c */
+ extern int viva_lowpri_max;                                                          /* kern/processor.c (0194) */
+ extern uint64_t viva_lowpri_time_now(int c);
++extern void viva_energy_cpu(int big, uint64_t ns, uint32_t mhz, uint32_t uv);                     /* VivaEnergy.cpp (0231) */
++extern void viva_energy_cci(uint64_t ns, uint32_t mhz, uint32_t uv, unsigned busy);
++#define VSEL_UV(v)      (500000u + 6250u * (uint32_t)(v))
+ 
+ #define NOPP 16
+ struct viva_opp {
+@@ -418,6 +421,13 @@ cluster_busy(int first, int last, unsigned *hot, unsigned *all)
+ 			continue;
+ 		}
+ 		unsigned ba = (unsigned)(1000 - di * 1000 / dw);
++		{       /* 0231: the busy time at the cluster's OPP for PowerLog's Energy Model (VivaEnergy.cpp) */
++			bool big = first == BIG_FIRST;
++			int d = big ? DOM_BIG : DOM_LL;
++			uint64_t ns;
++			absolutetime_to_nanoseconds(dw - di, &ns);
++			viva_energy_cpu(big, ns, kOpp[d][gIdx[d]].mhz, VSEL_UV(big ? kOppBig[gIdx[d]].vsel : vsel12_for(gIdx)));
++		}
+ 		unsigned b = ba;
+ 		if (gBgMhz != 0) {
+ 			uint64_t lp = dl * 1000 / dw;
+@@ -548,6 +558,12 @@ gov_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ 		gBusy[DOM_LL] = cluster_busy(LL_FIRST, LL_LAST, &gHot[DOM_LL], &gBusyAll[DOM_LL]);
+ 		gBusy[DOM_BIG] = cluster_busy(BIG_FIRST, BIG_LAST, &gHot[DOM_BIG], &gBusyAll[DOM_BIG]);
+ 		uint64_t now = mach_absolute_time();
++		if (gLastTick != 0 && now > gLastTick) {       /* 0231: the CCI for the Energy Model */
++			uint64_t ns;
++			absolutetime_to_nanoseconds(now - gLastTick, &ns);
++			unsigned b = MAX(gBusyAll[DOM_LL], gBusyAll[DOM_BIG]);
++			viva_energy_cci(ns, kOppCCI[gIdx[DOM_CCI]].mhz, VSEL_UV(vsel12_for(gIdx)), b);
++		}
+ 		bool on = gBoost && !gDispOff;
+ 		bool full = on && now < gBoostUntil;
+ 		bool boost = full || (on && now < gSwapUntil);
